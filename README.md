@@ -28,23 +28,7 @@ Status: working end to end. Both models generate correct, validated output.
 The current focus is kernel speed (the decode loop is dispatch bound, not
 IO bound, so there is clear headroom).
 
-## Try it on your phone
-
-The 35B runs on iPhone inside
-**[Priv AI on the App Store](https://apps.apple.com/us/app/priv-ai/id6765706001)**:
-open Settings, then Experimental Models, and download the model. It streams
-from storage and chats on-device with no server involved.
-
-The Experimental Models feature ships in the newest app version, which is
-still in App Store review, so it may not appear for a couple of days. If you
-want the phone experience today, build the app from source: the app is open
-source at [leonickson1/localLLM](https://github.com/leonickson1/localLLM).
-Clone this repo next to it as `swiftlet`, open the Xcode project, and run it
-on your iPhone.
-
-For Macs, no app is needed at all; use the quick start below.
-
-## Quick start
+## Quick start: try it on a Mac
 
 ```bash
 git clone https://github.com/leonickson1/Swiftlet.git && cd Swiftlet
@@ -79,6 +63,20 @@ The same command also repacks raw MLX checkpoints
 Requirements: Apple Silicon, macOS 14+ or iOS 17+, free SSD space for the
 container (18 GB for the 35B, 42 GB for the 80B).
 
+## Try it on your phone
+
+The 35B runs on iPhone inside
+**[Priv AI on the App Store](https://apps.apple.com/us/app/priv-ai/id6765706001)**:
+open Settings, then Experimental Models, and download the model. It streams
+from storage and chats on-device with no server involved.
+
+The Experimental Models feature ships in the newest app version, which is
+still in App Store review, so it may not appear for a couple of days. If you
+want the phone experience today, build the app from source: the app is open
+source at [leonickson1/localLLM](https://github.com/leonickson1/localLLM).
+Clone this repo next to it as `swiftlet`, open the Xcode project, and run it
+on your iPhone.
+
 ## How it works
 
 These models activate only about 3B of their parameters per token. Each layer
@@ -99,25 +97,25 @@ routes every token to 10 of 512 experts (80B) or 8 of 256 (35B). Swiftlet:
 fixed-size recurrent state, so there is no growing KV cache for those layers
 at any context length.
 
-## What people actually use
+## Four ways to use it
 
-Swiftlet is a library first. There are four ways in:
+Swiftlet is a library first:
 
-1. **An app.** [Priv AI](https://apps.apple.com/us/app/priv-ai/id6765706001)
+1. **The Swift package.** Add SwiftletCore to any macOS or iOS app and use
+   `SwiftletSession` for chat with streaming deltas, conversation caching,
+   sampling with repetition control, and memory-pressure handling built in.
+2. **The CLI.** `swiftlet chat` and `swiftlet generate` for local use and
+   benchmarking, `swiftlet-repack` to build containers from MLX checkpoints
+   (including streaming straight from Hugging Face with resume).
+3. **The server.** `swiftlet-server` speaks the OpenAI chat-completions API
+   on loopback, so any chat UI that talks to OpenAI-compatible endpoints can
+   use a streamed local model.
+4. **An app.** [Priv AI](https://apps.apple.com/us/app/priv-ai/id6765706001)
    on iOS embeds SwiftletCore as its streamed-model engine. End users tap
    Download and chat. Nothing here is terminal-only. The app itself is open
    source at [leonickson1/localLLM](https://github.com/leonickson1/localLLM)
    if you want to build it yourself (clone this repo next to it as
    `swiftlet`).
-2. **The Swift package.** Add SwiftletCore to any macOS or iOS app and use
-   `SwiftletSession` for chat with streaming deltas, conversation caching,
-   sampling with repetition control, and memory-pressure handling built in.
-3. **The CLI.** `swiftlet chat` and `swiftlet generate` for local use and
-   benchmarking, `swiftlet-repack` to build containers from MLX checkpoints
-   (including streaming straight from Hugging Face with resume).
-4. **The server.** `swiftlet-server` speaks the OpenAI chat-completions API
-   on loopback, so any chat UI that talks to OpenAI-compatible endpoints can
-   use a streamed local model.
 
 ## Correctness
 
