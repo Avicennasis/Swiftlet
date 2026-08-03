@@ -21,12 +21,15 @@ demand. The result:
 | [Qwen3.6-35B-A3B, 4-bit](https://huggingface.co/Leonickson/Qwen3.6-35B-A3B-qpack) | 18 GB | 2.6 GB | 7 to 11 tok/s |
 | [Qwen3-Next-80B-A3B, 4-bit](https://huggingface.co/Leonickson/Qwen3-Next-80B-A3B-qpack) | 42 GB | 4.3 GB | 4.5 to 5 tok/s |
 
-The 35B also runs on an iPhone 17 in about 2.5 GB of RAM. As far as we know,
-that is the first time a model of this class has run natively on a phone.
+The 35B also runs on an iPhone 17 in about 2.5 GB of RAM, at about 1 tok/s
+today. As far as we know, that is the first time a model of this class has
+run natively on a phone.
 
 Status: working end to end. Both models generate correct, validated output.
 The current focus is kernel speed (the decode loop is dispatch bound, not
-IO bound, so there is clear headroom).
+IO bound, so there is clear headroom). One expectation to set honestly: only
+about 3B parameters are active per token, so these models chat and write
+like large models but recall facts like small ones.
 
 ## Quick start: try it on a Mac
 
