@@ -27,16 +27,21 @@ Status: working end to end. Both models generate correct, validated output.
 The current focus is kernel speed (the decode loop is dispatch bound, not
 IO bound, so there is clear headroom).
 
-## Try it without building anything
+## Try it on your phone
 
-Download **[Priv AI on the App Store](https://apps.apple.com/us/app/priv-ai/id6765706001)**,
-open Settings, then Experimental Models, and download the 35B. It streams
+The 35B runs on iPhone inside
+**[Priv AI on the App Store](https://apps.apple.com/us/app/priv-ai/id6765706001)**:
+open Settings, then Experimental Models, and download the model. It streams
 from storage and chats on-device with no server involved.
 
-Note: the Experimental Models feature ships in the newest app version, which
-is still in App Store review. If you do not see it yet, check back in a
-couple of days, or use the quick start below and run the models on a Mac
-today.
+The Experimental Models feature ships in the newest app version, which is
+still in App Store review, so it may not appear for a couple of days. If you
+want the phone experience today, build the app from source: the app is open
+source at [leonickson1/localLLM](https://github.com/leonickson1/localLLM).
+Clone this repo next to it as `swiftlet`, open the Xcode project, and run it
+on your iPhone.
+
+For Macs, no app is needed at all; use the quick start below.
 
 ## Quick start
 
