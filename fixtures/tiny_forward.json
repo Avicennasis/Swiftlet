@@ -1,0 +1,42 @@
+{
+  "tokens": [
+    1,
+    5,
+    9,
+    42,
+    7,
+    99,
+    3,
+    17,
+    64,
+    2
+  ],
+  "greedy_next_tokens": [
+    51,
+    72,
+    53,
+    3,
+    17,
+    72,
+    45,
+    87,
+    84,
+    48
+  ],
+  "tensors": [
+    "embed",
+    "final_norm",
+    "input_ids",
+    "layer_00",
+    "layer_01",
+    "layer_02",
+    "layer_03",
+    "layer_04",
+    "layer_05",
+    "layer_06",
+    "layer_07",
+    "logits"
+  ],
+  "dtype": "mlx.core.float32",
+  "mlx_seed": 0
+}
