@@ -7,6 +7,7 @@
 [![App Store](https://img.shields.io/badge/App%20Store-Priv%20AI-black?logo=apple)](https://apps.apple.com/us/app/priv-ai/id6765706001)
 [![35B](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Qwen3.6--35B--qpack-yellow)](https://huggingface.co/Leonickson/Qwen3.6-35B-A3B-qpack)
 [![80B](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Qwen3--Next--80B--qpack-yellow)](https://huggingface.co/Leonickson/Qwen3-Next-80B-A3B-qpack)
+[![Built with Claude Code](https://img.shields.io/badge/built%20with-Claude%20Code-D97757)](https://claude.com/claude-code)
 
 **Run 35B and 80B Qwen models on ordinary Apple devices, including iPhones.**
 
@@ -165,6 +166,9 @@ Metal written against mlx-lm references rather than TurboFieldfare code:
 
 [colibrì](https://github.com/JustVugg/colibri) informed the caching and
 placement policy thinking. mlx-lm is the correctness reference throughout.
+
+Swiftlet was built in collaboration with
+[Claude Code](https://claude.com/claude-code).
 
 ## License
 
