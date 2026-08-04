@@ -22,8 +22,10 @@ demand. The result:
 | [Qwen3-Next-80B-A3B, 4-bit](https://huggingface.co/Leonickson/Qwen3-Next-80B-A3B-qpack) | 42 GB | 4.3 GB | 4.5 to 5 tok/s |
 
 The 35B also runs on an iPhone 17 in about 2.5 GB of RAM, at about 1 tok/s
-today. As far as we know, that is the first time a model of this class has
-run natively on a phone.
+today. Credit where due: [ANEMLL](https://www.anemll.com/) showed a 397B
+MoE streaming on an iPhone 17 Pro as a proof of concept in early 2026.
+Swiftlet's aim is the next step, making this class of model an installable
+app on a base iPhone, with an open runtime anyone can build on.
 
 Status: working end to end. Both models generate correct, validated output.
 The current focus is kernel speed (the decode loop is dispatch bound, not
