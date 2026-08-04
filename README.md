@@ -170,7 +170,7 @@ Metal written against mlx-lm references rather than TurboFieldfare code:
 [colibrì](https://github.com/JustVugg/colibri) informed the caching and
 placement policy thinking. mlx-lm is the correctness reference throughout.
 
-Swiftlet was built in collaboration with
+Swiftlet was built with
 [Claude Code](https://claude.com/claude-code).
 
 ## License
