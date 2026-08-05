@@ -39,20 +39,29 @@ like large models but recall facts like small ones.
 git clone https://github.com/leonickson1/Swiftlet.git && cd Swiftlet
 swift build -c release
 
-# Download the 35B container from Hugging Face (resumable):
+# Download the 35B container from the R2 mirror (fast and consistent;
+# Hugging Face throttles anonymous downloads harder the longer they run):
 .build/release/swiftlet-repack \
-  --from-hf Leonickson/Qwen3.6-35B-A3B-qpack \
+  --from-url https://pub-c0cfece2dbc340dbb2cd9d94310a7d68.r2.dev/qwen3.6-35b-qpack \
   --output ~/models/qwen3.6-35b.qpack
 
 # Or the 80B (42 GB on disk, still only ~4.3 GB of RAM):
 .build/release/swiftlet-repack \
-  --from-hf Leonickson/Qwen3-Next-80B-A3B-qpack \
+  --from-url https://pub-c0cfece2dbc340dbb2cd9d94310a7d68.r2.dev/qwen3-next-80b-qpack \
   --output ~/models/qwen3-next-80b.qpack
+
+# The same containers are on Hugging Face (anonymous downloads are
+# rate-limited there, so the mirror is usually much faster):
+#   --from-hf Leonickson/Qwen3.6-35B-A3B-qpack
+#   --from-hf Leonickson/Qwen3-Next-80B-A3B-qpack
+
+# Verify a finished download against the source hashes (optional):
+#   python3 scripts/verify_container.py <base-url or org/repo> <container-dir>
 
 # Chat (applies the model chat template, disables the reasoning block,
 # keeps conversation state so follow-ups prefill only the new turn):
 .build/release/swiftlet chat ~/models/qwen3.6-35b.qpack \
-  "Who wrote One Hundred Years of Solitude?" "What language did he write it in?"
+  "What is the capital of Spain?" "And what about France?"
 
 # One-shot generation with stats:
 .build/release/swiftlet generate ~/models/qwen3.6-35b.qpack \

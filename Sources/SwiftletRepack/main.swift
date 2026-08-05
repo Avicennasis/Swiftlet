@@ -4,6 +4,7 @@ import SwiftletCore
 // Installer/repacker for .qpack containers.
 //   Local repack:      swiftlet-repack --source <mlx-checkpoint-dir> --output <dir>.qpack
 //   Streaming install: swiftlet-repack --from-hf <org/repo> --output <dir>.qpack
+//                      swiftlet-repack --from-url <base-url> --output <dir>.qpack
 // The streaming path never stores the raw checkpoint: bytes route from the
 // network straight into the container. Re-run to resume after interruption.
 
@@ -16,7 +17,8 @@ func value(_ flag: String) -> String? {
 guard let output = value("--output") else {
     print("usage:")
     print("  swiftlet-repack --source <mlx-checkpoint-dir> --output <dir>.qpack")
-    print("  swiftlet-repack --from-hf <org/repo> --output <dir>.qpack   (streaming, resumable)")
+    print("  swiftlet-repack --from-hf <org/repo> --output <dir>.qpack    (streaming, resumable)")
+    print("  swiftlet-repack --from-url <base-url> --output <dir>.qpack   (R2/CDN mirror, resumable)")
     exit(2)
 }
 
@@ -28,6 +30,12 @@ do {
             outputDir: URL(fileURLWithPath: output)
         )
         try installer.install()
+    } else if let base = value("--from-url") {
+        let installer = StreamingInstaller(
+            source: .baseURL(base),
+            outputDir: URL(fileURLWithPath: output)
+        )
+        try installer.install()
     } else if let source = value("--source") {
         let repacker = QpackRepacker(
             checkpointDir: URL(fileURLWithPath: source),
@@ -35,7 +43,7 @@ do {
         )
         try repacker.repack()
     } else {
-        print("need --source or --from-hf")
+        print("need --source, --from-hf, or --from-url")
         exit(2)
     }
     print(String(format: "done in %.1fs", -start.timeIntervalSinceNow))
