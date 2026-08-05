@@ -607,6 +607,29 @@ final class HTTPChunkPump: NSObject, URLSessionDataDelegate {
         }
     }
 
+    // Validate the response BEFORE any body bytes are accepted. Without this,
+    // a rate-limit or CDN error page (429/503 HTML) gets written straight
+    // into the container as if it were weights — silent corruption that only
+    // shows up as degraded model output. On resume (fromByte > 0) the server
+    // must honor the Range with a 206: a 200 would restart the file from
+    // byte zero while we append at an offset.
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let ok = fromByte > 0 ? code == 206 : (code == 200 || code == 206)
+        if ok {
+            completionHandler(.allow)
+            return
+        }
+        lock.lock()
+        failure = StreamingInstaller.Error.httpError(url.lastPathComponent, code)
+        finished = true
+        lock.signal()
+        lock.unlock()
+        completionHandler(.cancel)
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
         queue.append(data)
