@@ -19,7 +19,12 @@ demand. The result:
 | Model | Disk | Peak RAM | Decode speed (M5 Mac) |
 |---|---|---|---|
 | [Qwen3.6-35B-A3B, 4-bit](https://huggingface.co/Leonickson/Qwen3.6-35B-A3B-qpack) | 18 GB | 2.6 GB | 7 to 11 tok/s |
+| [Qwen3.6-35B-A3B, 8-bit](https://huggingface.co/Leonickson/Qwen3.6-35B-A3B-8bit-qpack) | 34 GB | 7.6 GB | 3.5 to 4 tok/s |
 | [Qwen3-Next-80B-A3B, 4-bit](https://huggingface.co/Leonickson/Qwen3-Next-80B-A3B-qpack) | 42 GB | 4.3 GB | 4.5 to 5 tok/s |
+
+The 8-bit 35B is the quality tier for Macs: tested head to head on identical
+prompts, it removes the repetition artifacts the 4-bit build can show on
+longer writing tasks, at the cost of disk, RAM, and speed.
 
 The 35B also runs on an iPhone 17 in about 2.5 GB of RAM, at about 1 tok/s
 today. Credit where due: [ANEMLL](https://www.anemll.com/) showed a 397B
@@ -50,9 +55,15 @@ swift build -c release
   --from-url https://pub-c0cfece2dbc340dbb2cd9d94310a7d68.r2.dev/qwen3-next-80b-qpack \
   --output ~/models/qwen3-next-80b.qpack
 
+# Or the 8-bit 35B (best writing quality, 34 GB disk, ~7.6 GB RAM):
+.build/release/swiftlet-repack \
+  --from-url https://pub-c0cfece2dbc340dbb2cd9d94310a7d68.r2.dev/qwen3.6-35b-8bit-qpack \
+  --output ~/models/qwen3.6-35b-8bit.qpack
+
 # The same containers are on Hugging Face (anonymous downloads are
 # rate-limited there, so the mirror is usually much faster):
 #   --from-hf Leonickson/Qwen3.6-35B-A3B-qpack
+#   --from-hf Leonickson/Qwen3.6-35B-A3B-8bit-qpack
 #   --from-hf Leonickson/Qwen3-Next-80B-A3B-qpack
 
 # Verify a finished download against the source hashes (optional):
@@ -75,7 +86,7 @@ The same command also repacks raw MLX checkpoints
 (`--from-hf mlx-community/...` or `--source /path/to/checkpoint`).
 
 Requirements: Apple Silicon, macOS 14+ or iOS 17+, free SSD space for the
-container (18 GB for the 35B, 42 GB for the 80B).
+container (18 GB for the 35B, 34 GB for the 8-bit 35B, 42 GB for the 80B).
 
 ## Try it on your phone
 
