@@ -3,13 +3,12 @@ import NIOCore
 import NIOHTTP1
 import NIOPosix
 import SwiftletCore
-import Tokenizers
 
 // Loopback OpenAI-compatible Chat Completions server (modeled on
 // TurboFieldfare's). One warm model, requests serialized. No auth/TLS: keep it
 // on 127.0.0.1.
 //
-//   swiftlet-server --model <dir> [--port 8080]
+//   swiftlet-server --model <dir> [--port 8080] [--cache-gb 2]
 
 struct ChatRequest: Decodable {
     struct Message: Decodable { let role: String; let content: String }
@@ -17,6 +16,8 @@ struct ChatRequest: Decodable {
     let stream: Bool?
     let max_tokens: Int?
     let max_completion_tokens: Int?
+    let temperature: Float?
+    let top_p: Float?
 }
 
 let cliArgs = CommandLine.arguments
@@ -25,19 +26,26 @@ func flag(_ name: String) -> String? {
     return cliArgs[i + 1]
 }
 guard let modelPath = flag("--model") else {
-    print("usage: swiftlet-server --model <dir> [--port 8080]")
+    print("usage: swiftlet-server --model <dir> [--port 8080] [--cache-gb 2]")
     exit(2)
 }
 let port = Int(flag("--port") ?? "8080") ?? 8080
+let cacheGB = Double(flag("--cache-gb") ?? "2") ?? 2
 let modelURL = URL(fileURLWithPath: modelPath)
 
 FileHandle.standardError.write(Data("loading model + tokenizer...\n".utf8))
-let tokenizer = try await AutoTokenizer.from(modelFolder: modelURL)
-let cpuModel = try QwenCPUModel(modelDir: modelURL)
-cpuModel.retainAllLayers = true
-let generator = TextGenerator(model: cpuModel)
-let modelName = cpuModel.config.modelType
-// One request at a time: the generator mutates shared per-layer caches.
+// The same Metal streaming engine as `swiftlet chat`: routed experts stream
+// from the .qpack blobs, so a 35B/80B container serves in a few GB of RAM.
+// (The CPU model reader cannot serve containers: their experts are not in
+// model.safetensors.)
+let session = try await SwiftletSession(modelDir: modelURL, cacheBudgetGB: cacheGB)
+let modelName: String = {
+    let configURL = modelURL.appendingPathComponent("config.json")
+    if let cfg = try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any],
+       let t = cfg["model_type"] as? String { return t }
+    return "swiftlet"
+}()
+// One request at a time: the session mutates shared conversation state.
 let generationQueue = DispatchQueue(label: "swiftlet.generation")
 
 @Sendable func jsonData(_ obj: [String: Any]) -> Data {
@@ -107,6 +115,15 @@ final class HTTPHandler: ChannelInboundHandler {
         let eventLoop = context.eventLoop
         let channel = context.channel
 
+        let options: SwiftletSession.GenerationOptions = {
+            var o = SwiftletSession.GenerationOptions()
+            if let t = request.temperature {
+                if t <= 0 { o = .greedy } else { o.temperature = t }
+            }
+            if let p = request.top_p { o.topP = p }
+            return o
+        }()
+
         if streaming {
             var head = HTTPResponseHead(version: .http1_1, status: .ok)
             head.headers.add(name: "Content-Type", value: "text/event-stream")
@@ -124,43 +141,50 @@ final class HTTPHandler: ChannelInboundHandler {
             }
         }
 
-        generationQueue.async { [wrapOutboundOut] in
-            do {
-                let promptIds = try tokenizer.applyChatTemplate(messages: messages)
-                var generated: [Int] = []
-                var printedText = ""
-                let stats = try generator.generate(promptIds: promptIds, maxNew: maxNew) { token in
-                    generated.append(token)
-                    if streaming {
-                        let text = tokenizer.decode(tokens: generated)
-                        if text.hasPrefix(printedText) {
-                            let delta = String(text.dropFirst(printedText.count))
-                            if !delta.isEmpty {
-                                writeSSE(completionPayload(id: id, text: nil, delta: delta, finish: nil))
-                                printedText = text
-                            }
+        generationQueue.async {
+            let done = DispatchSemaphore(value: 0)
+            Task {
+                defer { done.signal() }
+                do {
+                    var fullText = ""
+                    for try await delta in session.streamChat(
+                        messages: messages, maxNew: maxNew, options: options
+                    ) {
+                        fullText += delta
+                        if streaming {
+                            writeSSE(completionPayload(id: id, text: nil, delta: delta, finish: nil))
                         }
                     }
-                    return true
-                }
-                let fullText = tokenizer.decode(tokens: generated)
-                FileHandle.standardError.write(Data(String(
-                    format: "[%@] %d prompt + %d generated, prefill %.1fs, %.2f tok/s\n",
-                    id as NSString, stats.promptTokens, stats.generatedTokens,
-                    stats.prefillSeconds, Double(stats.generatedTokens) / max(stats.decodeSeconds, 0.001)
-                ).utf8))
+                    let m = session.lastMetrics
+                    FileHandle.standardError.write(Data(String(
+                        format: "[%@] %d prompt + %d generated, ttft %.1fs, %.2f tok/s\n",
+                        id as NSString, m.promptTokens, m.generatedTokens,
+                        m.timeToFirstToken, m.tokensPerSecond
+                    ).utf8))
 
-                eventLoop.execute {
-                    if streaming {
-                        writeSSE(completionPayload(id: id, text: nil, delta: "", finish: "stop"))
-                        var buf = channel.allocator.buffer(capacity: 16)
-                        buf.writeString("data: [DONE]\n\n")
-                        _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
-                        _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
-                    } else {
-                        let data = jsonData(completionPayload(id: id, text: fullText, delta: nil, finish: "stop"))
-                        var head = HTTPResponseHead(version: .http1_1, status: .ok)
-                        head.headers.add(name: "Content-Type", value: "application/json")
+                    eventLoop.execute {
+                        if streaming {
+                            writeSSE(completionPayload(id: id, text: nil, delta: "", finish: "stop"))
+                            var buf = channel.allocator.buffer(capacity: 16)
+                            buf.writeString("data: [DONE]\n\n")
+                            _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
+                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                        } else {
+                            let data = jsonData(completionPayload(id: id, text: fullText, delta: nil, finish: "stop"))
+                            var head = HTTPResponseHead(version: .http1_1, status: .ok)
+                            head.headers.add(name: "Content-Type", value: "application/json")
+                            head.headers.add(name: "Content-Length", value: String(data.count))
+                            var buf = channel.allocator.buffer(capacity: data.count)
+                            buf.writeBytes(data)
+                            _ = channel.write(HTTPServerResponsePart.head(head))
+                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
+                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                        }
+                    }
+                } catch {
+                    eventLoop.execute {
+                        let data = jsonData(["error": "\(error)"])
+                        var head = HTTPResponseHead(version: .http1_1, status: .internalServerError)
                         head.headers.add(name: "Content-Length", value: String(data.count))
                         var buf = channel.allocator.buffer(capacity: data.count)
                         buf.writeBytes(data)
@@ -169,18 +193,8 @@ final class HTTPHandler: ChannelInboundHandler {
                         _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
                     }
                 }
-            } catch {
-                eventLoop.execute {
-                    let data = jsonData(["error": "\(error)"])
-                    var head = HTTPResponseHead(version: .http1_1, status: .internalServerError)
-                    head.headers.add(name: "Content-Length", value: String(data.count))
-                    var buf = channel.allocator.buffer(capacity: data.count)
-                    buf.writeBytes(data)
-                    _ = channel.write(HTTPServerResponsePart.head(head))
-                    _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
-                    _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
-                }
             }
+            done.wait()
         }
     }
 
