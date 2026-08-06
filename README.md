@@ -157,6 +157,13 @@ changes model semantics: an expert answers identically from cache or disk.
 swift test
 ```
 
+## Roadmap
+
+- Batched prefill: long prompts currently process at decode speed, so agent
+  clients with big system prompts are slow. Top of the list.
+- Phone speed pass: fp16 activations and fewer GPU dispatches per token.
+- A 6-bit container tier between the 4-bit and 8-bit ones.
+
 ## Relationship to TurboFieldfare
 
 [TurboFieldfare](https://github.com/drumih/turbo-fieldfare) proved the
