@@ -18,8 +18,8 @@ import Testing
     static func bf16(_ f: Float) -> UInt16 { UInt16(truncatingIfNeeded: f.bitPattern >> 16) }
     static func fromBF16(_ u: UInt16) -> Float { Float(bitPattern: UInt32(u) << 16) }
 
-    @Test(arguments: [4, 8])
-    func gemvAffineMatchesCPU(bits: Int) throws {
+    @Test(arguments: [4, 8], [false, true])
+    func gemvAffineMatchesCPU(bits: Int, useFast: Bool) throws {
         let engine = try MetalEngine()
         let O = 48, I = 128, group = 32
         let perWord = 32 / bits
@@ -53,7 +53,8 @@ import Testing
             packed: packed.withUnsafeBytes { Data($0) },
             scales: scalesF.withUnsafeBytes { Data($0) },
             biases: biasesF.withUnsafeBytes { Data($0) },
-            outDim: O, inDim: I, groupSize: group, bits: bits, scalesType: .f32
+            outDim: O, inDim: I, groupSize: group, bits: bits, scalesType: .f32,
+            useFast: useFast
         )
         let refF32 = cpuReference(scaleAt: { scalesF[$0] }, biasAt: { biasesF[$0] })
         for i in 0..<O { #expect(abs(yF32[i] - refF32[i]) < 1e-3, "f32 row \(i): \(yF32[i]) vs \(refF32[i])") }
@@ -66,7 +67,8 @@ import Testing
             packed: packed.withUnsafeBytes { Data($0) },
             scales: scalesB.withUnsafeBytes { Data($0) },
             biases: biasesB.withUnsafeBytes { Data($0) },
-            outDim: O, inDim: I, groupSize: group, bits: bits, scalesType: .bf16
+            outDim: O, inDim: I, groupSize: group, bits: bits, scalesType: .bf16,
+            useFast: useFast
         )
         let refBF16 = cpuReference(
             scaleAt: { Self.fromBF16(scalesB[$0]) }, biasAt: { Self.fromBF16(biasesB[$0]) }

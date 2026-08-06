@@ -104,10 +104,13 @@ public final class MetalEngine {
             // Cooperative fast path: one simdgroup per row, vectorized loads.
             // Needs 4-byte-aligned rows (qpack blobs and resident buffers are).
             // SWIFTLET_NO_FAST_GEMV=1 forces the scalar kernel (A/B debugging).
-            let fast = Self.fastGemvEnabled && lin.bits == 4 && lin.groupSize % 8 == 0
-                && (lin.wOff + wExtra) % 4 == 0 && (lin.inDim / 8) % 1 == 0
-            if fast {
-                let pipe = try pipeline("gemv_affine_fast")
+            let aligned = (lin.wOff + wExtra) % 4 == 0
+            let fastName: String? = !Self.fastGemvEnabled || !aligned ? nil
+                : lin.bits == 4 && lin.groupSize % 8 == 0 ? "gemv_affine_fast"
+                : lin.bits == 8 && lin.groupSize % 4 == 0 ? "gemv_affine_fast8"
+                : nil
+            if let fastName {
+                let pipe = try pipeline(fastName)
                 enc.setComputePipelineState(pipe)
                 var p = GemvParams(
                     wOff: UInt64(lin.wOff + wExtra), sOff: UInt64(lin.sOff + sExtra),
@@ -186,9 +189,11 @@ public final class MetalEngine {
     /// Blocking quantized GEMV: y = W x with MLX affine layout.
     public func gemvQuantized(
         x: [Float], packed: Data, scales: Data, biases: Data,
-        outDim: Int, inDim: Int, groupSize: Int, bits: Int, scalesType: ScalesType
+        outDim: Int, inDim: Int, groupSize: Int, bits: Int, scalesType: ScalesType,
+        useFast: Bool = false
     ) throws -> [Float] {
-        let pipe = try pipeline("gemv_affine")
+        let pipe = try pipeline(
+            useFast ? (bits == 4 ? "gemv_affine_fast" : "gemv_affine_fast8") : "gemv_affine")
         var params = GemvParams(
             outDim: UInt32(outDim), inDim: UInt32(inDim),
             groupSize: UInt32(groupSize), bits: UInt32(bits),
@@ -205,11 +210,18 @@ public final class MetalEngine {
         enc.setBuffer(makeBuffer(biases), offset: 0, index: 3)
         enc.setBuffer(yBuf, offset: 0, index: 4)
         enc.setBytes(&params, length: MemoryLayout<GemvParams>.stride, index: 5)
-        let tg = min(pipe.maxTotalThreadsPerThreadgroup, 64)
-        enc.dispatchThreads(
-            MTLSize(width: outDim, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1)
-        )
+        if useFast {
+            enc.dispatchThreads(
+                MTLSize(width: 32, height: outDim, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+            )
+        } else {
+            let tg = min(pipe.maxTotalThreadsPerThreadgroup, 64)
+            enc.dispatchThreads(
+                MTLSize(width: outDim, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1)
+            )
+        }
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()

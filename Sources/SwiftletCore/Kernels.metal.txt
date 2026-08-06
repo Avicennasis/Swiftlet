@@ -260,6 +260,48 @@ kernel void gemv_affine_fast(
     if (lane == 0) y[p.yOff + row] = acc;
 }
 
+// 8-bit variant of the fast path: 4 weights per uint32 word. Same alignment
+// requirement; group size divisible by 4.
+kernel void gemv_affine_fast8(
+    device const float *x       [[buffer(0)]],
+    device const uchar *w       [[buffer(1)]],
+    device const uchar *scales  [[buffer(2)]],
+    device const uchar *biases  [[buffer(3)]],
+    device float       *y       [[buffer(4)]],
+    constant GemvParams &p      [[buffer(5)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tpg.y;
+    if (row >= p.outDim) return;
+    const uint packedCols = p.inDim / 4;           // uint32 words per row
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / 4;
+    device const uint *wr = (device const uint *)(w + p.wOff + ulong(row) * packedCols * 4);
+
+    float acc = 0;
+    for (uint g = lane; g < groups; g += 32) {
+        float qdot = 0;
+        float xsum = 0;
+        uint base = g * wordsPerGroup;
+        uint xbase = p.xOff + g * p.groupSize;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            uint word = wr[base + wi];
+            uint xo = xbase + wi * 4;
+            qdot += float(word & 0xFF) * x[xo]
+                  + float((word >> 8) & 0xFF) * x[xo + 1]
+                  + float((word >> 16) & 0xFF) * x[xo + 2]
+                  + float((word >> 24) & 0xFF) * x[xo + 3];
+            xsum += x[xo] + x[xo+1] + x[xo+2] + x[xo+3];
+        }
+        uint gi = row * groups + g;
+        acc += load_scale(scales, p.sOff, gi, p.scalesType) * qdot
+             + load_scale(biases, p.bOff, gi, p.scalesType) * xsum;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[p.yOff + row] = acc;
+}
+
 // ===== Small glue kernels so a token needs few command buffers. =====
 
 // RMSNorm over `rows` rows of `dim`, in place at data[off...]. Optional
