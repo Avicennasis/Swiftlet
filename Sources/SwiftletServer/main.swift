@@ -52,18 +52,29 @@ let generationQueue = DispatchQueue(label: "swiftlet.generation")
     (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
 }
 
-@Sendable func completionPayload(id: String, text: String?, delta: String?, finish: String?) -> [String: Any] {
+@Sendable func completionPayload(
+    id: String, text: String?, delta: String?, finish: String?,
+    usage: (prompt: Int, completion: Int)? = nil
+) -> [String: Any] {
     var choice: [String: Any] = ["index": 0]
     if let text { choice["message"] = ["role": "assistant", "content": text] }
     if let delta { choice["delta"] = ["content": delta] }
     if let finish { choice["finish_reason"] = finish }
-    return [
+    var payload: [String: Any] = [
         "id": id,
         "object": delta != nil ? "chat.completion.chunk" : "chat.completion",
         "created": Int(Date().timeIntervalSince1970),
         "model": modelName,
         "choices": [choice],
     ]
+    if let usage {
+        payload["usage"] = [
+            "prompt_tokens": usage.prompt,
+            "completion_tokens": usage.completion,
+            "total_tokens": usage.prompt + usage.completion,
+        ]
+    }
+    return payload
 }
 
 final class HTTPHandler: ChannelInboundHandler {
@@ -124,13 +135,25 @@ final class HTTPHandler: ChannelInboundHandler {
             return o
         }()
 
+        // Agent clients (OpenCode etc.) send multi-thousand-token prompts, so
+        // prefill can run minutes with no output. SSE comment heartbeats keep
+        // the idle connection from being dropped; parsers ignore them.
+        var heartbeat: RepeatedTask? = nil
         if streaming {
             var head = HTTPResponseHead(version: .http1_1, status: .ok)
             head.headers.add(name: "Content-Type", value: "text/event-stream")
             head.headers.add(name: "Cache-Control", value: "no-cache")
             head.headers.add(name: "Transfer-Encoding", value: "chunked")
             context.writeAndFlush(wrapOutboundOut(.head(head)), promise: nil)
+            heartbeat = eventLoop.scheduleRepeatedTask(
+                initialDelay: .seconds(15), delay: .seconds(15)
+            ) { _ in
+                var buf = channel.allocator.buffer(capacity: 16)
+                buf.writeString(": ping\n\n")
+                _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
+            }
         }
+        let stopHeartbeat = heartbeat
 
         @Sendable func writeSSE(_ obj: [String: Any]) {
             let payload = "data: " + (String(data: jsonData(obj), encoding: .utf8) ?? "{}") + "\n\n"
@@ -163,14 +186,27 @@ final class HTTPHandler: ChannelInboundHandler {
                     ).utf8))
 
                     eventLoop.execute {
+                        stopHeartbeat?.cancel()
                         if streaming {
-                            writeSSE(completionPayload(id: id, text: nil, delta: "", finish: "stop"))
-                            var buf = channel.allocator.buffer(capacity: 16)
-                            buf.writeString("data: [DONE]\n\n")
-                            _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
+                            // The finish chunk, [DONE], and the HTTP end must
+                            // land in this order on the wire. Write them here
+                            // directly: routing the finish chunk through
+                            // writeSSE would re-enqueue it on the event loop
+                            // and it would land after .end and be dropped
+                            // (strict clients then wait for it forever).
+                            let finish = jsonData(completionPayload(
+                                id: id, text: nil, delta: "", finish: "stop",
+                                usage: (m.promptTokens, m.generatedTokens)))
+                            let tail = "data: " + (String(data: finish, encoding: .utf8) ?? "{}")
+                                + "\n\ndata: [DONE]\n\n"
+                            var buf = channel.allocator.buffer(capacity: tail.utf8.count)
+                            buf.writeString(tail)
+                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
                             _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
                         } else {
-                            let data = jsonData(completionPayload(id: id, text: fullText, delta: nil, finish: "stop"))
+                            let data = jsonData(completionPayload(
+                                id: id, text: fullText, delta: nil, finish: "stop",
+                                usage: (m.promptTokens, m.generatedTokens)))
                             var head = HTTPResponseHead(version: .http1_1, status: .ok)
                             head.headers.add(name: "Content-Type", value: "application/json")
                             head.headers.add(name: "Content-Length", value: String(data.count))
@@ -183,14 +219,28 @@ final class HTTPHandler: ChannelInboundHandler {
                     }
                 } catch {
                     eventLoop.execute {
-                        let data = jsonData(["error": "\(error)"])
-                        var head = HTTPResponseHead(version: .http1_1, status: .internalServerError)
-                        head.headers.add(name: "Content-Length", value: String(data.count))
-                        var buf = channel.allocator.buffer(capacity: data.count)
-                        buf.writeBytes(data)
-                        _ = channel.write(HTTPServerResponsePart.head(head))
-                        _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
-                        _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                        stopHeartbeat?.cancel()
+                        if streaming {
+                            // The 200 + SSE head is already on the wire; a
+                            // second head would be a protocol error. Report
+                            // the failure as an SSE event and end the stream.
+                            let payload = "data: " + (String(
+                                data: jsonData(["error": "\(error)"]), encoding: .utf8
+                            ) ?? "{}") + "\n\ndata: [DONE]\n\n"
+                            var buf = channel.allocator.buffer(capacity: payload.utf8.count)
+                            buf.writeString(payload)
+                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
+                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                        } else {
+                            let data = jsonData(["error": "\(error)"])
+                            var head = HTTPResponseHead(version: .http1_1, status: .internalServerError)
+                            head.headers.add(name: "Content-Length", value: String(data.count))
+                            var buf = channel.allocator.buffer(capacity: data.count)
+                            buf.writeBytes(data)
+                            _ = channel.write(HTTPServerResponsePart.head(head))
+                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
+                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                        }
                     }
                 }
             }
