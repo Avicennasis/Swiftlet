@@ -77,16 +77,26 @@ public final class SwiftletSession: @unchecked Sendable {
         }
         config = model.config
         generator = TextGenerator(model: model)
-        // In no-think mode Qwen3.6 likes to emit stray <think>/</think>
-        // tokens (sometimes mid-answer, truncating it if treated as a stop).
-        // Ban them from sampling entirely: with reasoning disabled they are
-        // never legitimate output, and banning them forces real content
-        // until EOS. <|im_start|> is chat markup, never legal output either.
+        // Special tokens (think tags, chat markup, FIM markers, vision and
+        // tool tags) are never legitimate chat output, but a model pushed off
+        // a momentarily-banned EOS will land on one of them: greedy 80B
+        // emitted a literal <|fim_middle|> when its natural stop was gated.
+        // Ban every added special token from sampling except the real stop
+        // tokens (the same mechanism as HF's SuppressTokensLogitsProcessor).
         var banned = Set<Int>()
-        for tag in ["<think>", "</think>", "<|im_start|>"] {
-            let ids = tokenizer.encode(text: tag)
-            if ids.count == 1 { banned.formUnion(ids) }
+        let tokCfgURL = modelDir.appendingPathComponent("tokenizer_config.json")
+        if let cfg = try? JSONSerialization.jsonObject(with: Data(contentsOf: tokCfgURL)) as? [String: Any],
+           let added = cfg["added_tokens_decoder"] as? [String: Any] {
+            for key in added.keys { if let id = Int(key) { banned.insert(id) } }
         }
+        if banned.isEmpty {
+            // No readable token config: fall back to banning the known-bad ones.
+            for tag in ["<think>", "</think>", "<|im_start|>"] {
+                let ids = tokenizer.encode(text: tag)
+                if ids.count == 1 { banned.formUnion(ids) }
+            }
+        }
+        banned.subtract(generator.eosTokens)
         suppressedIds = banned
         // Thinking-family templates (Qwen3.6) end the generation prompt with
         // "<think>\n"; instruct-family ones (Qwen3-Next-Instruct) don't.
@@ -202,6 +212,15 @@ public final class SwiftletSession: @unchecked Sendable {
         return tokenizer.encode(text: turn)
     }
 
+    /// Drops the replacement characters an incomplete trailing multi-byte
+    /// sequence decodes to. Interior U+FFFD (a model genuinely emitting the
+    /// replacement character) is preserved; only the unstable tail is held.
+    static func trimIncompleteUTF8(_ s: String) -> String {
+        var t = s
+        while t.hasSuffix("\u{FFFD}") { t.removeLast() }
+        return t
+    }
+
     /// One sampled token. Presence penalty pushes down everything generated
     /// so far; top-k/top-p/temperature otherwise standard.
     private func sample(_ logitsIn: [Float], options: GenerationOptions, seen: [Int: Int], banEOS: Bool) -> Int {
@@ -296,18 +315,27 @@ public final class SwiftletSession: @unchecked Sendable {
                     var stopReason = "maxNew"
                     for _ in 0..<maxNew {
                         self.applyPendingShrink()
-                        // EOS is legal only for a reply that reads finished:
-                        // long enough AND ending at a sentence or line break
-                        // (a stop after "are:" mid-list is never valid). The
-                        // 300-token escape keeps a punctuation-averse reply
-                        // from running to maxNew.
+                        // EOS is legal when the reply reads finished (ends at
+                        // a sentence or line break; a stop after "are:"
+                        // mid-list is never valid) OR when EOS is the model's
+                        // top choice outright: a model that strongly wants to
+                        // stop knows the reply is done even after ")" or a
+                        // quote, and forcing it past its stop just makes it
+                        // emit junk. The 300-token escape keeps a
+                        // punctuation-averse reply from running to maxNew.
                         let tail = printed.hasSuffix("\n") || {
                             guard let last = printed.trimmingCharacters(in: .whitespacesAndNewlines).last
                             else { return false }
                             return ".!?。！？".contains(last)
                         }()
+                        let eosIsTop = { () -> Bool in
+                            let vocab = min(self.config.vocabSize, logits.count)
+                            var best = 0
+                            for v in 1..<vocab where logits[v] > logits[best] { best = v }
+                            return self.generator.eosTokens.contains(best)
+                        }()
                         let eosAllowed = generated.count >= options.minNew
-                            && (tail || generated.count >= 300)
+                            && (tail || eosIsTop || generated.count >= 300)
                         let best = self.sample(logits, options: options, seen: generatedCounts,
                                                banEOS: !eosAllowed)
                         if self.generator.eosTokens.contains(best) {
@@ -318,7 +346,16 @@ public final class SwiftletSession: @unchecked Sendable {
                         if firstTokenAt == nil { firstTokenAt = Date() }
                         generated.append(best)
                         generatedCounts[best, default: 0] += 1
-                        let text = self.tokenizer.decode(tokens: generated)
+                        // Byte-level BPE tokens can split a multi-byte
+                        // character; the incomplete tail decodes as U+FFFD and
+                        // must never be emitted or recorded: once the next
+                        // token completes the character, the re-decode no
+                        // longer has `printed` as a prefix and every later
+                        // delta would be dropped (issue #9). Hold the unstable
+                        // tail back until it resolves, the same policy as
+                        // llama.cpp's validate_utf8 and vLLM's detokenizer.
+                        let text = Self.trimIncompleteUTF8(
+                            self.tokenizer.decode(tokens: generated))
                         var terminated = false
                         if text.hasPrefix(printed) {
                             let delta = String(text.dropFirst(printed.count))
@@ -340,7 +377,8 @@ public final class SwiftletSession: @unchecked Sendable {
                     }
 
                     self.lastMessages = messages
-                    self.lastReplyText = self.tokenizer.decode(tokens: generated)
+                    self.lastReplyText = Self.trimIncompleteUTF8(
+                        self.tokenizer.decode(tokens: generated))
                     self.statePrimed = cleanEnd && !generated.isEmpty
 
                     self.metricsLock.lock()
