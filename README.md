@@ -1,5 +1,7 @@
 # Swiftlet
 
+<a href="https://trendshift.io/repositories/102405?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-102405" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/102405/daily?language=Swift" alt="leonickson1%2FSwiftlet | Trendshift" width="250" height="55"/></a>
+
 ![Platforms](https://img.shields.io/badge/platforms-macOS%2014%2B%20%7C%20iOS%2017%2B-blue)
 ![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange)
 ![Metal](https://img.shields.io/badge/GPU-Metal-8A2BE2)
