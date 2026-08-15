@@ -159,6 +159,13 @@ changes model semantics: an expert answers identically from cache or disk.
 swift test
 ```
 
+The test suite uses [Swift Testing](https://developer.apple.com/documentation/testing),
+which ships with the full Xcode toolchain (Xcode 16+) and with Swift.org
+toolchains. If `swift build` succeeds but `swift test` fails with
+`no such module 'Testing'`, the bare Command Line Tools are selected rather than
+a full toolchain; point at Xcode with `sudo xcode-select -s /Applications/Xcode.app`
+(or run through `xcrun`).
+
 ## Roadmap
 
 - Batched prefill: long prompts currently process at decode speed, so agent
