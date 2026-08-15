@@ -26,6 +26,13 @@ public final class SwiftletSession: @unchecked Sendable {
         /// Additional penalty that grows with each repetition — this is what
         /// actually breaks degenerate loops that a one-time penalty can't.
         public var frequencyPenalty: Float = 0.5
+        /// Blocks any token that would repeat an already-emitted n-gram of this
+        /// length. This is the deterministic loop-breaker greedy decoding needs:
+        /// pure argmax on a quantized checkpoint otherwise falls into verbatim
+        /// repetition cycles (issue #13), and penalties alone are probabilistic.
+        /// 0 disables it; 3 is the standard safe value (short legitimate repeats
+        /// in code, like indentation or operators, stay allowed).
+        public var noRepeatNGram: Int = 3
         /// EOS is banned until this many tokens exist. Quantized models given
         /// a "be concise" system prompt put real probability on stopping after
         /// 1-2 tokens ("I can" <eos>); a minimum length makes that impossible.
@@ -34,8 +41,16 @@ public final class SwiftletSession: @unchecked Sendable {
         public static var greedy: GenerationOptions {
             var o = GenerationOptions()
             o.temperature = 0
+            // Greedy means a deterministic pick, not "no loop protection". The
+            // frequency penalty and the n-gram block are both deterministic
+            // functions of the generated history, so the pick stays fully
+            // reproducible while degenerate repetition loops are broken (issue
+            // #13: temperature 0 code prompts collapsed into verbatim cycles).
+            // Only the flat presence penalty is dropped, because it distorts the
+            // legitimate repetition in code (indentation, keywords, operators).
             o.presencePenalty = 0
-            o.frequencyPenalty = 0
+            o.frequencyPenalty = 0.5
+            o.noRepeatNGram = 3
             return o
         }
     }
@@ -221,9 +236,31 @@ public final class SwiftletSession: @unchecked Sendable {
         return t
     }
 
+    /// Tokens that would complete an n-gram (length `n`) already emitted in
+    /// `generated`. Banning them guarantees no verbatim n-gram — and therefore
+    /// no verbatim repetition loop — can recur, which is the deterministic
+    /// loop-breaker greedy decode needs (issue #13). Returns an empty set when
+    /// `n` disables the guard or there is not yet a full n-gram of history.
+    static func noRepeatNGramBanned(generated: [Int], n: Int) -> Set<Int> {
+        guard n >= 2, generated.count >= n else { return [] }
+        let prefix = Array(generated.suffix(n - 1))
+        let lastStart = generated.count - (n - 1)   // exclusive: skips `prefix` itself
+        var banned = Set<Int>()
+        var i = 0
+        while i < lastStart {
+            if Array(generated[i..<i + (n - 1)]) == prefix {
+                banned.insert(generated[i + (n - 1)])
+            }
+            i += 1
+        }
+        return banned
+    }
+
     /// One sampled token. Presence penalty pushes down everything generated
-    /// so far; top-k/top-p/temperature otherwise standard.
-    private func sample(_ logitsIn: [Float], options: GenerationOptions, seen: [Int: Int], banEOS: Bool) -> Int {
+    /// so far; top-k/top-p/temperature otherwise standard. `generated` is the
+    /// ordered history, used only for the no-repeat-n-gram loop guard.
+    private func sample(_ logitsIn: [Float], options: GenerationOptions,
+                        generated: [Int], seen: [Int: Int], banEOS: Bool) -> Int {
         var logits = logitsIn
         for t in suppressedIds { logits[t] = -.infinity }
         if banEOS {
@@ -235,6 +272,15 @@ public final class SwiftletSession: @unchecked Sendable {
             }
         }
         let vocab = min(config.vocabSize, logits.count)
+        // Hard loop-breaker: forbid completing an n-gram that already occurred,
+        // so no verbatim sequence can repeat (issue #13). Skipped in the
+        // degenerate case where it would ban the entire candidate set.
+        if options.noRepeatNGram >= 2 {
+            let banned = Self.noRepeatNGramBanned(generated: generated, n: options.noRepeatNGram)
+            if !banned.isEmpty && banned.count < vocab {
+                for t in banned where t < logits.count { logits[t] = -.infinity }
+            }
+        }
         if options.temperature <= 0 {
             var best = 0
             for v in 1..<vocab where logits[v] > logits[best] { best = v }
@@ -336,8 +382,8 @@ public final class SwiftletSession: @unchecked Sendable {
                         }()
                         let eosAllowed = generated.count >= options.minNew
                             && (tail || eosIsTop || generated.count >= 300)
-                        let best = self.sample(logits, options: options, seen: generatedCounts,
-                                               banEOS: !eosAllowed)
+                        let best = self.sample(logits, options: options, generated: generated,
+                                               seen: generatedCounts, banEOS: !eosAllowed)
                         if self.generator.eosTokens.contains(best) {
                             cleanEnd = true
                             stopReason = "eos"
