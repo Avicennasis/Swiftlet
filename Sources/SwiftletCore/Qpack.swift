@@ -61,6 +61,26 @@ public struct QpackRepacker {
 
     static let expertTensorSuffixes = ["gate_proj", "up_proj", "down_proj"]
 
+    /// Follows a (possibly relative, possibly chained) symlink to the real file
+    /// it points at, returning the input unchanged when it is not a symlink.
+    /// Hugging Face snapshot dirs point aux files at ../../blobs/<hash> via a
+    /// single relative link; resolving it lets the repacker copy real bytes
+    /// instead of a link that dangles once the container moves (issue #11).
+    static func resolveSymlink(_ url: URL, fileManager fm: FileManager = .default) -> URL {
+        var current = url
+        var hops = 0
+        while hops < 16, let dest = try? fm.destinationOfSymbolicLink(atPath: current.path) {
+            if (dest as NSString).isAbsolutePath {
+                current = URL(fileURLWithPath: dest).standardizedFileURL
+            } else {
+                current = URL(fileURLWithPath: dest,
+                              relativeTo: current.deletingLastPathComponent()).standardizedFileURL
+            }
+            hops += 1
+        }
+        return current
+    }
+
     public func repack() throws {
         let fm = FileManager.default
         let config = try QwenConfig(url: checkpointDir.appendingPathComponent("config.json"))
@@ -147,7 +167,12 @@ public struct QpackRepacker {
             guard fm.fileExists(atPath: src.path) else { continue }
             let dst = outputDir.appendingPathComponent(aux)
             try? fm.removeItem(at: dst)
-            try fm.copyItem(at: src, to: dst)
+            // Hugging Face snapshot dirs store these as relative symlinks into
+            // ../../blobs; copyItem preserves the link verbatim, so the
+            // container ships a dangling symlink and swiftlet-server fails with
+            // configurationMissing (issue #11). Resolve to the real file first
+            // so the actual bytes land in the container.
+            try fm.copyItem(at: Self.resolveSymlink(src, fileManager: fm), to: dst)
             files[aux] = try fm.attributesOfItem(atPath: dst.path)[.size] as? Int ?? 0
         }
 
