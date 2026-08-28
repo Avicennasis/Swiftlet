@@ -63,6 +63,7 @@ public final class StreamingInstaller {
         case httpError(String, Int)
         case ioError(String)
         case cancelled
+        case notMLXCheckpoint
 
         public var errorDescription: String? {
             switch self {
@@ -71,6 +72,10 @@ public final class StreamingInstaller {
             case .httpError(let f, let c): return "network error \(c) on \(f)"
             case .ioError(let f): return "could not write \(f)"
             case .cancelled: return "cancelled"
+            case .notMLXCheckpoint:
+                return "no model.layers.0.mlp.switch_mlp.* tensors found -- this is not "
+                    + "an mlx-lm runtime-format checkpoint. Convert it with mlx-lm first "
+                    + "(raw Hugging Face checkpoints store experts as .mlp.experts.N.*)."
             }
         }
     }
@@ -226,6 +231,11 @@ public final class StreamingInstaller {
                 running += perBytes
             }
         }
+        // Same reasoning as QpackRepacker: an empty section table means the source
+        // is not an mlx-lm runtime-format checkpoint. Fail here rather than writing
+        // a container that cannot be loaded.
+        guard !sections.isEmpty else { throw Error.notMLXCheckpoint }
+
         let stride = Qpack.align(running, to: Qpack.pageAlignment)
         log("expert blob payload \(running) B, stride \(stride) B")
 

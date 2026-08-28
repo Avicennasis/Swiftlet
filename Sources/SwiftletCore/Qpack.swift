@@ -110,6 +110,18 @@ public struct QpackRepacker {
                 offset += perExpertBytes
             }
         }
+        // A checkpoint with no stacked expert tensors is not in mlx-lm runtime
+        // format. Without this guard the loop above silently skips every section,
+        // yielding zero-length layer files and a structurally valid container
+        // that only fails much later, at load time.
+        guard !sections.isEmpty else {
+            throw Checkpoint.Error.missingTensor(
+                l0 + "* -- no stacked expert tensors found. This is not an mlx-lm "
+                + "runtime-format checkpoint; convert it with mlx-lm first "
+                + "(raw Hugging Face checkpoints store experts as .mlp.experts.N.*)."
+            )
+        }
+
         let stride = Qpack.align(offset, to: Qpack.pageAlignment)
         let layout = Qpack.Layout(
             expertCount: config.numExperts,
