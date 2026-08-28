@@ -275,5 +275,11 @@ default:
     print("usage:")
     print("  swiftlet info <model>            model budget summary (\(ArchConfig.known.keys.sorted().joined(separator: " | ")))")
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
-    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat]")
+    print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
+    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--lazy]")
+    print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
+    print("")
+    print("  --gpu       Metal runtime; on a .qpack container experts stream through a bounded cache")
+    print("  --cache-gb  expert cache budget, default 8 (note: swiftlet-server defaults to 2)")
+    print("  --lazy      CPU path only: ~3 GB peak instead of ~10-14 GB, slower per step")
 }
