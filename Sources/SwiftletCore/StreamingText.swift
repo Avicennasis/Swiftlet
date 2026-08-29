@@ -2,38 +2,54 @@ import Foundation
 
 /// Streaming-safe text deltas over an incrementally decoded token sequence.
 ///
-/// BPE tokenizers split multi-byte UTF-8 characters (emoji in particular)
-/// across tokens. Decoding a prefix of such a sequence renders the incomplete
-/// tail as U+FFFD; emitting that replacement character is wrong twice over:
-/// the user sees a garbage glyph, and once the next token completes the
-/// character, the emitted text is no longer a prefix of the full decode — a
-/// naive `hasPrefix` delta scheme then goes silent for the rest of the turn.
+/// A BPE tokenizer breaks the stream in two ways that a grapheme-level
+/// `hasPrefix` delta scheme cannot survive, both of which silence the rest of
+/// the turn once they hit:
 ///
-/// `delta(printed:decoded:)` holds back any trailing U+FFFD run until the
-/// bytes complete, so the emitted prefix always stays a true prefix of every
-/// future decode.
+///  - It splits a character's UTF-8 bytes across tokens. The incomplete tail
+///    decodes to a trailing U+FFFD that must not be emitted.
+///  - A later token *extends* a character that already decoded cleanly. A
+///    variation selector, skin-tone modifier, or ZWJ turns ✍ (U+270D) into
+///    ✍️ (U+270D U+FE0F). Nothing is malformed, but the final grapheme cluster
+///    changed identity, so `"✍️".hasPrefix("✍")` is false and the emitted
+///    text is no longer a `Character`-prefix of the full decode.
+///
+/// Comparing on Unicode scalars fixes both. A trailing U+FFFD run is held back
+/// until it completes, and an extended cluster stays a valid scalar-prefix, so
+/// the combining scalar is emitted as its own delta and the consumer composes
+/// it onto the character already on screen. The concatenation of every delta
+/// always equals the final decoded text.
 public enum StreamingText {
-    /// `decoded` with any trailing U+FFFD run removed (an incomplete
+    /// `decoded`'s scalars with any trailing U+FFFD run removed (an incomplete
     /// multi-byte character mid-stream). U+FFFD elsewhere is preserved.
     public static func stablePrefix(_ decoded: String) -> String {
-        var s = Substring(decoded)
-        while s.hasSuffix("\u{FFFD}") { s.removeLast() }
-        return String(s)
+        var scalars = Array(decoded.unicodeScalars)
+        while scalars.last == "\u{FFFD}" { scalars.removeLast() }
+        return String(String.UnicodeScalarView(scalars))
     }
 
     /// The next emittable delta, or nil when nothing new can be emitted yet.
     /// On success, the caller should append `delta` to its output and replace
-    /// its printed-state with `printed`.
+    /// its printed-state with `printed`. Prefix and slice are computed on
+    /// Unicode scalars, so a character that a later token extends stays a
+    /// valid prefix instead of silencing the stream.
     public static func delta(printed: String, decoded: String) -> (delta: String, printed: String)? {
         let stable = stablePrefix(decoded)
-        guard stable.hasPrefix(printed), stable.count > printed.count else { return nil }
-        return (String(stable.dropFirst(printed.count)), stable)
+        let printedScalars = Array(printed.unicodeScalars)
+        let stableScalars = Array(stable.unicodeScalars)
+        guard stableScalars.count > printedScalars.count,
+              stableScalars.starts(with: printedScalars) else { return nil }
+        let deltaScalars = stableScalars[printedScalars.count...]
+        return (String(String.UnicodeScalarView(deltaScalars)), stable)
     }
 
     /// Delta for the END of a turn: the sequence is final, so a trailing
     /// U+FFFD can never complete and is emitted as-is rather than held back.
     public static func finalDelta(printed: String, decoded: String) -> String? {
-        guard decoded.hasPrefix(printed), decoded.count > printed.count else { return nil }
-        return String(decoded.dropFirst(printed.count))
+        let printedScalars = Array(printed.unicodeScalars)
+        let decodedScalars = Array(decoded.unicodeScalars)
+        guard decodedScalars.count > printedScalars.count,
+              decodedScalars.starts(with: printedScalars) else { return nil }
+        return String(String.UnicodeScalarView(decodedScalars[printedScalars.count...]))
     }
 }

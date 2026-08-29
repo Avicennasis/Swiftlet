@@ -230,10 +230,10 @@ public final class SwiftletSession: @unchecked Sendable {
     /// Drops the replacement characters an incomplete trailing multi-byte
     /// sequence decodes to. Interior U+FFFD (a model genuinely emitting the
     /// replacement character) is preserved; only the unstable tail is held.
+    /// Delegates to `StreamingText.stablePrefix` so the hold-back has one
+    /// implementation instead of a second copy layered on the streaming path.
     static func trimIncompleteUTF8(_ s: String) -> String {
-        var t = s
-        while t.hasSuffix("\u{FFFD}") { t.removeLast() }
-        return t
+        StreamingText.stablePrefix(s)
     }
 
     /// Tokens that would complete an n-gram (length `n`) already emitted in
@@ -392,21 +392,16 @@ public final class SwiftletSession: @unchecked Sendable {
                         if firstTokenAt == nil { firstTokenAt = Date() }
                         generated.append(best)
                         generatedCounts[best, default: 0] += 1
-                        // Byte-level BPE tokens can split a multi-byte
-                        // character; the incomplete tail decodes as U+FFFD and
-                        // must never be emitted or recorded: once the next
-                        // token completes the character, the re-decode no
-                        // longer has `printed` as a prefix and every later
-                        // delta would be dropped (issue #9). Hold the unstable
-                        // tail back until it resolves, the same policy as
-                        // llama.cpp's validate_utf8 and vLLM's detokenizer.
-                        let text = Self.trimIncompleteUTF8(
-                            self.tokenizer.decode(tokens: generated))
+                        // StreamingText.delta owns the hold-back: a byte-split
+                        // multi-byte character decodes with a trailing U+FFFD,
+                        // and a later token can extend an already-decoded
+                        // character with a variation selector or ZWJ. Either
+                        // one desyncs a naive prefix check and silences the
+                        // rest of the turn (issues #9 and #15). Pass the raw
+                        // decode so the trim and the scalar-level prefix run
+                        // once, in one place, not stacked with a second trim.
+                        let text = self.tokenizer.decode(tokens: generated)
                         var terminated = false
-                        // Streaming-safe delta: an emoji split across tokens
-                        // decodes with a trailing U+FFFD that must be held
-                        // back — printing it desyncs the prefix comparison
-                        // and silences the rest of the turn.
                         if let (delta, newPrinted) = StreamingText.delta(printed: printed, decoded: text) {
                             if case .terminated = continuation.yield(delta) { terminated = true }
                             printed = newPrinted

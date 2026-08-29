@@ -56,4 +56,61 @@ import Testing
         }
         #expect(out == "Wald 🌲!")
     }
+
+    // MARK: Grapheme-extension (issue #15)
+    //
+    // A later token appends a combining scalar to a character that already
+    // decoded cleanly, so no U+FFFD is ever involved. Under `Character`
+    // comparison the grown cluster is not a prefix of itself, which silenced
+    // the whole rest of the turn. Scalar comparison keeps it a valid prefix.
+
+    @Test func variationSelectorExtendsEmittedCharacter() {
+        // ✍ (U+270D) decoded first; the next token adds U+FE0F -> ✍️.
+        let r = StreamingText.delta(printed: "\u{270D}", decoded: "\u{270D}\u{FE0F} Writing")
+        #expect(r?.delta == "\u{FE0F} Writing")
+        #expect(r?.printed == "\u{270D}\u{FE0F} Writing")
+    }
+
+    @Test func skinToneModifierExtendsEmittedCharacter() {
+        // 👍 then a skin-tone modifier (U+1F3FD): the base is already on screen,
+        // so only the modifier and what follows is the new delta.
+        let r = StreamingText.delta(printed: "👍", decoded: "👍\u{1F3FD} nice")
+        #expect(r?.delta == "\u{1F3FD} nice")
+    }
+
+    @Test func zwjSequenceGrowsWithoutSilencing() {
+        // A ZWJ family emoji arriving scalar group by scalar group: every step
+        // must keep emitting rather than going quiet, and the concatenation
+        // must equal the final text.
+        var printed = ""
+        var out = ""
+        let steps = [
+            "family: \u{1F468}",                                   // 👨
+            "family: \u{1F468}\u{200D}\u{1F469}",                  // 👨‍👩
+            "family: \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", // 👨‍👩‍👧
+            "family: \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} done",
+        ]
+        for decoded in steps {
+            if let (d, p) = StreamingText.delta(printed: printed, decoded: decoded) {
+                out += d
+                printed = p
+            }
+        }
+        #expect(out == steps.last)
+    }
+
+    @Test func combinerAfterHeldBackReplacementStillResolves() {
+        // The two hazards back to back: an incomplete tail (U+FFFD) resolves
+        // into a base character, and the following token extends it. Neither
+        // step may go silent.
+        var printed = ""
+        var out = ""
+        for decoded in ["ok \u{FFFD}", "ok \u{270D}", "ok \u{270D}\u{FE0F}!"] {
+            if let (d, p) = StreamingText.delta(printed: printed, decoded: decoded) {
+                out += d
+                printed = p
+            }
+        }
+        #expect(out == "ok \u{270D}\u{FE0F}!")
+    }
 }
