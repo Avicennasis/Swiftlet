@@ -24,6 +24,14 @@ demand. The result:
 | [Qwen3.6-35B-A3B, 8-bit](https://huggingface.co/Leonickson/Qwen3.6-35B-A3B-8bit-qpack) | 34 GB | 7.6 GB | 3.5 to 4 tok/s |
 | [Qwen3-Next-80B-A3B, 4-bit](https://huggingface.co/Leonickson/Qwen3-Next-80B-A3B-qpack) | 42 GB | 4.3 GB | 4.5 to 5 tok/s |
 
+Those figures are on an M5. For a low end reference, on a base M1 (8-core GPU,
+16 GB) the 4-bit 35B decodes at about 2.5 tok/s and the 8-bit at about 1.7
+tok/s, with prefill running at that same speed. On so few GPU cores the decode
+loop is fully compute bound, so the expert cache is a memory knob rather than a
+speed one there: `--cache-gb 2` matches `--cache-gb 8` while saving several GB
+of RAM, which is the better setting on a 16 GB machine. Thanks to @Avicennasis
+for the measurements (#18).
+
 The 8-bit 35B is the quality tier for Macs: tested head to head on identical
 prompts, it removes the repetition artifacts the 4-bit build can show on
 longer writing tasks, at the cost of disk, RAM, and speed.
