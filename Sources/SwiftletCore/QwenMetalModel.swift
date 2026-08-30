@@ -7,13 +7,45 @@ import Metal
 /// delta recurrence, attention softmax over cached KV, top-k routing), all of
 /// it microseconds per token. Numerics mirror QwenCPUModel exactly.
 public final class QwenMetalModel {
+    /// S3a whole-step aggregate baseline. These totals do not identify phases,
+    /// layer costs, overlap, or command-buffer timeline gaps.
     public struct StepMetrics: Equatable, Sendable {
         public let tokensProcessed: Int
         public let logitProjections: Int
+        public let commandBuffersCommitted: Int
+        public let blockingWaits: Int
+        /// Wall time spent inside the existing waitUntilCompleted calls.
+        public let blockingWaitSeconds: Double
+        /// Compute dispatch calls encoded, including partial work if step throws.
+        public let computeDispatchesEncoded: Int
+        public let stepWallSeconds: Double
+        /// Buffers whose status was not completed after waitUntilCompleted.
+        public let commandBufferErrors: Int
+        /// Sum of valid per-command-buffer GPU durations, not an elapsed span.
+        public let gpuExecutionSeconds: Double
+        public let gpuTimedCommandBuffers: Int
+        /// Completed buffers with unavailable or invalid GPU timestamps.
+        public let gpuUntimedCommandBuffers: Int
+        /// False when step exited by throwing after publishing partial counters.
+        public let completedWithoutThrow: Bool
 
         public var avoidedLogitProjections: Int {
             max(0, tokensProcessed - logitProjections)
         }
+    }
+
+    private final class StepCounters {
+        var tokensProcessed = 0
+        var logitProjections = 0
+        var commandBuffersCommitted = 0
+        var blockingWaits = 0
+        var blockingWaitSeconds = 0.0
+        var computeDispatchesEncoded = 0
+        var commandBufferErrors = 0
+        var gpuExecutionSeconds = 0.0
+        var gpuTimedCommandBuffers = 0
+        var gpuUntimedCommandBuffers = 0
+        var completedWithoutThrow = false
     }
 
     public let config: QwenConfig
@@ -81,9 +113,15 @@ public final class QwenMetalModel {
     let xBuf: MTLBuffer
     let yBuf: MTLBuffer
     let logitsBuf: MTLBuffer
+    /// Latest step snapshot. A throwing step publishes its partial counters.
     public private(set) var lastStepMetrics = StepMetrics(
-        tokensProcessed: 0, logitProjections: 0
+        tokensProcessed: 0, logitProjections: 0,
+        commandBuffersCommitted: 0, blockingWaits: 0, blockingWaitSeconds: 0,
+        computeDispatchesEncoded: 0, stepWallSeconds: 0, commandBufferErrors: 0,
+        gpuExecutionSeconds: 0, gpuTimedCommandBuffers: 0, gpuUntimedCommandBuffers: 0,
+        completedWithoutThrow: false
     )
+    private var activeStepCounters: StepCounters?
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -349,13 +387,36 @@ public final class QwenMetalModel {
         }
     }
 
+    private func commitAndWait(_ cb: MTLCommandBuffer) {
+        cb.commit()
+        activeStepCounters?.commandBuffersCommitted += 1
+        let waitStart = ProcessInfo.processInfo.systemUptime
+        cb.waitUntilCompleted()
+        activeStepCounters?.blockingWaits += 1
+        activeStepCounters?.blockingWaitSeconds += max(
+            0, ProcessInfo.processInfo.systemUptime - waitStart
+        )
+
+        guard cb.status == .completed else {
+            activeStepCounters?.commandBufferErrors += 1
+            return
+        }
+        let start = cb.gpuStartTime
+        let end = cb.gpuEndTime
+        guard start.isFinite, end.isFinite, start > 0, end > 0, end >= start else {
+            activeStepCounters?.gpuUntimedCommandBuffers += 1
+            return
+        }
+        activeStepCounters?.gpuExecutionSeconds += end - start
+        activeStepCounters?.gpuTimedCommandBuffers += 1
+    }
+
     private func runPhase(_ body: (MTLComputeCommandEncoder) throws -> Void) throws {
         let cb = engine.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
         try body(enc)
         enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
+        commitAndWait(cb)
     }
 
     private func readY(_ offset: Int, _ count: Int) -> [Float] {
@@ -369,13 +430,26 @@ public final class QwenMetalModel {
 
     /// Incremental step matching QwenCPUModel.step semantics.
     public func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
-        lastStepMetrics = StepMetrics(tokensProcessed: 0, logitProjections: 0)
-        var tokensProcessed = 0
-        var logitProjections = 0
+        let counters = StepCounters()
+        let wallStart = ProcessInfo.processInfo.systemUptime
+        activeStepCounters = counters
+        engine.computeDispatchObserver = { counters.computeDispatchesEncoded += 1 }
         defer {
+            engine.computeDispatchObserver = nil
+            activeStepCounters = nil
             lastStepMetrics = StepMetrics(
-                tokensProcessed: tokensProcessed,
-                logitProjections: logitProjections
+                tokensProcessed: counters.tokensProcessed,
+                logitProjections: counters.logitProjections,
+                commandBuffersCommitted: counters.commandBuffersCommitted,
+                blockingWaits: counters.blockingWaits,
+                blockingWaitSeconds: counters.blockingWaitSeconds,
+                computeDispatchesEncoded: counters.computeDispatchesEncoded,
+                stepWallSeconds: max(0, ProcessInfo.processInfo.systemUptime - wallStart),
+                commandBufferErrors: counters.commandBufferErrors,
+                gpuExecutionSeconds: counters.gpuExecutionSeconds,
+                gpuTimedCommandBuffers: counters.gpuTimedCommandBuffers,
+                gpuUntimedCommandBuffers: counters.gpuUntimedCommandBuffers,
+                completedWithoutThrow: counters.completedWithoutThrow
             )
         }
 
@@ -385,25 +459,19 @@ public final class QwenMetalModel {
             // position's logits, so intermediate vocabulary projections are
             // unnecessary.
             let projectLogits = index == tokens.count - 1
-            logits = try stepOne(
-                t, state: state, projectLogits: projectLogits,
-                logitProjections: &logitProjections
-            )
+            logits = try stepOne(t, state: state, projectLogits: projectLogits)
             state.position += 1
-            tokensProcessed += 1
+            counters.tokensProcessed += 1
         }
+        counters.completedWithoutThrow = true
         return logits
     }
 
     private func stepOne(
-        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool,
-        logitProjections: inout Int
+        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool
     ) throws -> [Float] {
         if sBuf != nil {
-            return try stepOneFast(
-                token, state: state, projectLogits: projectLogits,
-                logitProjections: &logitProjections
-            )
+            return try stepOneFast(token, state: state, projectLogits: projectLogits)
         }
         let cfg = config
         let D = cfg.hiddenSize
@@ -435,7 +503,7 @@ public final class QwenMetalModel {
         try runPhase { enc in
             try engine.encodeGemv(enc, lmHead, x: xBuf, y: logitsBuf, yOff: 0)
         }
-        logitProjections += 1
+        activeStepCounters?.logitProjections += 1
         return Array(UnsafeBufferPointer(
             start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
             count: cfg.vocabSize
@@ -767,15 +835,15 @@ extension QwenMetalModel {
     }
 
     private func dispatchRows(_ enc: MTLComputeCommandEncoder, rows: Int) {
-        enc.dispatchThreads(
-            MTLSize(width: 32, height: rows, depth: 1),
+        engine.dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: rows, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
         )
     }
 
     private func dispatchN(_ enc: MTLComputeCommandEncoder, _ n: Int) {
-        enc.dispatchThreads(
-            MTLSize(width: n, height: 1, depth: 1),
+        engine.dispatchThreads(
+            enc, threads: MTLSize(width: n, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: min(64, n), height: 1, depth: 1)
         )
     }
@@ -932,8 +1000,7 @@ extension QwenMetalModel {
     }
 
     func stepOneFast(
-        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool,
-        logitProjections: inout Int
+        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool
     ) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
@@ -959,8 +1026,7 @@ extension QwenMetalModel {
                 if let p = pending { try encodePendingMoE(enc, p); pending = nil }
                 try encDeltaLayer(enc, delta: delta, fl: fl, moeGate: L.moe.gate)
                 enc.endEncoding()
-                cb.commit()
-                cb.waitUntilCompleted()
+                commitAndWait(cb)
             } else {
                 // Attention: projections, CPU core, then out-proj + router.
                 let cb1 = engine.queue.makeCommandBuffer()!
@@ -973,8 +1039,7 @@ extension QwenMetalModel {
                 try engine.encodeGemv(e1, attn.kProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.knew)
                 try engine.encodeGemv(e1, attn.vProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.vnew)
                 e1.endEncoding()
-                cb1.commit()
-                cb1.waitUntilCompleted()
+                commitAndWait(cb1)
 
                 let attnOut = attnCoreCPU(layerIndex: li, state: state, attn: attn)
                 writeS(reg.att, attnOut)
@@ -994,8 +1059,7 @@ extension QwenMetalModel {
                 barrier(e2)
                 try engine.encodeGemv(e2, L.moe.gate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
                 e2.endEncoding()
-                cb2.commit()
-                cb2.waitUntilCompleted()
+                commitAndWait(cb2)
             }
 
             let (picks, weights) = routerPicks()
@@ -1021,11 +1085,10 @@ extension QwenMetalModel {
             dispatchRows(enc, rows: 1)
             barrier(enc)
             try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
-            logitProjections += 1
+            activeStepCounters?.logitProjections += 1
         }
         enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
+        commitAndWait(cb)
 
         guard projectLogits else { return [] }
         return Array(UnsafeBufferPointer(
@@ -1103,8 +1166,10 @@ extension QwenMetalModel {
         enc.setBuffer(sBuf!, offset: reg.dy * 4, index: 6)
         enc.setBuffer(fl.state!, offset: 0, index: 7)
         setBytesParams(enc, &delp, index: 8)
-        enc.dispatchThreads(MTLSize(width: 32, height: dv, depth: nv),
-                            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        engine.dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: dv, depth: nv),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
+        )
         barrier(enc)
 
         enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))

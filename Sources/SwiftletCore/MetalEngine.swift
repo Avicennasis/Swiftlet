@@ -89,6 +89,19 @@ public final class MetalEngine {
 
     // MARK: - Encoder-level API (persistent-buffer runtime path)
 
+    /// Set only while QwenMetalModel.step is active. Keeping the hook here
+    /// counts actual dispatch encodes across both fast and fallback paths.
+    var computeDispatchObserver: (() -> Void)?
+
+    func dispatchThreads(
+        _ enc: MTLComputeCommandEncoder,
+        threads: MTLSize,
+        threadsPerThreadgroup: MTLSize
+    ) {
+        enc.dispatchThreads(threads, threadsPerThreadgroup: threadsPerThreadgroup)
+        computeDispatchObserver?()
+    }
+
     /// Encode one GEMV over a shard-resident linear. `wExtra`/`sExtra`/`bExtra`
     /// advance into stacked tensors (expert slicing), in the same units as the
     /// descriptor offsets. Output rows land at `y[yOff...]`.
@@ -125,8 +138,8 @@ public final class MetalEngine {
                 enc.setBuffer(lin.bBuffer, offset: 0, index: 3)
                 enc.setBuffer(y, offset: 0, index: 4)
                 enc.setBytes(&p, length: MemoryLayout<GemvParams>.stride, index: 5)
-                enc.dispatchThreads(
-                    MTLSize(width: 32, height: outDim, depth: 1),
+                dispatchThreads(
+                    enc, threads: MTLSize(width: 32, height: outDim, depth: 1),
                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
                 )
                 return
@@ -146,8 +159,8 @@ public final class MetalEngine {
             enc.setBuffer(lin.bBuffer, offset: 0, index: 3)
             enc.setBuffer(y, offset: 0, index: 4)
             enc.setBytes(&p, length: MemoryLayout<GemvParams>.stride, index: 5)
-            enc.dispatchThreads(
-                MTLSize(width: outDim, height: 1, depth: 1),
+            dispatchThreads(
+                enc, threads: MTLSize(width: outDim, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: min(64, outDim), height: 1, depth: 1)
             )
         } else {
@@ -162,8 +175,8 @@ public final class MetalEngine {
             enc.setBuffer(lin.wBuffer, offset: 0, index: 1)
             enc.setBuffer(y, offset: 0, index: 2)
             enc.setBytes(&p, length: MemoryLayout<GemvPlainParams>.stride, index: 3)
-            enc.dispatchThreads(
-                MTLSize(width: outDim, height: 1, depth: 1),
+            dispatchThreads(
+                enc, threads: MTLSize(width: outDim, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: min(64, outDim), height: 1, depth: 1)
             )
         }
@@ -180,8 +193,8 @@ public final class MetalEngine {
         enc.setBuffer(buf, offset: 0, index: 1)
         enc.setBuffer(buf, offset: 0, index: 2)
         enc.setBytes(&p, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 3)
-        enc.dispatchThreads(
-            MTLSize(width: count, height: 1, depth: 1),
+        dispatchThreads(
+            enc, threads: MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: min(64, count), height: 1, depth: 1)
         )
     }
