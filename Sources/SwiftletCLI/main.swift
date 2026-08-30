@@ -5,6 +5,40 @@ import Tokenizers
 func gib(_ bytes: Int) -> String { String(format: "%.2f GiB", Double(bytes) / Double(1 << 30)) }
 func mib(_ bytes: Int) -> String { String(format: "%.1f MiB", Double(bytes) / Double(1 << 20)) }
 
+/// S3a decode totals only. They establish an aggregate baseline, not phase or
+/// command-buffer timeline diagnosis.
+private struct MetalStepAggregate {
+    var steps = 0
+    var commandBuffersCommitted = 0
+    var blockingWaits = 0
+    var blockingWaitSeconds = 0.0
+    var computeDispatchesEncoded = 0
+    var commandBufferErrors = 0
+    var gpuExecutionSeconds = 0.0
+    var gpuTimedCommandBuffers = 0
+    var gpuUntimedCommandBuffers = 0
+
+    mutating func add(_ metrics: QwenMetalModel.StepMetrics) {
+        steps += 1
+        commandBuffersCommitted += metrics.commandBuffersCommitted
+        blockingWaits += metrics.blockingWaits
+        blockingWaitSeconds += metrics.blockingWaitSeconds
+        computeDispatchesEncoded += metrics.computeDispatchesEncoded
+        commandBufferErrors += metrics.commandBufferErrors
+        gpuExecutionSeconds += metrics.gpuExecutionSeconds
+        gpuTimedCommandBuffers += metrics.gpuTimedCommandBuffers
+        gpuUntimedCommandBuffers += metrics.gpuUntimedCommandBuffers
+    }
+}
+
+private func gpuTimingSummary(
+    seconds: Double, timed: Int, untimed: Int
+) -> String {
+    timed > 0
+        ? String(format: "%.3fs/%d timed/%d n/a", seconds, timed, untimed)
+        : "n/a/\(untimed)cb"
+}
+
 func runInfo(_ modelKey: String) {
     guard let cfg = ArchConfig.known[modelKey] else {
         print("unknown model \(modelKey); known: \(ArchConfig.known.keys.sorted().joined(separator: ", "))")
@@ -129,17 +163,29 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     let prefillStart = Date()
     var logits = try model.step(ids, state: state)
     let prefillSecs = -prefillStart.timeIntervalSinceNow
-    FileHandle.standardError.write(Data(String(format: "prefill: %d tokens in %.1fs\n", ids.count, prefillSecs).utf8))
     if let metal = model as? QwenMetalModel {
+        let m = metal.lastStepMetrics
+        let gpu = gpuTimingSummary(
+            seconds: m.gpuExecutionSeconds,
+            timed: m.gpuTimedCommandBuffers,
+            untimed: m.gpuUntimedCommandBuffers
+        )
+        let line = String(format:
+            "prefill S3a: %d tok wall=%.3fs wait=%.3fs/%d cb=%d err=%d dispatch=%d lm=%d skip=%d",
+            ids.count, m.stepWallSeconds, m.blockingWaitSeconds, m.blockingWaits,
+            m.commandBuffersCommitted, m.commandBufferErrors, m.computeDispatchesEncoded,
+            m.logitProjections, m.avoidedLogitProjections
+        ) + " gpu=\(gpu)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    } else {
         FileHandle.standardError.write(Data(String(
-            format: "LM-head elision: %d encoded, %d intermediate skipped\n",
-            metal.lastStepMetrics.logitProjections,
-            metal.lastStepMetrics.avoidedLogitProjections
+            format: "prefill: %d tokens in %.1fs\n", ids.count, prefillSecs
         ).utf8))
     }
 
     var generated: [Int] = []
     var printed = ""
+    var decodeMetal = MetalStepAggregate()
     let decodeStart = Date()
     for _ in 0..<maxNew {
         var best = 0
@@ -160,6 +206,9 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             fflush(stdout)
         }
         logits = try model.step([best], state: state)
+        if let metal = model as? QwenMetalModel {
+            decodeMetal.add(metal.lastStepMetrics)
+        }
     }
     let decodeSecs = -decodeStart.timeIntervalSinceNow
     if let tokenizer,
@@ -171,6 +220,20 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         format: "decode: %d tokens in %.1fs (%.2f tok/s)\n",
         generated.count, decodeSecs, Double(generated.count) / max(decodeSecs, 0.001)
     ).utf8))
+    if model is QwenMetalModel {
+        let gpu = gpuTimingSummary(
+            seconds: decodeMetal.gpuExecutionSeconds,
+            timed: decodeMetal.gpuTimedCommandBuffers,
+            untimed: decodeMetal.gpuUntimedCommandBuffers
+        )
+        let line = String(format:
+            "decode Metal S3a: steps=%d cb=%d err=%d wait=%.3fs/%d dispatch=%d",
+            decodeMetal.steps, decodeMetal.commandBuffersCommitted,
+            decodeMetal.commandBufferErrors, decodeMetal.blockingWaitSeconds,
+            decodeMetal.blockingWaits, decodeMetal.computeDispatchesEncoded
+        ) + " gpu=\(gpu)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
     if let metal = model as? QwenMetalModel, let cache = metal.expertCache {
         let total = cache.hits + cache.misses
         FileHandle.standardError.write(Data(String(
