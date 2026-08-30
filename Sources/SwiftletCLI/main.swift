@@ -130,6 +130,13 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     var logits = try model.step(ids, state: state)
     let prefillSecs = -prefillStart.timeIntervalSinceNow
     FileHandle.standardError.write(Data(String(format: "prefill: %d tokens in %.1fs\n", ids.count, prefillSecs).utf8))
+    if let metal = model as? QwenMetalModel {
+        FileHandle.standardError.write(Data(String(
+            format: "LM-head elision: %d encoded, %d intermediate skipped\n",
+            metal.lastStepMetrics.logitProjections,
+            metal.lastStepMetrics.avoidedLogitProjections
+        ).utf8))
+    }
 
     var generated: [Int] = []
     var printed = ""

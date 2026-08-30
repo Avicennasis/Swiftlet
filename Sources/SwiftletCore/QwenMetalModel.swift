@@ -7,6 +7,15 @@ import Metal
 /// delta recurrence, attention softmax over cached KV, top-k routing), all of
 /// it microseconds per token. Numerics mirror QwenCPUModel exactly.
 public final class QwenMetalModel {
+    public struct StepMetrics: Equatable, Sendable {
+        public let tokensProcessed: Int
+        public let logitProjections: Int
+
+        public var avoidedLogitProjections: Int {
+            max(0, tokensProcessed - logitProjections)
+        }
+    }
+
     public let config: QwenConfig
     let ckpt: Checkpoint
     let engine: MetalEngine
@@ -72,6 +81,9 @@ public final class QwenMetalModel {
     let xBuf: MTLBuffer
     let yBuf: MTLBuffer
     let logitsBuf: MTLBuffer
+    public private(set) var lastStepMetrics = StepMetrics(
+        tokensProcessed: 0, logitProjections: 0
+    )
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -357,16 +369,42 @@ public final class QwenMetalModel {
 
     /// Incremental step matching QwenCPUModel.step semantics.
     public func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
+        lastStepMetrics = StepMetrics(tokensProcessed: 0, logitProjections: 0)
+        var tokensProcessed = 0
+        var logitProjections = 0
+        defer {
+            lastStepMetrics = StepMetrics(
+                tokensProcessed: tokensProcessed,
+                logitProjections: logitProjections
+            )
+        }
+
         var logits: [Float] = []
-        for t in tokens {
-            logits = try stepOne(t, state: state)
+        for (index, t) in tokens.enumerated() {
+            // S1a LM-head elision: a multi-token call consumes only the final
+            // position's logits, so intermediate vocabulary projections are
+            // unnecessary.
+            let projectLogits = index == tokens.count - 1
+            logits = try stepOne(
+                t, state: state, projectLogits: projectLogits,
+                logitProjections: &logitProjections
+            )
             state.position += 1
+            tokensProcessed += 1
         }
         return logits
     }
 
-    private func stepOne(_ token: Int, state: QwenCPUModel.DecodeState) throws -> [Float] {
-        if sBuf != nil { return try stepOneFast(token, state: state) }
+    private func stepOne(
+        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool,
+        logitProjections: inout Int
+    ) throws -> [Float] {
+        if sBuf != nil {
+            return try stepOneFast(
+                token, state: state, projectLogits: projectLogits,
+                logitProjections: &logitProjections
+            )
+        }
         let cfg = config
         let D = cfg.hiddenSize
         var h = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
@@ -391,11 +429,13 @@ public final class QwenMetalModel {
             for i in 0..<D { h[i] += m[i] }
         }
 
+        guard projectLogits else { return [] }
         QwenCPUModel.rmsNorm(&h, rows: 1, dim: D, weight: finalNorm, eps: Float(cfg.rmsNormEps))
         loadX(h)
         try runPhase { enc in
             try engine.encodeGemv(enc, lmHead, x: xBuf, y: logitsBuf, yOff: 0)
         }
+        logitProjections += 1
         return Array(UnsafeBufferPointer(
             start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
             count: cfg.vocabSize
@@ -891,7 +931,10 @@ extension QwenMetalModel {
         return (picks, weights)
     }
 
-    func stepOneFast(_ token: Int, state: QwenCPUModel.DecodeState) throws -> [Float] {
+    func stepOneFast(
+        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool,
+        logitProjections: inout Int
+    ) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
         if boundStateID != ObjectIdentifier(state) || state.position == 0 {
@@ -963,23 +1006,28 @@ extension QwenMetalModel {
             pending = PendingMoE(bufs: bufs, weights: weights, stacksLayer: li, picks: picks)
         }
 
-        // Final: last layer's experts + final norm + lm head.
+        // Always apply the last layer's experts. Only the final token in a
+        // multi-token call also needs final norm + vocabulary projection.
         let cb = engine.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
         if let p = pending { try encodePendingMoE(enc, p) }
-        enc.setComputePipelineState(try engine.pipeline("norm_copy"))
-        var np = NormParams(rows: 1, dim: UInt32(D), eps: Float(cfg.rmsNormEps), hasWeight: 1, scale: 1, off: UInt32(reg.x0))
-        enc.setBuffer(hBuf!, offset: 0, index: 0)
-        enc.setBuffer(sBuf!, offset: 0, index: 1)
-        enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
-        setBytesParams(enc, &np, index: 3)
-        dispatchRows(enc, rows: 1)
-        barrier(enc)
-        try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
+        if projectLogits {
+            enc.setComputePipelineState(try engine.pipeline("norm_copy"))
+            var np = NormParams(rows: 1, dim: UInt32(D), eps: Float(cfg.rmsNormEps), hasWeight: 1, scale: 1, off: UInt32(reg.x0))
+            enc.setBuffer(hBuf!, offset: 0, index: 0)
+            enc.setBuffer(sBuf!, offset: 0, index: 1)
+            enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
+            setBytesParams(enc, &np, index: 3)
+            dispatchRows(enc, rows: 1)
+            barrier(enc)
+            try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
+            logitProjections += 1
+        }
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
 
+        guard projectLogits else { return [] }
         return Array(UnsafeBufferPointer(
             start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
             count: cfg.vocabSize))
