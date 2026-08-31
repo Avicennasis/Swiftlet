@@ -1674,10 +1674,11 @@ extension QwenMetalModel {
     /// slot's projection regions and advances the layer's shared conv
     /// history and recurrent state, so chunked callers must encode tokens in
     /// ascending order (the decode core encodes exactly one). Assembled
-    /// from the stage helpers below; the chunked prefill keeps only the
-    /// conv steps per token, batches decay/beta prep, the q/k norms, and
-    /// the gated norm through their stride twins, and runs the gated scan
-    /// once per chunk with T = chunk length (S1b chunked recurrence).
+    /// from the stage helpers below; the chunked prefill batches decay/beta
+    /// prep, the q/k norms, and the gated norm through their stride twins
+    /// and runs each order-sensitive stage as one cross-token scan per
+    /// chunk (conv_scan, and the gated scan with T = chunk length; S1b
+    /// chunked recurrence).
     private func encDeltaRecurrence(
         _ enc: MTLComputeCommandEncoder, fl: FastLayer, slot: TokenSlot
     ) throws {
@@ -1923,9 +1924,9 @@ extension QwenMetalModel {
 // kernels (norms, deinterleave, silu, residual adds, weighted accumulation,
 // attention q prep / KV append) via their batch twins. Every batched row is
 // the single-token kernel's arithmetic verbatim; the order-sensitive
-// recurrent stages keep ascending token order (conv history per token, the
-// gated recurrence as one T=chunk in-dispatch scan), so numerics match the
-// token-major schedule exactly. S2 batches the attention core across the
+// recurrent stages keep ascending token order inside cross-token scans (the
+// conv history and the gated recurrence each advance in one T=chunk
+// in-dispatch scan), so numerics match the token-major schedule exactly. S2 batches the attention core across the
 // chunk's tokens on GPU, including the causal attend: its batch twin derives
 // each token's kvLen from the token grid, and every KV append lands behind a
 // barrier before any token attends.
@@ -2259,12 +2260,11 @@ extension QwenMetalModel {
     /// One DeltaNet layer over the whole chunk (S1b token batching): one
     /// batched input norm, then one batched dispatch per in_proj tensor
     /// covering all tokens, one batched deinterleave, then the chunked
-    /// recurrence (per-token conv steps in ascending order, batched
-    /// decay/beta prep and q/k norms, one T=n gated scan, one batched gated
-    /// norm), then one batched output projection and one batched
-    /// residual add. One token degenerates to exactly the decode core's
-    /// encode stream, keeping the per-token scan alive as the chunked
-    /// path's oracle.
+    /// recurrence (one cross-token conv scan, batched decay/beta prep and
+    /// q/k norms, one T=n gated scan, one batched gated norm), then one
+    /// batched output projection and one batched residual add. One token
+    /// degenerates to exactly the decode core's encode stream, keeping the
+    /// per-token scan alive as the chunked path's oracle.
     private func encChunkDelta(
         _ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, tokens n: Int
     ) throws {
@@ -2293,29 +2293,33 @@ extension QwenMetalModel {
         barrier(enc)
     }
 
-    /// The chunk's recurrence stage with the T-step scan (S1b chunked
-    /// recurrence): only the conv steps stay per token in ascending order
-    /// (the conv history is shared state, so a barrier separates consecutive
-    /// tokens); decay/beta prep and the weightless q/k norms are independent
+    /// The chunk's recurrence stage as pure cross-token dispatches (S1b
+    /// chunked recurrence): one conv_scan advances the layer's shared conv
+    /// history through all n tokens in-dispatch — its step loop is the
+    /// chained per-token conv_steps' arithmetic verbatim, history carried
+    /// in registers instead of a barrier-fenced device round trip per
+    /// token; decay/beta prep and the weightless q/k norms are independent
     /// per token and encode once per chunk through their stride twins; one
     /// delta_gather packs the normed rows into the contiguous [T, row]
     /// staging blocks, a single T=n gated_delta_step replaces the n
     /// per-token scans, and one batched gated norm reads the scan's staged y
     /// rows. Every batched row is the single-token kernel's arithmetic
-    /// verbatim and the scan's internal step loop performs the same
+    /// verbatim and both scans' internal step loops perform the same
     /// ascending-order arithmetic the per-token dispatches did — state
     /// carried in f32 registers instead of a per-token f32 device round trip
-    /// — so every y row and the final state are bitwise identical. Ends on a
+    /// — so every conv row, y row, and both final states are bitwise
+    /// identical. Nothing here dispatches per token any more. Ends on a
     /// barrier like the decode core.
     private func encChunkDeltaRecurrence(
         _ enc: MTLComputeCommandEncoder, fl: FastLayer, tokens n: Int
     ) throws {
         let cfg = config
         let valueDim = cfg.valueDim
-        for t in 0..<n {
-            try encConvStep(enc, fl: fl, slot: prefillSlot(t))
-            barrier(enc)   // token t+1's conv reads the advanced history
-        }
+        try engine.encodeConvScan(
+            enc, data: prefillScratchBuf!, hist: fl.hist!, weight: fl.convW!,
+            convDim: cfg.convDim, K: cfg.linearConvKernelDim,
+            inOff: reg.qkv, outOff: reg.conv, slotStride: reg.total, tokens: n)
+        barrier(enc)   // the in-place q/k norms read the scan's conv rows
         // Reads the slots' a/b projection rows (behind encChunkDelta's
         // barrier) and writes gb, disjoint from the conv rows the norms
         // touch in place — one barrier below covers both for the gather.
