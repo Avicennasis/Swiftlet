@@ -58,6 +58,71 @@ import Testing
         }
     }
 
+    private final class SingleFlightProbeModel: InferenceModel, @unchecked Sendable {
+        enum ProbeError: Swift.Error { case timedOutWaitingForRelease }
+
+        let config: QwenConfig
+        let modelDir: URL
+        private let lock = NSLock()
+        private let releaseFirstCall = DispatchSemaphore(value: 0)
+        private var _callCount = 0
+        private var _activeCalls = 0
+        private var _maxActiveCalls = 0
+        private var _firstCallEntered = false
+
+        init(modelDir: URL) throws {
+            self.modelDir = modelDir
+            config = try QwenConfig(url: modelDir.appendingPathComponent("config.json"))
+        }
+
+        var callCount: Int { locked { _callCount } }
+        var maxActiveCalls: Int { locked { _maxActiveCalls } }
+        var firstCallEntered: Bool { locked { _firstCallEntered } }
+
+        func releaseFirst() {
+            releaseFirstCall.signal()
+        }
+
+        func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
+            try runStep(shouldCancel: { false })
+        }
+
+        func step(
+            _ tokens: [Int],
+            state: QwenCPUModel.DecodeState,
+            shouldCancel: () -> Bool
+        ) throws -> [Float] {
+            try runStep(shouldCancel: shouldCancel)
+        }
+
+        private func runStep(shouldCancel: () -> Bool) throws -> [Float] {
+            let blocks = locked { () -> Bool in
+                _callCount += 1
+                _activeCalls += 1
+                _maxActiveCalls = max(_maxActiveCalls, _activeCalls)
+                if _callCount == 1 {
+                    _firstCallEntered = true
+                    return true
+                }
+                return false
+            }
+            defer { locked { _activeCalls -= 1 } }
+
+            if blocks,
+               releaseFirstCall.wait(timeout: .now() + .seconds(2)) == .timedOut {
+                throw ProbeError.timedOutWaitingForRelease
+            }
+            if shouldCancel() { throw GenerationInterruption.cancelled }
+            return [Float](repeating: 0, count: config.vocabSize)
+        }
+
+        private func locked<T>(_ body: () -> T) -> T {
+            lock.lock()
+            defer { lock.unlock() }
+            return body()
+        }
+    }
+
     static let fixturesDir = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
@@ -80,7 +145,7 @@ import Testing
         #expect(streamed.count == 6)
     }
 
-    @Test func generateRoutesCancellationThroughCancellableModelStep() throws {
+    @Test func generateRejectsPreCancelledWorkBeforeModelStep() throws {
         let model = try CancellationProbeModel(
             modelDir: Self.fixturesDir.appendingPathComponent("tiny-model"),
             waitForCancellation: false
@@ -94,9 +159,73 @@ import Testing
                 promptIds: [1, 5, 9], maxNew: 2, cancellation: cancellation
             ) { _ in true }
         }
-        #expect(model.cancellableCalls == 1)
+        #expect(model.cancellableCalls == 0)
         #expect(model.legacyCalls == 0)
-        #expect(model.observedCancellation)
+        #expect(!model.observedCancellation)
+    }
+
+    @Test func concurrentTokenStreamsNeverOverlapModelCalls() async throws {
+        let model = try SingleFlightProbeModel(
+            modelDir: Self.fixturesDir.appendingPathComponent("tiny-model")
+        )
+        let generator = TextGenerator(model: model)
+
+        let firstStream = generator.tokenStream(promptIds: [1], maxNew: 0)
+        let first = Task {
+            for try await _ in firstStream {}
+        }
+        let deadline = Date().addingTimeInterval(1)
+        while !model.firstCallEntered, Date() < deadline {
+            try await Task<Never, Never>.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(model.firstCallEntered)
+
+        let secondStream = generator.tokenStream(promptIds: [2], maxNew: 0)
+        let second = Task {
+            for try await _ in secondStream {}
+        }
+        try await Task<Never, Never>.sleep(nanoseconds: 20_000_000)
+
+        #expect(model.callCount == 1)
+        #expect(model.maxActiveCalls == 1)
+        model.releaseFirst()
+        try await first.value
+        try await second.value
+
+        #expect(model.callCount == 2)
+        #expect(model.maxActiveCalls == 1)
+    }
+
+    @Test func queuedCancelledTokenStreamNeverTouchesModel() async throws {
+        let model = try SingleFlightProbeModel(
+            modelDir: Self.fixturesDir.appendingPathComponent("tiny-model")
+        )
+        let generator = TextGenerator(model: model)
+
+        let firstStream = generator.tokenStream(promptIds: [1], maxNew: 0)
+        let first = Task {
+            for try await _ in firstStream {}
+        }
+        let deadline = Date().addingTimeInterval(1)
+        while !model.firstCallEntered, Date() < deadline {
+            try await Task<Never, Never>.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(model.firstCallEntered)
+
+        let cancellation = GenerationCancellation()
+        let secondStream = generator.tokenStream(
+            promptIds: [2], maxNew: 0, cancellation: cancellation
+        )
+        let second = Task {
+            for try await _ in secondStream {}
+        }
+        cancellation.cancel()
+        model.releaseFirst()
+
+        try await first.value
+        try await second.value
+        #expect(model.callCount == 1)
+        #expect(model.maxActiveCalls == 1)
     }
 
     @Test func tokenStreamOwnerCancelsBlockedPrefill() async throws {

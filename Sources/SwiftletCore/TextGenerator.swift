@@ -37,9 +37,13 @@ extension QwenMetalModel: InferenceModel {
 }
 
 /// Engine-agnostic greedy generation loop shared by the CLI and server.
-public final class TextGenerator {
+public final class TextGenerator: @unchecked Sendable {
     public let model: any InferenceModel
     public let eosTokens: Set<Int>
+    /// Inference models own mutable decode/GPU scratch state. Keep every
+    /// public generation entry point single-flight even when callers create
+    /// several token streams from the same generator concurrently.
+    private let generationLock = NSLock()
 
     public init(model: any InferenceModel) {
         self.model = model
@@ -136,6 +140,14 @@ public final class TextGenerator {
         cancellation: GenerationCancellation,
         onToken: (Int) -> Bool
     ) throws -> Stats {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+
+        // A stream can be cancelled while it waits behind another generation.
+        // Observe that before allocating or passing any DecodeState to the
+        // shared model.
+        try checkGenerationCancellation { cancellation.isCancelled }
+
         var stats = Stats()
         stats.promptTokens = promptIds.count
         let state = QwenCPUModel.DecodeState()
