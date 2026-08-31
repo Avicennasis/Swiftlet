@@ -20,6 +20,9 @@ private struct MetalStepAggregate {
     var gpuUntimedCommandBuffers = 0
     var phaseDispatches: [QwenMetalModel.StepPhase: Int] = [:]
     var phaseEncodeSeconds: [QwenMetalModel.StepPhase: Double] = [:]
+    /// Per-phase GPU seconds; non-nil only when the device measured them
+    /// (dispatch-boundary counters — see QwenMetalModel.PhaseGpuSplitSupport).
+    var phaseGpuSeconds: [QwenMetalModel.StepPhase: Double]?
     var bufferCounts: [String: Int] = [:]
     var bufferWaitSeconds: [String: Double] = [:]
     var bufferGpuSeconds: [String: Double] = [:]
@@ -41,6 +44,11 @@ private struct MetalStepAggregate {
         for (phase, s) in metrics.phaseEncodeSeconds {
             phaseEncodeSeconds[phase, default: 0] += s
         }
+        if let measured = metrics.phaseGpuSeconds {
+            var merged = phaseGpuSeconds ?? [:]
+            for (phase, s) in measured { merged[phase, default: 0] += s }
+            phaseGpuSeconds = merged
+        }
         for sample in metrics.commandBufferTimeline {
             let label = sample.phases.map(\.rawValue).joined(separator: "+")
             bufferCounts[label, default: 0] += 1
@@ -61,9 +69,14 @@ private func phaseSummaryLines(_ prefix: String, _ agg: MetalStepAggregate) -> [
         agg.phaseDispatches[$0, default: 0] > 0 || agg.phaseEncodeSeconds[$0, default: 0] > 0
     }
     if !phases.isEmpty {
-        let cells = phases.map {
-            "\($0.rawValue) enc=" + String(format: "%.3fs", agg.phaseEncodeSeconds[$0, default: 0])
-                + " disp=\(agg.phaseDispatches[$0, default: 0])"
+        let cells = phases.map { phase -> String in
+            var cell = "\(phase.rawValue) enc="
+                + String(format: "%.3fs", agg.phaseEncodeSeconds[phase, default: 0])
+                + " disp=\(agg.phaseDispatches[phase, default: 0])"
+            if let gpu = agg.phaseGpuSeconds {
+                cell += String(format: " gpu=%.3fs", gpu[phase, default: 0])
+            }
+            return cell
         }
         lines.append("\(prefix) S3b encode phases: " + cells.joined(separator: " | "))
     }
@@ -183,7 +196,19 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         // Metal runtime: weights stay quantized; experts stream via the
         // bounded cache (--cache-gb) when the model is a .qpack container.
         let cacheGB = Double(flagValue(CommandLine.arguments, "--cache-gb") ?? "8") ?? 8
-        model = try QwenMetalModel(modelDir: url, cacheBudgetGB: cacheGB)
+        let metal = try QwenMetalModel(modelDir: url, cacheBudgetGB: cacheGB)
+        // S3b follow-up: what the device's counters can actually sample, and
+        // whether the per-phase GPU split is measured or honestly absent.
+        let split: String
+        switch metal.phaseGpuSplitSupport {
+        case .dispatchBoundaryCounters:
+            split = "per-phase GPU split: measured (dispatch-boundary counters)"
+        case .unsupported(let reason):
+            split = "per-phase GPU split: unsupported (\(reason))"
+        }
+        FileHandle.standardError.write(Data(
+            "S3b counters: \(metal.counterSamplingSupport.summary)\n\(split)\n".utf8))
+        model = metal
     } else {
         let cpu = try QwenCPUModel(modelDir: url)
         // --lazy: ~3 GB peak instead of ~10-14 GB, at the cost of re-dequantizing
