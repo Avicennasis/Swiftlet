@@ -53,3 +53,112 @@ public enum StreamingText {
         return String(String.UnicodeScalarView(decodedScalars[printedScalars.count...]))
     }
 }
+
+/// Incremental text-stop filtering for a cumulatively decoded token stream.
+///
+/// A suffix that could still become a stop string is held back instead of
+/// being sent to the caller. This is what lets `"END"` match when `"E"`,
+/// `"N"`, and `"D"` arrive in separate tokens without leaking `"EN"` first.
+/// Matching and slicing use Unicode scalars for the same reason StreamingText
+/// does: a later token may extend a previously complete grapheme cluster.
+public struct StopSequenceFilter {
+    public struct Update: Sendable {
+        public let delta: String?
+        public let matchedStop: String?
+        /// False only when cumulative tokenizer output no longer has the text
+        /// already exposed to the caller as a Unicode-scalar prefix.
+        public let isConsistent: Bool
+
+        public var didStop: Bool { matchedStop != nil }
+    }
+
+    private let stops: [(text: String, scalars: [Unicode.Scalar])]
+    private var emitted: [Unicode.Scalar] = []
+    private var stopped = false
+
+    public init(stopSequences: [String]) {
+        var seen = Set<String>()
+        stops = stopSequences.compactMap { text in
+            guard !text.isEmpty, seen.insert(text).inserted else { return nil }
+            return (text, Array(text.unicodeScalars))
+        }
+    }
+
+    /// Text released to the caller so far. If a stop matched, this excludes
+    /// both the stop itself and any text decoded after it in the same token.
+    public var output: String {
+        String(String.UnicodeScalarView(emitted))
+    }
+
+    /// Consumes the tokenizer's full cumulative decode for the current token.
+    public mutating func consume(decoded: String) -> Update {
+        guard !stopped else {
+            return Update(delta: nil, matchedStop: nil, isConsistent: true)
+        }
+        let stable = Array(StreamingText.stablePrefix(decoded).unicodeScalars)
+
+        // Tokenizer output is expected to grow by scalar prefix. If a custom
+        // tokenizer violates that contract, fail closed instead of duplicating
+        // or emitting text from an ambiguous offset.
+        guard stable.starts(with: emitted) else {
+            return Update(delta: nil, matchedStop: nil, isConsistent: false)
+        }
+
+        var earliest: (index: Int, stop: (text: String, scalars: [Unicode.Scalar]))?
+        if !stops.isEmpty {
+            for index in emitted.count...stable.count {
+                for stop in stops where index + stop.scalars.count <= stable.count {
+                    if stable[index..<(index + stop.scalars.count)].elementsEqual(stop.scalars) {
+                        earliest = (index, stop)
+                        break
+                    }
+                }
+                if earliest != nil { break }
+            }
+        }
+
+        if let match = earliest {
+            let delta = append(stable[emitted.count..<match.index])
+            stopped = true
+            return Update(delta: delta, matchedStop: match.stop.text, isConsistent: true)
+        }
+
+        // Hold the longest suffix that is a proper prefix of any stop. A full
+        // stop was handled above, so limiting to count-1 is sufficient.
+        let uncommittedCount = stable.count - emitted.count
+        var hold = 0
+        for stop in stops where stop.scalars.count > 1 {
+            let limit = min(stop.scalars.count - 1, uncommittedCount)
+            guard limit > hold else { continue }
+            for count in stride(from: limit, through: hold + 1, by: -1) {
+                if stable.suffix(count).elementsEqual(stop.scalars.prefix(count)) {
+                    hold = count
+                    break
+                }
+            }
+        }
+        let safeEnd = stable.count - hold
+        return Update(
+            delta: append(stable[emitted.count..<safeEnd]),
+            matchedStop: nil,
+            isConsistent: true
+        )
+    }
+
+    /// Releases a non-matching held prefix when EOS or the length limit ends
+    /// the turn. It is deliberately not called for cancellation or a match.
+    public mutating func finish(decoded: String) -> String? {
+        guard !stopped else { return nil }
+        let scalars = Array(decoded.unicodeScalars)
+        guard scalars.starts(with: emitted) else { return nil }
+        return append(scalars[emitted.count..<scalars.count])
+    }
+
+    private mutating func append<C: Collection>(_ scalars: C) -> String?
+    where C.Element == Unicode.Scalar {
+        guard !scalars.isEmpty else { return nil }
+        let delta = String(String.UnicodeScalarView(Array(scalars)))
+        emitted.append(contentsOf: scalars)
+        return delta
+    }
+}

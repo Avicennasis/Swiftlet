@@ -5,6 +5,27 @@ public protocol InferenceModel: AnyObject {
     var config: QwenConfig { get }
     var modelDir: URL { get }
     func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float]
+    func step(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float]
+}
+
+public extension InferenceModel {
+    /// CPU/reference fallback: the batched step is atomic from the caller's
+    /// perspective, so cancellation is checked immediately before and after.
+    /// Metal supplies a finer-grained implementation between command buffers.
+    func step(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
+        try checkGenerationCancellation(shouldCancel)
+        let logits = try step(tokens, state: state)
+        try checkGenerationCancellation(shouldCancel)
+        return logits
+    }
 }
 
 extension QwenCPUModel: InferenceModel {

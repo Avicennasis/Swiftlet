@@ -37,6 +37,9 @@ let package = Package(
             ]
         ),
         .testTarget(name: "SwiftletCoreTests", dependencies: ["SwiftletCore"]),
-        .testTarget(name: "SwiftletServerTests", dependencies: ["SwiftletServer"]),
+        .testTarget(
+            name: "SwiftletServerTests",
+            dependencies: ["SwiftletServer", "SwiftletCore"]
+        ),
     ]
 )
