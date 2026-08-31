@@ -77,10 +77,14 @@ public struct StopSequenceFilter {
     private var stopped = false
 
     public init(stopSequences: [String]) {
-        var seen = Set<String>()
+        // Swift String equality is canonically equivalent, but stop matching
+        // is deliberately scalar-exact. Keep precomposed and decomposed forms
+        // as distinct entries so each can match its own wire representation.
+        var seen = Set<[Unicode.Scalar]>()
         stops = stopSequences.compactMap { text in
-            guard !text.isEmpty, seen.insert(text).inserted else { return nil }
-            return (text, Array(text.unicodeScalars))
+            let scalars = Array(text.unicodeScalars)
+            guard !scalars.isEmpty, seen.insert(scalars).inserted else { return nil }
+            return (text, scalars)
         }
     }
 
@@ -104,20 +108,7 @@ public struct StopSequenceFilter {
             return Update(delta: nil, matchedStop: nil, isConsistent: false)
         }
 
-        var earliest: (index: Int, stop: (text: String, scalars: [Unicode.Scalar]))?
-        if !stops.isEmpty {
-            for index in emitted.count...stable.count {
-                for stop in stops where index + stop.scalars.count <= stable.count {
-                    if stable[index..<(index + stop.scalars.count)].elementsEqual(stop.scalars) {
-                        earliest = (index, stop)
-                        break
-                    }
-                }
-                if earliest != nil { break }
-            }
-        }
-
-        if let match = earliest {
+        if let match = earliestMatch(in: stable) {
             let delta = append(stable[emitted.count..<match.index])
             stopped = true
             return Update(delta: delta, matchedStop: match.stop.text, isConsistent: true)
@@ -146,12 +137,47 @@ public struct StopSequenceFilter {
     }
 
     /// Releases a non-matching held prefix when EOS or the length limit ends
-    /// the turn. It is deliberately not called for cancellation or a match.
+    /// the turn. For callers that also need to distinguish a final raw-text
+    /// stop match, use `finishUpdate(decoded:)`.
     public mutating func finish(decoded: String) -> String? {
-        guard !stopped else { return nil }
+        finishUpdate(decoded: decoded).delta
+    }
+
+    /// Finalizes against the raw scalar stream. Unlike `consume`, this does
+    /// not trim a trailing U+FFFD: at EOS/length it can no longer complete, and
+    /// it may itself complete a caller-supplied stop sequence.
+    public mutating func finishUpdate(decoded: String) -> Update {
+        guard !stopped else {
+            return Update(delta: nil, matchedStop: nil, isConsistent: true)
+        }
         let scalars = Array(decoded.unicodeScalars)
-        guard scalars.starts(with: emitted) else { return nil }
-        return append(scalars[emitted.count..<scalars.count])
+        guard scalars.starts(with: emitted) else {
+            return Update(delta: nil, matchedStop: nil, isConsistent: false)
+        }
+        if let match = earliestMatch(in: scalars) {
+            let delta = append(scalars[emitted.count..<match.index])
+            stopped = true
+            return Update(delta: delta, matchedStop: match.stop.text, isConsistent: true)
+        }
+        return Update(
+            delta: append(scalars[emitted.count..<scalars.count]),
+            matchedStop: nil,
+            isConsistent: true
+        )
+    }
+
+    private func earliestMatch(
+        in scalars: [Unicode.Scalar]
+    ) -> (index: Int, stop: (text: String, scalars: [Unicode.Scalar]))? {
+        guard !stops.isEmpty else { return nil }
+        for index in emitted.count...scalars.count {
+            for stop in stops where index + stop.scalars.count <= scalars.count {
+                if scalars[index..<(index + stop.scalars.count)].elementsEqual(stop.scalars) {
+                    return (index, stop)
+                }
+            }
+        }
+        return nil
     }
 
     private mutating func append<C: Collection>(_ scalars: C) -> String?

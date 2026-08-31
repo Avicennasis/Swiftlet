@@ -93,6 +93,20 @@ import Testing
         #expect(!update.didStop)
     }
 
+    @Test func canonicallyEquivalentStopsRemainScalarDistinct() {
+        let precomposed = "\u{00E9}"
+        let decomposed = "e\u{0301}"
+        #expect(precomposed == decomposed) // Swift String canonical equality.
+
+        var filter = StopSequenceFilter(stopSequences: [precomposed, decomposed])
+        let update = filter.consume(decoded: "before \(decomposed) after")
+
+        #expect(update.didStop)
+        #expect(update.delta == "before ")
+        #expect(update.matchedStop?.unicodeScalars.count == 2)
+        #expect(filter.output == "before ")
+    }
+
     @Test func utf8ReplacementTailRemainsProvisional() {
         var filter = StopSequenceFilter(stopSequences: ["END"])
         #expect(filter.consume(decoded: "ok \u{FFFD}").delta == "ok ")
@@ -108,6 +122,20 @@ import Testing
         var cancelledFilter = StopSequenceFilter(stopSequences: ["END"])
         #expect(cancelledFilter.consume(decoded: "ok \u{FFFD}").delta == "ok ")
         #expect(cancelledFilter.output == "ok ")
+    }
+
+    @Test func finalRawReplacementCanCompleteStopWithoutLeaking() {
+        let stop = "X\u{FFFD}"
+        var filter = StopSequenceFilter(stopSequences: [stop])
+
+        // Model a terminal replacement at the end of the cumulative decode;
+        // stablePrefix withholds it, leaving X as a possible stop prefix.
+        #expect(filter.consume(decoded: "answer \(stop)").delta == "answer ")
+        let final = filter.finishUpdate(decoded: "answer \(stop)")
+
+        #expect(final.didStop)
+        #expect(final.delta == nil)
+        #expect(filter.output == "answer ")
     }
 
     @Test func divergentCumulativeDecodeFailsClosed() {
