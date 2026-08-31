@@ -302,6 +302,174 @@ kernel void gemv_affine_fast8(
     if (lane == 0) y[p.yOff + row] = acc;
 }
 
+// ===== S1b token-batched GEMV: one dispatch applies the same linear to =====
+// many token slots. Each grid slice reads its x/y float offsets from a small
+// offset table (buffer 6, or 4 for the plain variant); the per-row arithmetic
+// is copied verbatim from the single-token kernels above, so every output row
+// is bitwise the value the equivalent unbatched dispatch writes.
+
+kernel void gemv_affine_batch(
+    device const float *x       [[buffer(0)]],
+    device const uchar *w       [[buffer(1)]],
+    device const uchar *scales  [[buffer(2)]],
+    device const uchar *biases  [[buffer(3)]],
+    device float       *y       [[buffer(4)]],
+    constant GemvParams &p      [[buffer(5)]],
+    constant uint2     *offs    [[buffer(6)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint row = tpg.x;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.y].x;
+    const uint yOff = offs[tpg.y].y;
+    const uint perWord = 32 / p.bits;
+    const uint mask = (1u << p.bits) - 1u;
+    const uint packedCols = p.inDim / perWord;   // in uint32 words
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / perWord;
+    const ulong rowBase = p.wOff + ulong(row) * packedCols * 4;
+
+    float acc = 0;
+    for (uint g = 0; g < groups; ++g) {
+        float qdot = 0;
+        float xsum = 0;
+        uint base = g * wordsPerGroup;
+        uint xbase = g * p.groupSize;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            uint word = load_u32(w, rowBase + ulong(base + wi) * 4);
+            uint xoff = xOff + xbase + wi * perWord;
+            for (uint j = 0; j < perWord; ++j) {
+                float xv = x[xoff + j];
+                qdot += float(word & mask) * xv;
+                xsum += xv;
+                word >>= p.bits;
+            }
+        }
+        uint gi = row * groups + g;
+        acc += load_scale(scales, p.sOff, gi, p.scalesType) * qdot
+             + load_scale(biases, p.bOff, gi, p.scalesType) * xsum;
+    }
+    y[yOff + row] = acc;
+}
+
+kernel void gemv_plain_batch(
+    device const float *x        [[buffer(0)]],
+    device const uchar *w        [[buffer(1)]],
+    device float       *y        [[buffer(2)]],
+    constant GemvPlainParams &p  [[buffer(3)]],
+    constant uint2     *offs     [[buffer(4)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint row = tpg.x;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.y].x;
+    const uint yOff = offs[tpg.y].y;
+    float acc = 0;
+    if (p.dtype == 0) {
+        ulong base = p.wOff + ulong(row) * p.inDim * 4;
+        for (uint i = 0; i < p.inDim; ++i)
+            acc += as_type<float>(load_u32(w, base + ulong(i) * 4)) * x[xOff + i];
+    } else {
+        ulong base = p.wOff + ulong(row) * p.inDim * 2;
+        for (uint i = 0; i < p.inDim; ++i) {
+            ushort u = ushort(w[base + ulong(i) * 2]) | (ushort(w[base + ulong(i) * 2 + 1]) << 8);
+            float wv = (p.dtype == 1) ? float(as_type<half>(u)) : as_type<float>(uint(u) << 16);
+            acc += wv * x[xOff + i];
+        }
+    }
+    y[yOff + row] = acc;
+}
+
+kernel void gemv_affine_fast_batch(
+    device const float *x       [[buffer(0)]],
+    device const uchar *w       [[buffer(1)]],
+    device const uchar *scales  [[buffer(2)]],
+    device const uchar *biases  [[buffer(3)]],
+    device float       *y       [[buffer(4)]],
+    constant GemvParams &p      [[buffer(5)]],
+    constant uint2     *offs    [[buffer(6)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tpg.y;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.z].x;
+    const uint yOff = offs[tpg.z].y;
+    const uint packedCols = p.inDim / 8;           // uint32 words per row
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / 8;
+    device const uint *wr = (device const uint *)(w + p.wOff + ulong(row) * packedCols * 4);
+
+    float acc = 0;
+    for (uint g = lane; g < groups; g += 32) {
+        float qdot = 0;
+        float xsum = 0;
+        uint base = g * wordsPerGroup;
+        uint xbase = xOff + g * p.groupSize;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            uint word = wr[base + wi];
+            uint xo = xbase + wi * 8;
+            qdot += float(word & 0xF) * x[xo]
+                  + float((word >> 4) & 0xF) * x[xo + 1]
+                  + float((word >> 8) & 0xF) * x[xo + 2]
+                  + float((word >> 12) & 0xF) * x[xo + 3]
+                  + float((word >> 16) & 0xF) * x[xo + 4]
+                  + float((word >> 20) & 0xF) * x[xo + 5]
+                  + float((word >> 24) & 0xF) * x[xo + 6]
+                  + float((word >> 28) & 0xF) * x[xo + 7];
+            xsum += x[xo] + x[xo+1] + x[xo+2] + x[xo+3] + x[xo+4] + x[xo+5] + x[xo+6] + x[xo+7];
+        }
+        uint gi = row * groups + g;
+        acc += load_scale(scales, p.sOff, gi, p.scalesType) * qdot
+             + load_scale(biases, p.bOff, gi, p.scalesType) * xsum;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[yOff + row] = acc;
+}
+
+kernel void gemv_affine_fast8_batch(
+    device const float *x       [[buffer(0)]],
+    device const uchar *w       [[buffer(1)]],
+    device const uchar *scales  [[buffer(2)]],
+    device const uchar *biases  [[buffer(3)]],
+    device float       *y       [[buffer(4)]],
+    constant GemvParams &p      [[buffer(5)]],
+    constant uint2     *offs    [[buffer(6)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tpg.y;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.z].x;
+    const uint yOff = offs[tpg.z].y;
+    const uint packedCols = p.inDim / 4;           // uint32 words per row
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / 4;
+    device const uint *wr = (device const uint *)(w + p.wOff + ulong(row) * packedCols * 4);
+
+    float acc = 0;
+    for (uint g = lane; g < groups; g += 32) {
+        float qdot = 0;
+        float xsum = 0;
+        uint base = g * wordsPerGroup;
+        uint xbase = xOff + g * p.groupSize;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            uint word = wr[base + wi];
+            uint xo = xbase + wi * 4;
+            qdot += float(word & 0xFF) * x[xo]
+                  + float((word >> 8) & 0xFF) * x[xo + 1]
+                  + float((word >> 16) & 0xFF) * x[xo + 2]
+                  + float((word >> 24) & 0xFF) * x[xo + 3];
+            xsum += x[xo] + x[xo+1] + x[xo+2] + x[xo+3];
+        }
+        uint gi = row * groups + g;
+        acc += load_scale(scales, p.sOff, gi, p.scalesType) * qdot
+             + load_scale(biases, p.bOff, gi, p.scalesType) * xsum;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[yOff + row] = acc;
+}
+
 // ===== S2 full attention: q prep, KV append, gated causal GQA softmax. =====
 // Replaces the fast path's CPU attention core. RoPE trig uses precise::
 // variants so angles match the CPU's libm within float rounding.

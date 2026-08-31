@@ -301,6 +301,96 @@ public final class MetalEngine {
         }
     }
 
+    /// The setBytes offset-table ceiling for one batched GEMV dispatch:
+    /// 512 uint2 entries stay well under Metal's 4 KB setBytes limit. Longer
+    /// tables split into further dispatches.
+    static let gemvBatchSlotLimit = 512
+
+    /// Encode the same linear applied to many token slots (S1b token
+    /// batching): the grid gains a slot dimension and each slice reads its
+    /// x/y float offsets from a small table, so one dispatch replaces the
+    /// per-token `encodeGemv` sequence. The per-row arithmetic is the
+    /// single-token kernel's verbatim, making every output row bitwise
+    /// identical to the unbatched encode. A single slot delegates to
+    /// `encodeGemv` so degenerate chunks keep the decode-shaped encode
+    /// stream; empty slot lists encode nothing.
+    func encodeGemvBatch(
+        _ enc: MTLComputeCommandEncoder,
+        _ lin: MetalShardStore.GPULinear,
+        rows: Int? = nil,
+        wExtra: Int = 0, sExtra: Int = 0, bExtra: Int = 0,
+        x: MTLBuffer, y: MTLBuffer,
+        slots: [(xOff: Int, yOff: Int)]
+    ) throws {
+        guard let first = slots.first else { return }
+        if slots.count == 1 {
+            try encodeGemv(enc, lin, rows: rows, wExtra: wExtra, sExtra: sExtra, bExtra: bExtra,
+                           x: x, xOff: first.xOff, y: y, yOff: first.yOff)
+            return
+        }
+        let outDim = rows ?? lin.outDim
+        var start = 0
+        while start < slots.count {
+            let end = min(start + Self.gemvBatchSlotLimit, slots.count)
+            let table = slots[start..<end].map {
+                SIMD2<UInt32>(UInt32($0.xOff), UInt32($0.yOff))
+            }
+            let n = end - start
+            if lin.isQuantized {
+                // Same kernel selection as encodeGemv: cooperative fast path
+                // when rows are 4-byte aligned, scalar fallback otherwise.
+                let aligned = (lin.wOff + wExtra) % 4 == 0
+                let fastName: String? = !Self.fastGemvEnabled || !aligned ? nil
+                    : lin.bits == 4 && lin.groupSize % 8 == 0 ? "gemv_affine_fast_batch"
+                    : lin.bits == 8 && lin.groupSize % 4 == 0 ? "gemv_affine_fast8_batch"
+                    : nil
+                enc.setComputePipelineState(try pipeline(fastName ?? "gemv_affine_batch"))
+                var p = GemvParams(
+                    wOff: UInt64(lin.wOff + wExtra), sOff: UInt64(lin.sOff + sExtra),
+                    bOff: UInt64(lin.bOff + bExtra),
+                    outDim: UInt32(outDim), inDim: UInt32(lin.inDim),
+                    groupSize: UInt32(lin.groupSize), bits: UInt32(lin.bits),
+                    scalesType: lin.scalesType
+                )
+                enc.setBuffer(x, offset: 0, index: 0)
+                enc.setBuffer(lin.wBuffer, offset: 0, index: 1)
+                enc.setBuffer(lin.sBuffer, offset: 0, index: 2)
+                enc.setBuffer(lin.bBuffer, offset: 0, index: 3)
+                enc.setBuffer(y, offset: 0, index: 4)
+                enc.setBytes(&p, length: MemoryLayout<GemvParams>.stride, index: 5)
+                table.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 6) }
+                if fastName != nil {
+                    dispatchThreads(
+                        enc, threads: MTLSize(width: 32, height: outDim, depth: n),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                    )
+                } else {
+                    dispatchThreads(
+                        enc, threads: MTLSize(width: outDim, height: n, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: min(64, outDim), height: 1, depth: 1)
+                    )
+                }
+            } else {
+                enc.setComputePipelineState(try pipeline("gemv_plain_batch"))
+                var p = GemvPlainParams(
+                    wOff: UInt64(lin.wOff + wExtra),
+                    outDim: UInt32(outDim), inDim: UInt32(lin.inDim),
+                    dtype: lin.plainDtype
+                )
+                enc.setBuffer(x, offset: 0, index: 0)
+                enc.setBuffer(lin.wBuffer, offset: 0, index: 1)
+                enc.setBuffer(y, offset: 0, index: 2)
+                enc.setBytes(&p, length: MemoryLayout<GemvPlainParams>.stride, index: 3)
+                table.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 4) }
+                dispatchThreads(
+                    enc, threads: MTLSize(width: outDim, height: n, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(64, outDim), height: 1, depth: 1)
+                )
+            }
+            start = end
+        }
+    }
+
     func encodeSiluMul(
         _ enc: MTLComputeCommandEncoder,
         buf: MTLBuffer, count: Int, gOff: Int, uOff: Int, dstOff: Int
