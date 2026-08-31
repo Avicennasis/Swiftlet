@@ -659,6 +659,108 @@ public final class MetalEngine {
         )
     }
 
+    struct DeltaPreBatchParams {
+        var nv: UInt32
+        var aOff: UInt32
+        var bOff: UInt32
+        var outOff: UInt32
+        var stride: UInt32
+    }
+
+    /// delta_pre over `tokens` slots: slot t adds t*slotStride to every
+    /// offset (g at outOff, beta at outOff + nv; aLog/dtBias shared).
+    func encodeDeltaPreBatch(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer,
+        aLog: MTLBuffer, dtBias: MTLBuffer,
+        nv: Int, aOff: Int, bOff: Int, outOff: Int, slotStride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("delta_pre_batch"))
+        var p = DeltaPreBatchParams(
+            nv: UInt32(nv), aOff: UInt32(aOff), bOff: UInt32(bOff),
+            outOff: UInt32(outOff), stride: UInt32(slotStride)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(aLog, offset: 0, index: 1)
+        enc.setBuffer(dtBias, offset: 0, index: 2)
+        enc.setBytes(&p, length: MemoryLayout<DeltaPreBatchParams>.stride, index: 3)
+        dispatchThreads(
+            enc, threads: MTLSize(width: nv, height: tokens, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(64, nv), height: 1, depth: 1)
+        )
+    }
+
+    struct NormBatchParams {
+        var rows: UInt32
+        var dim: UInt32
+        var eps: Float
+        var hasWeight: UInt32
+        var scale: Float
+        var off: UInt32
+        var stride: UInt32
+    }
+
+    /// rmsnorm_rows over `tokens` slots, in place: slot t norms `rows` rows
+    /// of `dim` at off + t*slotStride. Optional weight, optional extra scale
+    /// (the DeltaNet q/k norms are weightless, scaled 1/dk and 1/sqrt(dk)).
+    /// One simdgroup per (row, token).
+    func encodeRMSNormRowsBatch(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer, weight: MTLBuffer?,
+        off: Int, rows: Int, dim: Int, scale: Float, eps: Float,
+        slotStride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("rmsnorm_rows_batch"))
+        var p = NormBatchParams(
+            rows: UInt32(rows), dim: UInt32(dim), eps: eps,
+            hasWeight: weight != nil ? 1 : 0, scale: scale,
+            off: UInt32(off), stride: UInt32(slotStride)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(weight ?? data, offset: 0, index: 1)
+        enc.setBytes(&p, length: MemoryLayout<NormBatchParams>.stride, index: 2)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: rows, depth: tokens),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
+    struct GatedNormBatchParams {
+        var nv: UInt32
+        var dv: UInt32
+        var eps: Float
+        var yOff: UInt32
+        var zOff: UInt32
+        var outOff: UInt32
+        var yStride: UInt32
+        var zStride: UInt32
+        var outStride: UInt32
+    }
+
+    /// gated_norm_mul over `tokens` with per-stream strides: the chunked
+    /// recurrence reads y rows from the contiguous [T, row] staging block
+    /// while z and the output stay slot-strided. One simdgroup per
+    /// (v-head, token).
+    func encodeGatedNormMulBatch(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer, weight: MTLBuffer,
+        nv: Int, dv: Int, eps: Float,
+        yOff: Int, yStride: Int, zOff: Int, zStride: Int,
+        outOff: Int, outStride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("gated_norm_mul_batch"))
+        var p = GatedNormBatchParams(
+            nv: UInt32(nv), dv: UInt32(dv), eps: eps,
+            yOff: UInt32(yOff), zOff: UInt32(zOff), outOff: UInt32(outOff),
+            yStride: UInt32(yStride), zStride: UInt32(zStride),
+            outStride: UInt32(outStride)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(weight, offset: 0, index: 1)
+        enc.setBytes(&p, length: MemoryLayout<GatedNormBatchParams>.stride, index: 2)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: nv, depth: tokens),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
     struct DeltaGatherParams {
         var keyDim: UInt32
         var valueDim: UInt32

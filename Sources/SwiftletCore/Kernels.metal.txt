@@ -1041,6 +1041,104 @@ kernel void attn_decode_gqa_batch(
     }
 }
 
+// delta_pre over n token slots: slot t adds t*stride to every offset;
+// per-slot arithmetic is the single-token kernel's verbatim (aLog/dtBias
+// are shared weights).
+struct DeltaPreBatchParams {
+    uint nv;
+    uint aOff;
+    uint bOff;
+    uint outOff;   // g at outOff, beta at outOff + nv
+    uint stride;
+};
+
+kernel void delta_pre_batch(
+    device float       *data   [[buffer(0)]],
+    device const float *aLog   [[buffer(1)]],
+    device const float *dtBias [[buffer(2)]],
+    constant DeltaPreBatchParams &p [[buffer(3)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= p.nv) return;
+    const uint b = tpg.y * p.stride;
+    float av = data[p.aOff + b + i] + dtBias[i];
+    float sp = av > 20.0f ? av : metal::log(1.0f + metal::exp(av));
+    data[p.outOff + b + i] = metal::exp(-metal::exp(aLog[i]) * sp);
+    float bv = data[p.bOff + b + i];
+    data[p.outOff + b + p.nv + i] = 1.0f / (1.0f + metal::exp(-bv));
+}
+
+// rmsnorm_rows over n token slots: slot t norms its `rows` rows in place at
+// off + t*stride. One simdgroup per (row, token).
+struct NormBatchParams {
+    uint rows;
+    uint dim;
+    float eps;
+    uint hasWeight;
+    float scale;
+    uint off;
+    uint stride;
+};
+
+kernel void rmsnorm_rows_batch(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],
+    constant NormBatchParams &p [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tpg.y;
+    if (row >= p.rows) return;
+    device float *r = data + p.off + tpg.z * p.stride + row * p.dim;
+    float ss = 0;
+    for (uint i = lane; i < p.dim; i += 32) ss += r[i] * r[i];
+    ss = simd_sum(ss);
+    float inv = metal::rsqrt(ss / float(p.dim) + p.eps) * p.scale;
+    for (uint i = lane; i < p.dim; i += 32) {
+        r[i] = p.hasWeight ? r[i] * inv * wgt[i] : r[i] * inv;
+    }
+}
+
+// gated_norm_mul over n tokens. The chunked recurrence reads y rows from
+// the contiguous [T, row] staging block while z and the output stay in the
+// per-token slots, so each stream carries its own stride. One simdgroup per
+// (v-head, token).
+struct GatedNormBatchParams {
+    uint nv;
+    uint dv;
+    float eps;
+    uint yOff;
+    uint zOff;
+    uint outOff;
+    uint yStride;
+    uint zStride;
+    uint outStride;
+};
+
+kernel void gated_norm_mul_batch(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],   // (dv)
+    constant GatedNormBatchParams &p [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint hv = tpg.y;
+    if (hv >= p.nv) return;
+    const uint t = tpg.z;
+    device float *yr = data + p.yOff + t * p.yStride + hv * p.dv;
+    device float *zr = data + p.zOff + t * p.zStride + hv * p.dv;
+    device float *outr = data + p.outOff + t * p.outStride + hv * p.dv;
+    float ss = 0;
+    for (uint i = lane; i < p.dv; i += 32) ss += yr[i] * yr[i];
+    ss = simd_sum(ss);
+    float inv = metal::rsqrt(ss / float(p.dv) + p.eps);
+    for (uint i = lane; i < p.dv; i += 32) {
+        float zv = zr[i];
+        outr[i] = yr[i] * inv * wgt[i] * (zv / (1.0f + metal::exp(-zv)));
+    }
+}
+
 // ===== S1b chunked DeltaNet staging: pack every chunk token's normed
 // q/k/v conv rows and g/beta pairs from slot-strided regions into the
 // contiguous [T, row] blocks gated_delta_step's T-step scan expects. Pure

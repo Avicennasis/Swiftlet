@@ -606,6 +606,136 @@ import Testing
         Self.expectBitwise(bufA, bufB, tokens * stride, "attn_decode")
     }
 
+    /// delta_pre_batch: per-token delta_pre dispatches vs one strided batch
+    /// over the slots' a/b rows, bitwise (g and beta both land at outOff).
+    @Test func deltaPreBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let nv = 6, tokens = 3
+        let aOff = 5, bOff = aOff + nv + 3, outOff = bOff + nv + 7
+        let stride = outOff + 2 * nv + 9
+        var rng = Rand(113)
+        let src = (0..<tokens * stride).map { _ in rng.float() }
+        let aLog = engine.makeBuffer((0..<nv).map { _ in rng.float() })
+        let dtBias = engine.makeBuffer((0..<nv).map { _ in rng.float() })
+
+        let bufA = engine.makeBuffer(src)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("delta_pre"))
+                var p = SIMD4<UInt32>(
+                    UInt32(nv), UInt32(aOff + t * stride),
+                    UInt32(bOff + t * stride), UInt32(outOff + t * stride))
+                enc.setBuffer(bufA, offset: 0, index: 0)
+                enc.setBuffer(aLog, offset: 0, index: 1)
+                enc.setBuffer(dtBias, offset: 0, index: 2)
+                enc.setBytes(&p, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 3)
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: nv, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(64, nv), height: 1, depth: 1))
+            }
+        }
+        let bufB = engine.makeBuffer(src)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeDeltaPreBatch(
+                enc, data: bufB, aLog: aLog, dtBias: dtBias,
+                nv: nv, aOff: aOff, bOff: bOff, outOff: outOff,
+                slotStride: stride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "delta_pre: per-token dispatch count")
+        #expect(batched == 1, "delta_pre: batched dispatch count")
+        Self.expectBitwise(bufA, bufB, tokens * stride, "delta_pre")
+    }
+
+    /// rmsnorm_rows_batch: per-token in-place rmsnorm_rows dispatches vs one
+    /// strided batch, bitwise — in the weightless scaled shape the DeltaNet
+    /// q/k norms use.
+    @Test func rmsnormRowsBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let rows = 2, dim = 32, tokens = 3, off = 5
+        let stride = rows * dim + 11
+        let scale: Float = 0.25
+        let total = off + (tokens - 1) * stride + rows * dim
+        var rng = Rand(127)
+        let src = (0..<total).map { _ in rng.float() }
+
+        struct NormParams {
+            var rows: UInt32; var dim: UInt32; var eps: Float
+            var hasWeight: UInt32; var scale: Float; var off: UInt32
+        }
+        let bufA = engine.makeBuffer(src)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("rmsnorm_rows"))
+                var p = NormParams(rows: UInt32(rows), dim: UInt32(dim), eps: 1e-6,
+                                   hasWeight: 0, scale: scale, off: UInt32(off + t * stride))
+                enc.setBuffer(bufA, offset: 0, index: 0)
+                enc.setBuffer(bufA, offset: 0, index: 1)
+                enc.setBytes(&p, length: MemoryLayout<NormParams>.stride, index: 2)
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: 32, height: rows, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+        }
+        let bufB = engine.makeBuffer(src)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeRMSNormRowsBatch(
+                enc, data: bufB, weight: nil, off: off, rows: rows, dim: dim,
+                scale: scale, eps: 1e-6, slotStride: stride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "rmsnorm_rows: per-token dispatch count")
+        #expect(batched == 1, "rmsnorm_rows: batched dispatch count")
+        Self.expectBitwise(bufA, bufB, total, "rmsnorm_rows")
+    }
+
+    /// gated_norm_mul_batch: per-token gated_norm_mul dispatches vs one
+    /// batched dispatch with per-stream strides — y rows in a contiguous
+    /// staging block (the chunked recurrence's layout), z and the output
+    /// slot-strided — bitwise.
+    @Test func gatedNormMulBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let nv = 4, dv = 8, tokens = 3
+        let zOff = 3
+        let outOff = zOff + nv * dv + 5
+        let slotStride = outOff + nv * dv + 7
+        let yOff = tokens * slotStride
+        let yStride = nv * dv
+        let total = yOff + tokens * yStride
+        var rng = Rand(137)
+        let src = (0..<total).map { _ in rng.float() }
+        let wgt = engine.makeBuffer((0..<dv).map { _ in rng.float() })
+
+        struct GatedNormParams {
+            var nv: UInt32; var dv: UInt32; var eps: Float
+            var yOff: UInt32; var zOff: UInt32; var outOff: UInt32
+        }
+        let bufA = engine.makeBuffer(src)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
+                var p = GatedNormParams(
+                    nv: UInt32(nv), dv: UInt32(dv), eps: 1e-6,
+                    yOff: UInt32(yOff + t * yStride), zOff: UInt32(zOff + t * slotStride),
+                    outOff: UInt32(outOff + t * slotStride))
+                enc.setBuffer(bufA, offset: 0, index: 0)
+                enc.setBuffer(wgt, offset: 0, index: 1)
+                enc.setBytes(&p, length: MemoryLayout<GatedNormParams>.stride, index: 2)
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: 32, height: nv, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+        }
+        let bufB = engine.makeBuffer(src)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeGatedNormMulBatch(
+                enc, data: bufB, weight: wgt, nv: nv, dv: dv, eps: 1e-6,
+                yOff: yOff, yStride: yStride, zOff: zOff, zStride: slotStride,
+                outOff: outOff, outStride: slotStride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "gated_norm_mul: per-token dispatch count")
+        #expect(batched == 1, "gated_norm_mul: batched dispatch count")
+        Self.expectBitwise(bufA, bufB, total, "gated_norm_mul")
+    }
+
     // MARK: - S1b chunked DeltaNet recurrence (T-step scan)
 
     /// gated_delta_step's T parameter is a sequential in-dispatch scan: one
