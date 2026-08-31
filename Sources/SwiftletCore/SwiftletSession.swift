@@ -458,14 +458,26 @@ public final class SwiftletSession: @unchecked Sendable {
                     }
 
                     if control.isCancelled { finishReason = .cancelled }
-                    // On EOS/length, release a non-matching potential stop
-                    // prefix and any final U+FFFD. A matched stop and a
-                    // cancelled turn deliberately release nothing further.
-                    if finishReason != .cancelled, !matchedTextStop,
-                       let rest = stopFilter.finish(
+                    // On EOS/length, inspect the final raw scalar stream before
+                    // releasing held text. This both flushes a non-matching
+                    // prefix/U+FFFD and catches a stop that itself ends in the
+                    // now-terminal U+FFFD. Cancellation and prior matches do
+                    // not release anything further.
+                    if finishReason != .cancelled, !matchedTextStop {
+                        let finalUpdate = stopFilter.finishUpdate(
                             decoded: self.tokenizer.decode(tokens: generated)
-                       ), case .terminated = continuation.yield(rest) {
-                        finishReason = .cancelled
+                        )
+                        guard finalUpdate.isConsistent else {
+                            throw GenerationInterruption.invalidTextStream
+                        }
+                        if finalUpdate.didStop {
+                            matchedTextStop = true
+                            finishReason = .stop
+                        }
+                        if let rest = finalUpdate.delta,
+                           case .terminated = continuation.yield(rest) {
+                            finishReason = .cancelled
+                        }
                     }
                     // Cancellation can race the final EOS/length flush. Make
                     // the reuse decision only after one last observation so a

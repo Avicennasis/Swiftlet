@@ -89,7 +89,7 @@ let generationQueue = DispatchQueue(label: "swiftlet.generation")
 final class ConnectionGenerationOwner: @unchecked Sendable {
     private struct Job {
         let cancellation: GenerationCancellation
-        let heartbeat: RepeatedTask?
+        var heartbeat: RepeatedTask?
     }
 
     private let lock = NSLock()
@@ -105,11 +105,48 @@ final class ConnectionGenerationOwner: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Attaches a heartbeat after the initial SSE head is submitted. If that
+    /// head has already failed and removed the job, cancel the newly-created
+    /// task instead of orphaning it.
+    func attachHeartbeat(id: String, heartbeat: RepeatedTask) {
+        lock.lock()
+        if var job = jobs[id] {
+            job.heartbeat = heartbeat
+            jobs[id] = job
+            lock.unlock()
+        } else {
+            lock.unlock()
+            heartbeat.cancel()
+        }
+    }
+
+    func stopHeartbeat(id: String) {
+        lock.lock()
+        let heartbeat = jobs[id]?.heartbeat
+        if var job = jobs[id] {
+            job.heartbeat = nil
+            jobs[id] = job
+        }
+        lock.unlock()
+        heartbeat?.cancel()
+    }
+
     func finish(id: String) {
         lock.lock()
         let job = jobs.removeValue(forKey: id)
         lock.unlock()
         job?.heartbeat?.cancel()
+    }
+
+    /// Cancels and removes only the request whose write failed.
+    @discardableResult
+    func failWrite(id: String) -> Bool {
+        lock.lock()
+        let job = jobs.removeValue(forKey: id)
+        lock.unlock()
+        job?.cancellation.cancel()
+        job?.heartbeat?.cancel()
+        return job != nil
     }
 
     func cancelAll() {
@@ -135,7 +172,17 @@ final class ConnectionGenerationOwner: @unchecked Sendable {
     var choice: [String: Any] = ["index": 0]
     if let text { choice["message"] = ["role": "assistant", "content": text] }
     if let delta { choice["delta"] = ["content": delta] }
-    if let finish { choice["finish_reason"] = finish }
+    if delta != nil {
+        // OpenAI streaming choices carry the key on every chunk; it is null
+        // until the terminal chunk supplies "stop" or "length".
+        if let finish {
+            choice["finish_reason"] = finish
+        } else {
+            choice["finish_reason"] = NSNull()
+        }
+    } else if let finish {
+        choice["finish_reason"] = finish
+    }
     var payload: [String: Any] = [
         "id": id,
         "object": delta != nil ? "chat.completion.chunk" : "chat.completion",
@@ -225,6 +272,27 @@ final class HTTPHandler: ChannelInboundHandler {
         let channel = context.channel
         let cancellation = GenerationCancellation()
         let owner = generationOwner
+        owner.register(id: id, cancellation: cancellation)
+
+        /// Every chat write is observed. A failed outbound future cancels this
+        /// request's token (never a neighboring connection/request), tears down
+        /// its heartbeat ownership, and closes the failed channel. The final
+        /// successful write is what releases normal ownership.
+        @Sendable func observeWrite(
+            _ future: EventLoopFuture<Void>,
+            terminal: Bool = false
+        ) {
+            future.whenComplete { result in
+                switch result {
+                case .success:
+                    if terminal { owner.finish(id: id) }
+                case .failure:
+                    cancellation.cancel()
+                    owner.failWrite(id: id)
+                    if channel.isActive { channel.close(promise: nil) }
+                }
+            }
+        }
 
         let options: SwiftletSession.GenerationOptions = {
             var o = SwiftletSession.GenerationOptions()
@@ -239,31 +307,42 @@ final class HTTPHandler: ChannelInboundHandler {
         // Agent clients (OpenCode etc.) send multi-thousand-token prompts, so
         // prefill can run minutes with no output. SSE comment heartbeats keep
         // the idle connection from being dropped; parsers ignore them.
-        var heartbeat: RepeatedTask? = nil
         if streaming {
             var head = HTTPResponseHead(version: .http1_1, status: .ok)
             head.headers.add(name: "Content-Type", value: "text/event-stream")
             head.headers.add(name: "Cache-Control", value: "no-cache")
             head.headers.add(name: "Transfer-Encoding", value: "chunked")
-            context.writeAndFlush(wrapOutboundOut(.head(head)), promise: nil)
-            heartbeat = eventLoop.scheduleRepeatedTask(
+            let headPromise = eventLoop.makePromise(of: Void.self)
+            observeWrite(headPromise.futureResult)
+            context.writeAndFlush(wrapOutboundOut(.head(head)), promise: headPromise)
+            let heartbeat = eventLoop.scheduleRepeatedTask(
                 initialDelay: .seconds(15), delay: .seconds(15)
             ) { _ in
-                guard channel.isActive else { return }
+                guard channel.isActive, !cancellation.isCancelled else { return }
                 var buf = channel.allocator.buffer(capacity: 16)
                 buf.writeString(": ping\n\n")
-                _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
+                observeWrite(channel.writeAndFlush(
+                    HTTPServerResponsePart.body(.byteBuffer(buf))
+                ))
             }
+            owner.attachHeartbeat(id: id, heartbeat: heartbeat)
         }
-        owner.register(id: id, cancellation: cancellation, heartbeat: heartbeat)
 
         @Sendable func writeSSE(_ obj: [String: Any]) {
             let payload = "data: " + (String(data: jsonData(obj), encoding: .utf8) ?? "{}") + "\n\n"
             eventLoop.execute {
-                guard channel.isActive else { return }
+                guard channel.isActive, !cancellation.isCancelled else {
+                    if !channel.isActive {
+                        cancellation.cancel()
+                        owner.failWrite(id: id)
+                    }
+                    return
+                }
                 var buf = channel.allocator.buffer(capacity: payload.utf8.count)
                 buf.writeString(payload)
-                _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
+                observeWrite(channel.writeAndFlush(
+                    HTTPServerResponsePart.body(.byteBuffer(buf))
+                ))
             }
         }
 
@@ -297,8 +376,12 @@ final class HTTPHandler: ChannelInboundHandler {
                     ).utf8))
 
                     eventLoop.execute {
-                        owner.finish(id: id)
-                        guard channel.isActive, m.finishReason != .cancelled else { return }
+                        guard channel.isActive, m.finishReason != .cancelled else {
+                            cancellation.cancel()
+                            owner.failWrite(id: id)
+                            return
+                        }
+                        owner.stopHeartbeat(id: id)
                         let finishReason = openAIFinishReason(m.finishReason)
                         if streaming {
                             // The finish chunk, [DONE], and the HTTP end must
@@ -314,8 +397,13 @@ final class HTTPHandler: ChannelInboundHandler {
                                 + "\n\ndata: [DONE]\n\n"
                             var buf = channel.allocator.buffer(capacity: tail.utf8.count)
                             buf.writeString(tail)
-                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
-                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                            observeWrite(channel.write(
+                                HTTPServerResponsePart.body(.byteBuffer(buf))
+                            ))
+                            observeWrite(
+                                channel.writeAndFlush(HTTPServerResponsePart.end(nil)),
+                                terminal: true
+                            )
                         } else {
                             let data = jsonData(completionPayload(
                                 id: id, text: fullText, delta: nil, finish: finishReason,
@@ -325,15 +413,24 @@ final class HTTPHandler: ChannelInboundHandler {
                             head.headers.add(name: "Content-Length", value: String(data.count))
                             var buf = channel.allocator.buffer(capacity: data.count)
                             buf.writeBytes(data)
-                            _ = channel.write(HTTPServerResponsePart.head(head))
-                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
-                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                            observeWrite(channel.write(HTTPServerResponsePart.head(head)))
+                            observeWrite(channel.write(
+                                HTTPServerResponsePart.body(.byteBuffer(buf))
+                            ))
+                            observeWrite(
+                                channel.writeAndFlush(HTTPServerResponsePart.end(nil)),
+                                terminal: true
+                            )
                         }
                     }
                 } catch {
                     eventLoop.execute {
-                        owner.finish(id: id)
-                        guard channel.isActive else { return }
+                        guard channel.isActive else {
+                            cancellation.cancel()
+                            owner.failWrite(id: id)
+                            return
+                        }
+                        owner.stopHeartbeat(id: id)
                         if streaming {
                             // The 200 + SSE head is already on the wire; a
                             // second head would be a protocol error. Report
@@ -343,17 +440,27 @@ final class HTTPHandler: ChannelInboundHandler {
                             ) ?? "{}") + "\n\ndata: [DONE]\n\n"
                             var buf = channel.allocator.buffer(capacity: payload.utf8.count)
                             buf.writeString(payload)
-                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
-                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                            observeWrite(channel.write(
+                                HTTPServerResponsePart.body(.byteBuffer(buf))
+                            ))
+                            observeWrite(
+                                channel.writeAndFlush(HTTPServerResponsePart.end(nil)),
+                                terminal: true
+                            )
                         } else {
                             let data = jsonData(["error": "\(error)"])
                             var head = HTTPResponseHead(version: .http1_1, status: .internalServerError)
                             head.headers.add(name: "Content-Length", value: String(data.count))
                             var buf = channel.allocator.buffer(capacity: data.count)
                             buf.writeBytes(data)
-                            _ = channel.write(HTTPServerResponsePart.head(head))
-                            _ = channel.write(HTTPServerResponsePart.body(.byteBuffer(buf)))
-                            _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
+                            observeWrite(channel.write(HTTPServerResponsePart.head(head)))
+                            observeWrite(channel.write(
+                                HTTPServerResponsePart.body(.byteBuffer(buf))
+                            ))
+                            observeWrite(
+                                channel.writeAndFlush(HTTPServerResponsePart.end(nil)),
+                                terminal: true
+                            )
                         }
                     }
                 }

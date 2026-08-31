@@ -83,6 +83,28 @@ import SwiftletCore
         #expect(openAIFinishReason(nil) == nil)
     }
 
+    @Test func nonterminalStreamingPayloadCarriesNullFinishReason() throws {
+        let payload = completionPayload(
+            id: "chatcmpl-test", text: nil, delta: "piece", finish: nil
+        )
+        let choices = try #require(payload["choices"] as? [[String: Any]])
+        let choice = try #require(choices.first)
+        #expect(choice["finish_reason"] is NSNull)
+
+        let encoded = try JSONSerialization.data(withJSONObject: payload)
+        let json = try #require(String(data: encoded, encoding: .utf8))
+        #expect(json.contains(#""finish_reason":null"#))
+    }
+
+    @Test func terminalStreamingPayloadCarriesConcreteFinishReason() throws {
+        let payload = completionPayload(
+            id: "chatcmpl-test", text: nil, delta: "", finish: "length"
+        )
+        let choices = try #require(payload["choices"] as? [[String: Any]])
+        let choice = try #require(choices.first)
+        #expect(choice["finish_reason"] as? String == "length")
+    }
+
     @Test func connectionOwnerCancelsQueuedAndActiveWork() {
         let owner = ConnectionGenerationOwner()
         let first = GenerationCancellation()
@@ -119,6 +141,22 @@ import SwiftletCore
 
         #expect(disconnectedRequest.isCancelled)
         #expect(!liveRequest.isCancelled)
+    }
+
+    @Test func writeFailureCancelsOnlyItsOwnedRequest() {
+        let owner = ConnectionGenerationOwner()
+        let failedRequest = GenerationCancellation()
+        let neighboringRequest = GenerationCancellation()
+        owner.register(id: "failed", cancellation: failedRequest)
+        owner.register(id: "neighbor", cancellation: neighboringRequest)
+
+        #expect(owner.failWrite(id: "failed"))
+        #expect(failedRequest.isCancelled)
+        #expect(!neighboringRequest.isCancelled)
+        #expect(!owner.failWrite(id: "unknown"))
+
+        owner.cancelAll()
+        #expect(neighboringRequest.isCancelled)
     }
 
     @Test func malformedInputThrows() {

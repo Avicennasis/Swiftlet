@@ -68,26 +68,48 @@ public final class TextGenerator {
     /// Token-id stream over `generate`, in the `AsyncStream` shape iOS chat
     /// UIs consume (Priv AI's engines all expose `-> AsyncStream`). Runs the
     /// blocking decode loop on a utility queue; cancelling the consuming task
-    /// stops generation at the next token.
+    /// stops prefill/decode at the next model-safe boundary.
     public func tokenStream(promptIds: [Int], maxNew: Int) -> AsyncThrowingStream<Int, Swift.Error> {
+        tokenStream(
+            promptIds: promptIds,
+            maxNew: maxNew,
+            cancellation: GenerationCancellation()
+        )
+    }
+
+    /// Token stream with an explicit cancellation owner for embedding clients
+    /// that need to cancel independently of the consuming Task.
+    public func tokenStream(
+        promptIds: [Int],
+        maxNew: Int,
+        cancellation: GenerationCancellation
+    ) -> AsyncThrowingStream<Int, Swift.Error> {
         AsyncThrowingStream { continuation in
             let work = DispatchWorkItem {
                 do {
-                    var cancelled = false
-                    try self.generate(promptIds: promptIds, maxNew: maxNew) { token in
+                    try self.generate(
+                        promptIds: promptIds,
+                        maxNew: maxNew,
+                        cancellation: cancellation
+                    ) { token in
                         if case .terminated = continuation.yield(token) {
-                            cancelled = true
+                            cancellation.cancel()
                             return false
                         }
                         return true
                     }
-                    _ = cancelled
+                    continuation.finish()
+                } catch GenerationInterruption.cancelled {
+                    // Task/owner cancellation is normal stream termination;
+                    // the local DecodeState dies with this work item.
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
-            continuation.onTermination = { _ in }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { cancellation.cancel() }
+            }
             DispatchQueue.global(qos: .userInitiated).async(execute: work)
         }
     }
@@ -97,22 +119,48 @@ public final class TextGenerator {
     /// consumed as a stop signal and not reported.
     @discardableResult
     public func generate(promptIds: [Int], maxNew: Int, onToken: (Int) -> Bool) throws -> Stats {
+        try generate(
+            promptIds: promptIds,
+            maxNew: maxNew,
+            cancellation: GenerationCancellation(),
+            onToken: onToken
+        )
+    }
+
+    /// Cancellable form of `generate`. Any cancellation error invalidates the
+    /// method-local DecodeState, which is discarded while unwinding.
+    @discardableResult
+    public func generate(
+        promptIds: [Int],
+        maxNew: Int,
+        cancellation: GenerationCancellation,
+        onToken: (Int) -> Bool
+    ) throws -> Stats {
         var stats = Stats()
         stats.promptTokens = promptIds.count
         let state = QwenCPUModel.DecodeState()
 
         let prefillStart = Date()
-        var logits = try model.step(promptIds, state: state)
+        var logits = try model.step(
+            promptIds,
+            state: state,
+            shouldCancel: { cancellation.isCancelled }
+        )
         stats.prefillSeconds = -prefillStart.timeIntervalSinceNow
 
         let decodeStart = Date()
-        for _ in 0..<maxNew {
+        for _ in 0..<max(0, maxNew) {
+            try checkGenerationCancellation { cancellation.isCancelled }
             var best = 0
             for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }
             if eosTokens.contains(best) { break }
             stats.generatedTokens += 1
             if !onToken(best) { break }
-            logits = try model.step([best], state: state)
+            logits = try model.step(
+                [best],
+                state: state,
+                shouldCancel: { cancellation.isCancelled }
+            )
         }
         stats.decodeSeconds = -decodeStart.timeIntervalSinceNow
         return stats
