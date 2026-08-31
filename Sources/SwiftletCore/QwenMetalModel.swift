@@ -1925,8 +1925,9 @@ extension QwenMetalModel {
 // recurrent stages keep ascending token order (conv history per token, the
 // gated recurrence as one T=chunk in-dispatch scan), so numerics match the
 // token-major schedule exactly. S2 batches the attention core across the
-// chunk's tokens on GPU; the causal attend stays per token because each
-// token reads a different kvLen.
+// chunk's tokens on GPU, including the causal attend: its batch twin derives
+// each token's kvLen from the token grid, and every KV append lands behind a
+// barrier before any token attends.
 extension QwenMetalModel {
 
     /// One layer's deferred MoE for a whole chunk: per-token picks/weights in
@@ -2069,6 +2070,29 @@ extension QwenMetalModel {
             kSrcOff: reg.knew, vSrcOff: reg.vnew, slotStride: reg.total, tokens: n)
     }
 
+    /// Causal attends for every chunk token as one attn_decode_gqa_batch:
+    /// token t attends over cache rows [0, basePosition + t + 1), a kvLen
+    /// the kernel derives from the token grid. Callers must barrier between
+    /// the chunk's KV appends and this encode — the youngest token reads
+    /// every appended row.
+    private func encChunkAttentionAttend(
+        _ enc: MTLComputeCommandEncoder, layer li: Int, basePosition: Int, tokens n: Int
+    ) throws {
+        if n == 1 {
+            try encAttentionAttend(
+                enc, layer: li, kvLen: basePosition + 1, slot: prefillSlot(0))
+            return
+        }
+        let cfg = config
+        let fl = fastLayers[li] // fresh copy: ensureKVCapacity may have swapped buffers
+        try engine.encodeAttnDecodeBatch(
+            enc, data: prefillScratchBuf!, kCache: fl.kCache!, vCache: fl.vCache!,
+            heads: cfg.numAttentionHeads, kvHeads: cfg.numKeyValueHeads,
+            headDim: cfg.headDim, basePosition: basePosition,
+            qOff: reg.qprep, qoutOff: reg.qout, outOff: reg.att,
+            slotStride: reg.total, tokens: n)
+    }
+
     /// Splits the prompt into chunks of at most `chunkCapacity` tokens and
     /// prefills each chunk layer-major. Only the final chunk projects logits
     /// (the S1a single-LM-head property).
@@ -2165,13 +2189,12 @@ extension QwenMetalModel {
                     try encChunkAttentionPrep(
                         enc, layer: li, basePosition: basePosition, tokens: S)
                     barrier(enc)
-                    // The causal attend stays per token: token t reads cache
-                    // rows [0, basePosition + t + 1), a kvLen no batched grid
-                    // slice shares.
-                    for t in 0..<S {
-                        try encAttentionAttend(
-                            enc, layer: li, kvLen: basePosition + t + 1, slot: prefillSlot(t))
-                    }
+                    // One batched causal attend: token t reads cache rows
+                    // [0, basePosition + t + 1), a kvLen the kernel derives
+                    // from the token grid; the barrier above guarantees
+                    // every row the youngest token can see has landed.
+                    try encChunkAttentionAttend(
+                        enc, layer: li, basePosition: basePosition, tokens: S)
                     barrier(enc)
                     try engine.encodeGemvBatch(
                         enc, attn.oProj, x: prefillScratchBuf!, y: prefillScratchBuf!,

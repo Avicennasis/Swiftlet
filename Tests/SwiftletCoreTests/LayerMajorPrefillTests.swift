@@ -63,28 +63,28 @@ import Testing
         }
     }
 
-    /// Batching the non-GEMV glue and chunking the DeltaNet recurrence
-    /// re-pin the prefill dispatch baselines.
-    /// Old (GEMV batching only): per token 104 (q4) = 6 delta layers x 10 +
-    /// 2 attention layers x 6 + 8 MoE layers x 4 (q35: 98, no deinterleave);
-    /// per chunk the token-batched projection GEMVs, 66 (q4) = 6x4 + 2x5 +
-    /// 8x4 (q35: 78 = 6x6 + 2x5 + 8x4).
-    /// New: per token only the order-sensitive kernels remain — the DeltaNet
+    /// Batching the causal attend re-pins the prefill dispatch baselines.
+    /// Old (glue twins + chunked scan): per token the DeltaNet
     /// conv/prep/norm chain (conv, decay/beta prep, q/k norms, gated norm;
-    /// 5 per delta layer — the gated scan itself is now one T=chunk dispatch
-    /// per layer) and the causal attend (1 per attention layer): q4/q35
-    /// 32 = 6x5 + 2x1. Per chunk the GEMVs plus the glue twins and the
-    /// chunked scan: q4 144 = 66 + 6x6 (input norm, deinterleave, gather,
-    /// T-step scan, residual, post norm) + 2x5 (input norm, q prep, KV
-    /// append, residual, post norm) + 8x4 (top-2 silus, shared silu,
-    /// weighted accum); q35 150 = 78 + 6x5 (no deinterleave) + 2x5 + 8x4.
+    /// 5 per delta layer) plus the causal attend (1 per attention layer):
+    /// q4/q35 32 = 6x5 + 2x1; per chunk q4 144 = 66 GEMVs + 6x6 + 2x5 +
+    /// 8x4 (q35: 150 = 78 + 6x5 + 2x5 + 8x4).
+    /// New: attn_decode_gqa_batch derives each token's kvLen from the token
+    /// grid, so the attend moves to the per-chunk column — per token only
+    /// the order-sensitive DeltaNet chain remains: q4/q35 30 = 6x5. Per
+    /// chunk the GEMVs plus the glue twins, the chunked scan, and the
+    /// batched attend: q4 146 = 66 + 6x6 (input norm, deinterleave, gather,
+    /// T-step scan, residual, post norm) + 2x6 (input norm, q prep, KV
+    /// append, attend, residual, post norm) + 8x4 (top-2 silus, shared
+    /// silu, weighted accum); q35 152 = 78 + 6x5 (no deinterleave) + 2x6 +
+    /// 8x4.
     /// Per union expert 3 (gate/up/down). A single-token chunk delegates to
     /// the legacy path and lands exactly on the old pin: 104 + 66 + 3x16
     /// = 218 and 98 + 78 + 3x16 = 224 (16 = 8 layers x top-2 picks).
     static let q4Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        perTokenDispatches: 32,
-        perChunkDispatches: 144,
+        perTokenDispatches: 30,
+        perChunkDispatches: 146,
         perUnionExpertDispatches: 3,
         lmHeadDispatches: 2,
         legacyPerTokenDispatches: 104,
@@ -93,8 +93,8 @@ import Testing
     )
     static let q35Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        perTokenDispatches: 32,
-        perChunkDispatches: 150,
+        perTokenDispatches: 30,
+        perChunkDispatches: 152,
         perUnionExpertDispatches: 3,
         lmHeadDispatches: 2,
         legacyPerTokenDispatches: 98,
