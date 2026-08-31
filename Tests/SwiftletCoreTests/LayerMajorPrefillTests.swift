@@ -17,22 +17,34 @@ import Testing
 
     /// Layer-major token-batched baseline: one decode-token-shaped buffer
     /// sequence per chunk (the S2 9-buffer shape), with the dispatch cost
-    /// decomposed into per-token kernels (norms, deinterleave, recurrence,
-    /// attention core, silu, residual adds, weighted accumulation), per-chunk
-    /// token-batched projections (each dense/shared/router GEMV encodes once
-    /// per chunk regardless of chunk size), and per-union-expert batched
-    /// GEMVs (gate/up/down encode once per (expert, projection) per chunk).
-    /// Exact assertions, S3a style.
+    /// decomposed into per-token kernels (the order-sensitive DeltaNet
+    /// recurrence chain and the per-token causal attends), per-chunk batched
+    /// dispatches (each dense/shared/router GEMV plus each glue twin — norm
+    /// copies, deinterleave, silu, residual adds, weighted accumulation,
+    /// attention q prep / KV append — encodes once per chunk regardless of
+    /// chunk size), and per-union-expert batched GEMVs (gate/up/down encode
+    /// once per (expert, projection) per chunk). A single-token chunk
+    /// delegates every batch encode to the legacy per-token path and lands
+    /// exactly on the pre-batching decomposition. Exact assertions, S3a
+    /// style.
     struct LayerMajorBaseline {
         let commandBuffersPerChunk: Int
+        /// Dispatches that stay per token inside a multi-token chunk.
         let perTokenDispatches: Int
+        /// Batched dispatches paid once per multi-token chunk.
         let perChunkDispatches: Int
         let perUnionExpertDispatches: Int
         let lmHeadDispatches: Int
-        /// The pre-batching per-token pin (the flat cost the S1b schedule
-        /// paid before token batching); chunk=1 must still land exactly on
-        /// it, larger chunks strictly below it.
+        /// The pre-batching decomposition (what a single-token chunk pays).
+        let legacyPerTokenDispatches: Int
+        let legacyPerChunkDispatches: Int
+        /// The flat per-token cost of the unbatched schedule; chunk=1 must
+        /// land exactly on it, larger chunks strictly below it.
         let unbatchedDispatchesPerToken: Int
+
+        func chunkSizes(tokens: Int, chunkTokens: Int) -> [Int] {
+            stride(from: 0, to: tokens, by: chunkTokens).map { min(chunkTokens, tokens - $0) }
+        }
 
         func chunkCount(tokens: Int, chunkTokens: Int) -> Int {
             (tokens + chunkTokens - 1) / chunkTokens
@@ -43,36 +55,48 @@ import Testing
         }
 
         func dispatches(tokens: Int, chunkTokens: Int, unionSizes: [Int]) -> Int {
-            perTokenDispatches * tokens
-                + perChunkDispatches * chunkCount(tokens: tokens, chunkTokens: chunkTokens)
-                + perUnionExpertDispatches * unionSizes.reduce(0, +)
-                + lmHeadDispatches
+            chunkSizes(tokens: tokens, chunkTokens: chunkTokens).reduce(lmHeadDispatches) {
+                $0 + ($1 == 1
+                    ? legacyPerTokenDispatches + legacyPerChunkDispatches
+                    : perTokenDispatches * $1 + perChunkDispatches)
+            } + perUnionExpertDispatches * unionSizes.reduce(0, +)
         }
     }
 
-    /// S1b token batching re-pins the prefill dispatch baselines. Old: a
-    /// flat 218 (q4) / 224 (q35) per token — the decode schedule's cost.
-    /// New: per token only the unbatchable kernels remain (q4 104 = 6 delta
-    /// layers x 10 + 2 attention layers x 6 + 8 MoE layers x 4; q35 has one
-    /// fewer batched in_proj stage per delta layer but no deinterleave, so
-    /// 98); per chunk the token-batched projection GEMVs (q4 66 = 6x4 + 2x5
-    /// + 8x4; q35 78 = 6x6 + 2x5 + 8x4); per union expert 3 (gate/up/down).
-    /// A single-token chunk lands exactly on the old pin: 104 + 66 + 3x16
-    /// = 218 and 98 + 78 + 3x16 = 224 (16 = 8 layers x top-2 picks).
+    /// Batching the non-GEMV glue re-pins the prefill dispatch baselines.
+    /// Old (GEMV batching only): per token 104 (q4) = 6 delta layers x 10 +
+    /// 2 attention layers x 6 + 8 MoE layers x 4 (q35: 98, no deinterleave);
+    /// per chunk the token-batched projection GEMVs, 66 (q4) = 6x4 + 2x5 +
+    /// 8x4 (q35: 78 = 6x6 + 2x5 + 8x4).
+    /// New: per token only the order-sensitive kernels remain — the DeltaNet
+    /// recurrence chain (conv, decay/beta prep, q/k norms, gated step, gated
+    /// norm; 6 per delta layer) and the causal attend (1 per attention
+    /// layer): q4/q35 38 = 6x6 + 2x1. Per chunk the GEMVs plus the glue
+    /// twins: q4 132 = 66 + 6x4 (input norm, deinterleave, residual, post
+    /// norm) + 2x5 (input norm, q prep, KV append, residual, post norm) +
+    /// 8x4 (top-2 silus, shared silu, weighted accum); q35 138 = 78 + 6x3 +
+    /// 2x5 + 8x4. Per union expert 3 (gate/up/down). A single-token chunk
+    /// delegates to the legacy path and lands exactly on the old pin:
+    /// 104 + 66 + 3x16 = 218 and 98 + 78 + 3x16 = 224 (16 = 8 layers x
+    /// top-2 picks).
     static let q4Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        perTokenDispatches: 104,
-        perChunkDispatches: 66,
+        perTokenDispatches: 38,
+        perChunkDispatches: 132,
         perUnionExpertDispatches: 3,
         lmHeadDispatches: 2,
+        legacyPerTokenDispatches: 104,
+        legacyPerChunkDispatches: 66,
         unbatchedDispatchesPerToken: 218
     )
     static let q35Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        perTokenDispatches: 98,
-        perChunkDispatches: 78,
+        perTokenDispatches: 38,
+        perChunkDispatches: 138,
         perUnionExpertDispatches: 3,
         lmHeadDispatches: 2,
+        legacyPerTokenDispatches: 98,
+        legacyPerChunkDispatches: 78,
         unbatchedDispatchesPerToken: 224
     )
 

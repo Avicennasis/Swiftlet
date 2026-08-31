@@ -1908,6 +1908,83 @@ extension QwenMetalModel {
         (0..<n).map { t in (xOff: t * reg.total + src, yOff: t * reg.total + dst) }
     }
 
+    // MARK: Chunk-level batch twins for the per-token glue kernels. Every
+    // helper encodes one batched dispatch covering all chunk tokens, and a
+    // single-token chunk delegates to the legacy per-token encode so the
+    // degenerate chunk keeps the decode-shaped stream byte-identical.
+
+    /// Input/post norms for every chunk token as one norm_copy_batch.
+    private func encChunkNormCopy(
+        _ enc: MTLComputeCommandEncoder, w: MTLBuffer, dstOff: Int, tokens n: Int
+    ) throws {
+        if n == 1 {
+            try encNormCopy(enc, w: w, dstOff: dstOff, slot: prefillSlot(0))
+            return
+        }
+        try engine.encodeNormCopyBatch(
+            enc, h: prefillHiddenBuf!, hByteOffset: 0, hStride: config.hiddenSize,
+            dst: prefillScratchBuf!, weight: w,
+            dim: config.hiddenSize, eps: Float(config.rmsNormEps),
+            dstOff: dstOff, dstStride: reg.total, tokens: n)
+    }
+
+    /// Residual adds for every chunk token as one add_inplace_batch.
+    private func encChunkResidualAdd(_ enc: MTLComputeCommandEncoder, tokens n: Int) throws {
+        if n == 1 {
+            try encResidualAdd(enc, slot: prefillSlot(0))
+            return
+        }
+        try engine.encodeAddInplaceBatch(
+            enc, h: prefillHiddenBuf!, hStride: config.hiddenSize,
+            r: prefillScratchBuf!, rOff: reg.r, rStride: reg.total,
+            count: config.hiddenSize, tokens: n)
+    }
+
+    /// Fused qkvz/ba splits for every chunk token as one
+    /// deinterleave_qkvz_batch (fusedInterleaved layout only).
+    private func encChunkDeinterleave(_ enc: MTLComputeCommandEncoder, tokens n: Int) throws {
+        if n == 1 {
+            try encDeltaDeinterleave(enc, slot: prefillSlot(0))
+            return
+        }
+        let cfg = config
+        try engine.encodeDeinterleaveBatch(
+            enc, data: prefillScratchBuf!,
+            nk: cfg.linearNumKeyHeads, dk: cfg.linearKeyHeadDim,
+            rep: cfg.linearNumValueHeads / cfg.linearNumKeyHeads,
+            dv: cfg.linearValueHeadDim, keyDim: cfg.keyDim,
+            srcOff: reg.qkvzStage, baOff: reg.baStage,
+            qkvOff: reg.qkv, zOff: reg.z, bOff: reg.b, aOff: reg.a,
+            stride: reg.total, tokens: n)
+    }
+
+    /// Query prep and KV append for every chunk token: one batched dispatch
+    /// each. Token t preps at position basePosition + t and appends into its
+    /// own (disjoint) cache row, so batching cannot reorder any write.
+    private func encChunkAttentionPrep(
+        _ enc: MTLComputeCommandEncoder, layer li: Int, basePosition: Int, tokens n: Int
+    ) throws {
+        if n == 1 {
+            try encAttentionPrep(enc, layer: li, position: basePosition, slot: prefillSlot(0))
+            return
+        }
+        let cfg = config
+        let fl = fastLayers[li] // fresh copy: ensureKVCapacity may have swapped buffers
+        try engine.encodeAttnQPrepBatch(
+            enc, data: prefillScratchBuf!, weight: fl.qNormW!,
+            heads: cfg.numAttentionHeads, headDim: cfg.headDim,
+            rotaryDims: cfg.rotaryDims, eps: Float(cfg.rmsNormEps),
+            ropeTheta: Float(cfg.ropeTheta), basePosition: basePosition,
+            srcOff: reg.qout, dstOff: reg.qprep, slotStride: reg.total, tokens: n)
+        try engine.encodeAttnKVAppendBatch(
+            enc, data: prefillScratchBuf!, weight: fl.kNormW!,
+            kCache: fl.kCache!, vCache: fl.vCache!,
+            kvHeads: cfg.numKeyValueHeads, headDim: cfg.headDim,
+            rotaryDims: cfg.rotaryDims, eps: Float(cfg.rmsNormEps),
+            ropeTheta: Float(cfg.ropeTheta), basePosition: basePosition,
+            kSrcOff: reg.knew, vSrcOff: reg.vnew, slotStride: reg.total, tokens: n)
+    }
+
     /// Splits the prompt into chunks of at most `chunkCapacity` tokens and
     /// prefills each chunk layer-major. Only the final chunk projects logits
     /// (the S1a single-LM-head property).
@@ -1990,11 +2067,9 @@ extension QwenMetalModel {
                     pending = nil
                 }
                 try phase(.attention) {
-                    // Input norms per token, then q/k/v each as one
-                    // token-batched dispatch over every slot.
-                    for t in 0..<S {
-                        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: prefillSlot(t))
-                    }
+                    // One batched input norm over every slot, then q/k/v each
+                    // as one token-batched dispatch.
+                    try encChunkNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, tokens: S)
                     barrier(enc)
                     for proj in [(attn.qProj, reg.qout), (attn.kProj, reg.knew),
                                  (attn.vProj, reg.vnew)] {
@@ -2003,11 +2078,12 @@ extension QwenMetalModel {
                             slots: chunkGemvSlots(S, src: reg.x0, dst: proj.1))
                     }
                     barrier(enc)
-                    for t in 0..<S {
-                        try encAttentionPrep(
-                            enc, layer: li, position: basePosition + t, slot: prefillSlot(t))
-                    }
+                    try encChunkAttentionPrep(
+                        enc, layer: li, basePosition: basePosition, tokens: S)
                     barrier(enc)
+                    // The causal attend stays per token: token t reads cache
+                    // rows [0, basePosition + t + 1), a kvLen no batched grid
+                    // slice shares.
                     for t in 0..<S {
                         try encAttentionAttend(
                             enc, layer: li, kvLen: basePosition + t + 1, slot: prefillSlot(t))
@@ -2017,7 +2093,7 @@ extension QwenMetalModel {
                         enc, attn.oProj, x: prefillScratchBuf!, y: prefillScratchBuf!,
                         slots: chunkGemvSlots(S, src: reg.att, dst: reg.r))
                     barrier(enc)
-                    for t in 0..<S { try encResidualAdd(enc, slot: prefillSlot(t)) }
+                    try encChunkResidualAdd(enc, tokens: S)
                     barrier(enc)
                 }
                 try phase(.router) {
@@ -2072,20 +2148,18 @@ extension QwenMetalModel {
             count: cfg.vocabSize))
     }
 
-    /// One DeltaNet layer over the whole chunk (S1b token batching): every
-    /// token's input norm, then one batched dispatch per in_proj tensor
-    /// covering all tokens, then the recurrence token-by-token in ascending
-    /// order (the conv history and recurrent state are shared per layer, and
-    /// the barriers inside each token's recurrence order token t+1 after
-    /// token t), then one batched output projection and the per-token
-    /// residual adds. One token degenerates to exactly the decode core's
-    /// encode stream.
+    /// One DeltaNet layer over the whole chunk (S1b token batching): one
+    /// batched input norm, then one batched dispatch per in_proj tensor
+    /// covering all tokens, one batched deinterleave, then the recurrence
+    /// token-by-token in ascending order (the conv history and recurrent
+    /// state are shared per layer, and the barriers inside each token's
+    /// recurrence order token t+1 after token t), then one batched output
+    /// projection and one batched residual add. One token degenerates to
+    /// exactly the decode core's encode stream.
     private func encChunkDelta(
         _ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, tokens n: Int
     ) throws {
-        for t in 0..<n {
-            try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: prefillSlot(t))
-        }
+        try encChunkNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, tokens: n)
         barrier(enc)
         for proj in deltaInProjections(delta) {
             try engine.encodeGemvBatch(
@@ -2094,7 +2168,7 @@ extension QwenMetalModel {
         }
         barrier(enc)
         if config.deltaLayout == .fusedInterleaved {
-            for t in 0..<n { try encDeltaDeinterleave(enc, slot: prefillSlot(t)) }
+            try encChunkDeinterleave(enc, tokens: n)
             barrier(enc)
         }
         for t in 0..<n { try encDeltaRecurrence(enc, fl: fl, slot: prefillSlot(t)) }
@@ -2102,18 +2176,16 @@ extension QwenMetalModel {
             enc, delta.outProj, x: prefillScratchBuf!, y: prefillScratchBuf!,
             slots: chunkGemvSlots(n, src: reg.dn, dst: reg.r))
         barrier(enc)
-        for t in 0..<n { try encResidualAdd(enc, slot: prefillSlot(t)) }
+        try encChunkResidualAdd(enc, tokens: n)
         barrier(enc)
     }
 
-    /// Post-attention norms for every chunk token, then the router logits as
-    /// one token-batched dispatch.
+    /// One batched post-attention norm over every chunk token, then the
+    /// router logits as one token-batched dispatch.
     private func encChunkRouterProbe(
         _ enc: MTLComputeCommandEncoder, moeGate: GPULinear, fl: FastLayer, tokens n: Int
     ) throws {
-        for t in 0..<n {
-            try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe, slot: prefillSlot(t))
-        }
+        try encChunkNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe, tokens: n)
         barrier(enc)
         try engine.encodeGemvBatch(
             enc, moeGate, x: prefillScratchBuf!, y: prefillScratchBuf!,
@@ -2130,6 +2202,7 @@ extension QwenMetalModel {
         let cfg = config
         let D = cfg.hiddenSize, inter = cfg.moeIntermediateSize
         let shInter = cfg.sharedExpertIntermediateSize
+        let topK = cfg.numExpertsPerTok
         let moe = layers[pend.layer].moe
         let fl = fastLayers[pend.layer]
         let projs = expertProjs
@@ -2187,18 +2260,36 @@ extension QwenMetalModel {
         barrier(enc)
 
         // Stage 2: silu(gate) * up for every (token, pick) and shared chain.
-        for (t, entry) in pend.perToken.enumerated() {
-            let slot = prefillSlot(t)
-            let K = entry.picks.count
-            for ki in 0..<K {
-                try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
-                    gOff: slot.base + reg.exp + ki * inter,
-                    uOff: slot.base + reg.exp + K * inter + ki * inter,
-                    dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
+        // Pick slot ki's rows sit at the same offsets in every token slot, so
+        // each ki batches into one strided dispatch over the chunk (as does
+        // the shared chain); a single-token chunk or a rare non-uniform pick
+        // count keeps the legacy per-token loop.
+        let uniformK = pend.perToken.allSatisfy { $0.picks.count == topK }
+        if S > 1, uniformK {
+            for ki in 0..<topK {
+                try engine.encodeSiluMulBatch(enc, buf: prefillScratchBuf!, count: inter,
+                    gOff: reg.exp + ki * inter,
+                    uOff: reg.exp + topK * inter + ki * inter,
+                    dstOff: reg.exp + 2 * topK * inter + ki * inter,
+                    stride: reg.total, tokens: S)
             }
-            try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
-                gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
-                dstOff: slot.base + reg.sh + 2 * shInter)
+            try engine.encodeSiluMulBatch(enc, buf: prefillScratchBuf!, count: shInter,
+                gOff: reg.sh, uOff: reg.sh + shInter, dstOff: reg.sh + 2 * shInter,
+                stride: reg.total, tokens: S)
+        } else {
+            for (t, entry) in pend.perToken.enumerated() {
+                let slot = prefillSlot(t)
+                let K = entry.picks.count
+                for ki in 0..<K {
+                    try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
+                        gOff: slot.base + reg.exp + ki * inter,
+                        uOff: slot.base + reg.exp + K * inter + ki * inter,
+                        dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
+                }
+                try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
+                    gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
+                    dstOff: slot.base + reg.sh + 2 * shInter)
+            }
         }
         barrier(enc)
 
@@ -2221,10 +2312,23 @@ extension QwenMetalModel {
             slots: chunkGemvSlots(S, src: reg.sh + 2 * shInter, dst: reg.sh + 3 * shInter))
         barrier(enc)
 
-        // Stage 4: weighted accumulation per token, legacy pick order.
-        for (t, entry) in pend.perToken.enumerated() {
-            try encWeightedAccum(enc, weights: entry.weights, count: entry.picks.count,
-                                 slot: prefillSlot(t))
+        // Stage 4: weighted accumulation, one batched dispatch over the
+        // chunk with a token-major weights table. Each token's K-expert
+        // accumulation order stays inside the kernel, exactly the legacy
+        // per-token loop, so batching cannot reorder any float sum.
+        if S > 1, uniformK {
+            var weights: [Float] = []
+            weights.reserveCapacity(S * topK)
+            for entry in pend.perToken { weights.append(contentsOf: entry.weights) }
+            try engine.encodeWeightedAccumBatch(
+                enc, h: prefillHiddenBuf!, hStride: D, data: prefillScratchBuf!,
+                count: D, k: topK, dBase: reg.dexp, shOff: reg.sh + 3 * shInter,
+                gateOff: reg.shg, stride: reg.total, weights: weights, tokens: S)
+        } else {
+            for (t, entry) in pend.perToken.enumerated() {
+                try encWeightedAccum(enc, weights: entry.weights, count: entry.picks.count,
+                                     slot: prefillSlot(t))
+            }
         }
         barrier(enc)
     }
