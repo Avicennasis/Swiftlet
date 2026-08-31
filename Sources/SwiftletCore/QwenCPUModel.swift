@@ -236,6 +236,19 @@ public final class QwenCPUModel {
     /// the last position's logits. Used for prefill (many tokens) and decode
     /// (one token at a time).
     public func step(_ tokens: [Int], state: DecodeState) throws -> [Float] {
+        try step(tokens, state: state, shouldCancel: { false })
+    }
+
+    /// Cancellable incremental step. The reference path checks only between
+    /// complete decoder layers, where no BLAS operation is in flight. A
+    /// cancellation after an earlier layer may leave `state` partially
+    /// updated, so the caller must discard it (SwiftletSession does).
+    public func step(
+        _ tokens: [Int],
+        state: DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
+        try checkGenerationCancellation(shouldCancel)
         let cfg = config
         let S = tokens.count
         let D = cfg.hiddenSize
@@ -245,13 +258,18 @@ public final class QwenCPUModel {
             for i in 0..<D { h[s * D + i] = embed[t * D + i] }
         }
         for li in 0..<cfg.numHiddenLayers {
+            try checkGenerationCancellation(shouldCancel)
             h = try layerForward(h, S: S, layerIndex: li, state: state)
         }
+        try checkGenerationCancellation(shouldCancel)
         state.position += S
 
         var last = Array(h[(S - 1) * D..<S * D])
         Self.rmsNorm(&last, rows: 1, dim: D, weight: finalNorm, eps: Float(cfg.rmsNormEps))
-        return Self.linear(last, rows: 1, inDim: D, weight: lmHead, outDim: cfg.vocabSize)
+        try checkGenerationCancellation(shouldCancel)
+        let logits = Self.linear(last, rows: 1, inDim: D, weight: lmHead, outDim: cfg.vocabSize)
+        try checkGenerationCancellation(shouldCancel)
+        return logits
     }
 
     /// One decoder layer: norm -> (DeltaNet | gated GQA) -> residual -> norm -> MoE -> residual.

@@ -357,22 +357,41 @@ public final class QwenMetalModel {
 
     /// Incremental step matching QwenCPUModel.step semantics.
     public func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
+        try step(tokens, state: state, shouldCancel: { false })
+    }
+
+    /// Cancellable Metal step. Checks happen only while no command buffer is
+    /// in flight; a cancelled partial token is abandoned with its DecodeState.
+    public func step(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
         var logits: [Float] = []
         for t in tokens {
-            logits = try stepOne(t, state: state)
+            try checkGenerationCancellation(shouldCancel)
+            logits = try stepOne(t, state: state, shouldCancel: shouldCancel)
+            try checkGenerationCancellation(shouldCancel)
             state.position += 1
         }
         return logits
     }
 
-    private func stepOne(_ token: Int, state: QwenCPUModel.DecodeState) throws -> [Float] {
-        if sBuf != nil { return try stepOneFast(token, state: state) }
+    private func stepOne(
+        _ token: Int,
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
+        if sBuf != nil {
+            return try stepOneFast(token, state: state, shouldCancel: shouldCancel)
+        }
         let cfg = config
         let D = cfg.hiddenSize
         var h = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
         precondition(h.count == D)
 
         for li in 0..<cfg.numHiddenLayers {
+            try checkGenerationCancellation(shouldCancel)
             let layer = layers[li]
             var x = h
             QwenCPUModel.rmsNorm(&x, rows: 1, dim: D, weight: layer.inputNorm, eps: Float(cfg.rmsNormEps))
@@ -391,6 +410,7 @@ public final class QwenMetalModel {
             for i in 0..<D { h[i] += m[i] }
         }
 
+        try checkGenerationCancellation(shouldCancel)
         QwenCPUModel.rmsNorm(&h, rows: 1, dim: D, weight: finalNorm, eps: Float(cfg.rmsNormEps))
         loadX(h)
         try runPhase { enc in
@@ -891,7 +911,11 @@ extension QwenMetalModel {
         return (picks, weights)
     }
 
-    func stepOneFast(_ token: Int, state: QwenCPUModel.DecodeState) throws -> [Float] {
+    func stepOneFast(
+        _ token: Int,
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool = { false }
+    ) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
         if boundStateID != ObjectIdentifier(state) || state.position == 0 {
@@ -907,6 +931,7 @@ extension QwenMetalModel {
         var pending: PendingMoE? = nil
 
         for li in 0..<cfg.numHiddenLayers {
+            try checkGenerationCancellation(shouldCancel)
             let L = layers[li]
             let fl = fastLayers[li]
 
@@ -918,6 +943,7 @@ extension QwenMetalModel {
                 enc.endEncoding()
                 cb.commit()
                 cb.waitUntilCompleted()
+                try checkGenerationCancellation(shouldCancel)
             } else {
                 // Attention: projections, CPU core, then out-proj + router.
                 let cb1 = engine.queue.makeCommandBuffer()!
@@ -932,6 +958,7 @@ extension QwenMetalModel {
                 e1.endEncoding()
                 cb1.commit()
                 cb1.waitUntilCompleted()
+                try checkGenerationCancellation(shouldCancel)
 
                 let attnOut = attnCoreCPU(layerIndex: li, state: state, attn: attn)
                 writeS(reg.att, attnOut)
@@ -953,17 +980,20 @@ extension QwenMetalModel {
                 e2.endEncoding()
                 cb2.commit()
                 cb2.waitUntilCompleted()
+                try checkGenerationCancellation(shouldCancel)
             }
 
             let (picks, weights) = routerPicks()
             var bufs: [MTLBuffer] = []
             if let cache = expertCache {
+                try checkGenerationCancellation(shouldCancel)
                 bufs = try cache.buffers(layer: li, experts: picks.map { $0.0 })
             }
             pending = PendingMoE(bufs: bufs, weights: weights, stacksLayer: li, picks: picks)
         }
 
         // Final: last layer's experts + final norm + lm head.
+        try checkGenerationCancellation(shouldCancel)
         let cb = engine.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
         if let p = pending { try encodePendingMoE(enc, p) }
@@ -979,6 +1009,7 @@ extension QwenMetalModel {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
+        try checkGenerationCancellation(shouldCancel)
 
         return Array(UnsafeBufferPointer(
             start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),

@@ -28,6 +28,20 @@ struct ChatContent: Decodable {
     }
 }
 
+/// OpenAI accepts `stop` as either one string or an array of strings.
+struct StopSequences: Decodable {
+    let values: [String]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(String.self) {
+            values = [value]
+        } else {
+            values = try container.decode([String].self)
+        }
+    }
+}
+
 /// OpenAI-compatible Chat Completions request body.
 struct ChatRequest: Decodable {
     struct Message: Decodable { let role: String; let content: ChatContent }
@@ -37,6 +51,7 @@ struct ChatRequest: Decodable {
     let max_completion_tokens: Int?
     let temperature: Float?
     let top_p: Float?
+    let stop: StopSequences?
 }
 
 let cliArgs = CommandLine.arguments
@@ -67,6 +82,48 @@ let modelName: String = {
 // One request at a time: the session mutates shared conversation state.
 let generationQueue = DispatchQueue(label: "swiftlet.generation")
 
+/// Owns every generation associated with one HTTP/1 connection. NIO invokes
+/// `channelInactive` as soon as a peer disconnects, even while its request is
+/// still queued behind another generation, so cancellation reaches both
+/// queued and active work instead of waiting for another attempted write.
+final class ConnectionGenerationOwner: @unchecked Sendable {
+    private struct Job {
+        let cancellation: GenerationCancellation
+        let heartbeat: RepeatedTask?
+    }
+
+    private let lock = NSLock()
+    private var jobs: [String: Job] = [:]
+
+    func register(
+        id: String,
+        cancellation: GenerationCancellation,
+        heartbeat: RepeatedTask? = nil
+    ) {
+        lock.lock()
+        jobs[id] = Job(cancellation: cancellation, heartbeat: heartbeat)
+        lock.unlock()
+    }
+
+    func finish(id: String) {
+        lock.lock()
+        let job = jobs.removeValue(forKey: id)
+        lock.unlock()
+        job?.heartbeat?.cancel()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let pending = Array(jobs.values)
+        jobs.removeAll()
+        lock.unlock()
+        for job in pending {
+            job.cancellation.cancel()
+            job.heartbeat?.cancel()
+        }
+    }
+}
+
 @Sendable func jsonData(_ obj: [String: Any]) -> Data {
     (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
 }
@@ -96,12 +153,34 @@ let generationQueue = DispatchQueue(label: "swiftlet.generation")
     return payload
 }
 
+@Sendable func openAIFinishReason(_ reason: GenerationFinishReason?) -> String? {
+    switch reason {
+    case .length: return "length"
+    case .stop: return "stop"
+    // Cancellation normally coincides with an inactive channel and therefore
+    // writes no terminal chunk. If it is observed on an active channel, omit
+    // the field instead of inventing a non-standard OpenAI finish reason.
+    case .cancelled, nil: return nil
+    }
+}
+
 final class HTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
     private var requestHead: HTTPRequestHead?
     private var body = ByteBuffer()
+    private let generationOwner = ConnectionGenerationOwner()
+
+    func channelInactive(context: ChannelHandlerContext) {
+        generationOwner.cancelAll()
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Swift.Error) {
+        generationOwner.cancelAll()
+        context.close(promise: nil)
+    }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         switch unwrapInboundIn(data) {
@@ -144,6 +223,8 @@ final class HTTPHandler: ChannelInboundHandler {
         let id = "chatcmpl-\(UUID().uuidString.prefix(8))"
         let eventLoop = context.eventLoop
         let channel = context.channel
+        let cancellation = GenerationCancellation()
+        let owner = generationOwner
 
         let options: SwiftletSession.GenerationOptions = {
             var o = SwiftletSession.GenerationOptions()
@@ -151,6 +232,7 @@ final class HTTPHandler: ChannelInboundHandler {
                 if t <= 0 { o = .greedy } else { o.temperature = t }
             }
             if let p = request.top_p { o.topP = p }
+            o.stopSequences = request.stop?.values ?? []
             return o
         }()
 
@@ -167,16 +249,18 @@ final class HTTPHandler: ChannelInboundHandler {
             heartbeat = eventLoop.scheduleRepeatedTask(
                 initialDelay: .seconds(15), delay: .seconds(15)
             ) { _ in
+                guard channel.isActive else { return }
                 var buf = channel.allocator.buffer(capacity: 16)
                 buf.writeString(": ping\n\n")
                 _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
             }
         }
-        let stopHeartbeat = heartbeat
+        owner.register(id: id, cancellation: cancellation, heartbeat: heartbeat)
 
         @Sendable func writeSSE(_ obj: [String: Any]) {
             let payload = "data: " + (String(data: jsonData(obj), encoding: .utf8) ?? "{}") + "\n\n"
             eventLoop.execute {
+                guard channel.isActive else { return }
                 var buf = channel.allocator.buffer(capacity: payload.utf8.count)
                 buf.writeString(payload)
                 _ = channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf)))
@@ -184,13 +268,21 @@ final class HTTPHandler: ChannelInboundHandler {
         }
 
         generationQueue.async {
+            // The channel may have disappeared while this request waited
+            // behind another generation. Do not even construct a stream in
+            // that case: prompt preparation and prefill must never start.
+            guard !cancellation.isCancelled else {
+                eventLoop.execute { owner.finish(id: id) }
+                return
+            }
             let done = DispatchSemaphore(value: 0)
             Task {
                 defer { done.signal() }
                 do {
                     var fullText = ""
                     for try await delta in session.streamChat(
-                        messages: messages, maxNew: maxNew, options: options
+                        messages: messages, maxNew: maxNew, options: options,
+                        cancellation: cancellation
                     ) {
                         fullText += delta
                         if streaming {
@@ -205,7 +297,9 @@ final class HTTPHandler: ChannelInboundHandler {
                     ).utf8))
 
                     eventLoop.execute {
-                        stopHeartbeat?.cancel()
+                        owner.finish(id: id)
+                        guard channel.isActive, m.finishReason != .cancelled else { return }
+                        let finishReason = openAIFinishReason(m.finishReason)
                         if streaming {
                             // The finish chunk, [DONE], and the HTTP end must
                             // land in this order on the wire. Write them here
@@ -214,7 +308,7 @@ final class HTTPHandler: ChannelInboundHandler {
                             // and it would land after .end and be dropped
                             // (strict clients then wait for it forever).
                             let finish = jsonData(completionPayload(
-                                id: id, text: nil, delta: "", finish: "stop",
+                                id: id, text: nil, delta: "", finish: finishReason,
                                 usage: (m.promptTokens, m.generatedTokens)))
                             let tail = "data: " + (String(data: finish, encoding: .utf8) ?? "{}")
                                 + "\n\ndata: [DONE]\n\n"
@@ -224,7 +318,7 @@ final class HTTPHandler: ChannelInboundHandler {
                             _ = channel.writeAndFlush(HTTPServerResponsePart.end(nil))
                         } else {
                             let data = jsonData(completionPayload(
-                                id: id, text: fullText, delta: nil, finish: "stop",
+                                id: id, text: fullText, delta: nil, finish: finishReason,
                                 usage: (m.promptTokens, m.generatedTokens)))
                             var head = HTTPResponseHead(version: .http1_1, status: .ok)
                             head.headers.add(name: "Content-Type", value: "application/json")
@@ -238,7 +332,8 @@ final class HTTPHandler: ChannelInboundHandler {
                     }
                 } catch {
                     eventLoop.execute {
-                        stopHeartbeat?.cancel()
+                        owner.finish(id: id)
+                        guard channel.isActive else { return }
                         if streaming {
                             // The 200 + SSE head is already on the wire; a
                             // second head would be a protocol error. Report
