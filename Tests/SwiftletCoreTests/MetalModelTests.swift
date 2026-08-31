@@ -92,20 +92,19 @@ import Testing
     }
 
     /// S3b: the committed command-buffer timeline must label every buffer,
-    /// follow the fast-path schedule exactly, and account for the S3a
+    /// follow the expected schedule exactly, and account for the S3a
     /// aggregates without inventing timing the buffers never reported.
     /// Only meaningful for a step that completed without throwing.
     static func expectPhaseTimeline(
         _ metrics: QwenMetalModel.StepMetrics,
-        config: QwenConfig,
-        tokens: Int,
+        expectedPhases: [[QwenMetalModel.StepPhase]],
         label: String
     ) {
         let timeline = metrics.commandBufferTimeline
         #expect(timeline.count == metrics.commandBuffersCommitted,
                 "\(label): timeline misses committed buffers")
-        #expect(timeline.map(\.phases) == Self.expectedTimelinePhases(config: config, tokens: tokens),
-                "\(label): phase labels diverged from the fast-path schedule")
+        #expect(timeline.map(\.phases) == expectedPhases,
+                "\(label): phase labels diverged from the expected schedule")
 
         let phaseDispatchTotal = metrics.phaseDispatchesEncoded.values.reduce(0, +)
         #expect(phaseDispatchTotal == metrics.computeDispatchesEncoded,
@@ -181,6 +180,11 @@ import Testing
         cpu.retainAllLayers = true
         let sequentialGPU = try QwenMetalModel(modelDir: dir)
         let elidingGPU = try QwenMetalModel(modelDir: dir)
+        // These baselines pin the legacy token-major prompt schedule (S1a).
+        // The layer-major S1b schedule has its own pinned baselines in
+        // LayerMajorPrefillTests.
+        sequentialGPU.prefillMode = .tokenMajor
+        elidingGPU.prefillMode = .tokenMajor
         let tokens = [1, 5, 9, 42, 7]
 
         let cpuState = QwenCPUModel.DecodeState()
@@ -200,7 +204,8 @@ import Testing
             singleMetrics, tokens: 1, baseline: baseline, label: "\(modelName) one token"
         )
         Self.expectPhaseTimeline(
-            singleMetrics, config: sequentialGPU.config, tokens: 1,
+            singleMetrics,
+            expectedPhases: Self.expectedTimelinePhases(config: sequentialGPU.config, tokens: 1),
             label: "\(modelName) one token"
         )
 
@@ -222,7 +227,8 @@ import Testing
             multiMetrics, tokens: tokens.count, baseline: baseline, label: "\(modelName) multi token"
         )
         Self.expectPhaseTimeline(
-            multiMetrics, config: elidingGPU.config, tokens: tokens.count,
+            multiMetrics,
+            expectedPhases: Self.expectedTimelinePhases(config: elidingGPU.config, tokens: tokens.count),
             label: "\(modelName) multi token"
         )
         Self.expectMatchingKV(sequentialState, elidingState, label: "\(modelName) elision input")
@@ -243,7 +249,8 @@ import Testing
             baseline: baseline, label: "\(modelName) continuation"
         )
         Self.expectPhaseTimeline(
-            elidingGPU.lastStepMetrics, config: elidingGPU.config, tokens: 1,
+            elidingGPU.lastStepMetrics,
+            expectedPhases: Self.expectedTimelinePhases(config: elidingGPU.config, tokens: 1),
             label: "\(modelName) continuation"
         )
         Self.expectMatchingKV(sequentialState, elidingState, label: "\(modelName) continuation")
@@ -266,6 +273,8 @@ import Testing
     @Test func phaseTimelineAccountsForWholeStep() throws {
         let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
         let model = try QwenMetalModel(modelDir: dir)
+        // Pins the legacy token-major prompt schedule (S1a).
+        model.prefillMode = .tokenMajor
         let state = QwenCPUModel.DecodeState()
         _ = try model.step([1, 5, 9], state: state)
         let multi = model.lastStepMetrics
@@ -274,7 +283,9 @@ import Testing
             multi, tokens: 3, baseline: Self.q4Baseline, label: "timeline multi"
         )
         Self.expectPhaseTimeline(
-            multi, config: model.config, tokens: 3, label: "timeline multi"
+            multi,
+            expectedPhases: Self.expectedTimelinePhases(config: model.config, tokens: 3),
+            label: "timeline multi"
         )
         let encodeSum = multi.commandBufferTimeline.reduce(0.0) { $0 + $1.encodeSeconds }
         #expect(encodeSum + multi.blockingWaitSeconds <= multi.stepWallSeconds + 1e-3,
@@ -283,7 +294,9 @@ import Testing
         _ = try model.step([11], state: state)
         let single = model.lastStepMetrics
         Self.expectPhaseTimeline(
-            single, config: model.config, tokens: 1, label: "timeline continuation"
+            single,
+            expectedPhases: Self.expectedTimelinePhases(config: model.config, tokens: 1),
+            label: "timeline continuation"
         )
         #expect(single.commandBufferTimeline.count == Self.commandBuffersPerToken,
                 "timeline continuation: timeline accumulated across steps")
@@ -304,6 +317,10 @@ import Testing
         cpu.retainAllLayers = true
         let sequentialGPU = try QwenMetalModel(modelDir: out, cacheBudgetGB: 0.05)
         let elidingGPU = try QwenMetalModel(modelDir: out, cacheBudgetGB: 0.05)
+        // Pins the legacy token-major prompt schedule (S1a); the layer-major
+        // qpack path is covered by LayerMajorPrefillTests.
+        sequentialGPU.prefillMode = .tokenMajor
+        elidingGPU.prefillMode = .tokenMajor
         #expect(sequentialGPU.expertCache != nil, "qpack mode not engaged")
         #expect(elidingGPU.expertCache != nil, "qpack mode not engaged")
 
@@ -325,7 +342,9 @@ import Testing
             singleMetrics, tokens: 1, baseline: Self.q4Baseline, label: "qpack one token"
         )
         Self.expectPhaseTimeline(
-            singleMetrics, config: sequentialGPU.config, tokens: 1, label: "qpack one token"
+            singleMetrics,
+            expectedPhases: Self.expectedTimelinePhases(config: sequentialGPU.config, tokens: 1),
+            label: "qpack one token"
         )
         let maxDiff = Self.maxAbsDiff(cpuLogits, sequentialLogits)
         #expect(maxDiff < 2e-3, "qpack GPU vs CPU logits maxAbsDiff \(maxDiff)")
@@ -344,7 +363,8 @@ import Testing
             baseline: Self.q4Baseline, label: "qpack multi token"
         )
         Self.expectPhaseTimeline(
-            multiMetrics, config: elidingGPU.config, tokens: tokens.count,
+            multiMetrics,
+            expectedPhases: Self.expectedTimelinePhases(config: elidingGPU.config, tokens: tokens.count),
             label: "qpack multi token"
         )
         Self.expectMatchingKV(sequentialState, elidingState, label: "qpack elision input")
@@ -363,7 +383,8 @@ import Testing
             baseline: Self.q4Baseline, label: "qpack continuation"
         )
         Self.expectPhaseTimeline(
-            elidingGPU.lastStepMetrics, config: elidingGPU.config, tokens: 1,
+            elidingGPU.lastStepMetrics,
+            expectedPhases: Self.expectedTimelinePhases(config: elidingGPU.config, tokens: 1),
             label: "qpack continuation"
         )
         Self.expectMatchingKV(sequentialState, elidingState, label: "qpack continuation")

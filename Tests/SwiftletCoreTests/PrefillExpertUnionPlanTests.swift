@@ -133,8 +133,12 @@ import Testing
         for t in tokens { _ = try loopModel.step([t], state: loopState) }
         loopModel.routedExpertObserver = nil
 
-        // S1a prefill-style path: one multi-token prompt call.
+        // S1a prefill-style path: one multi-token prompt call, pinned to the
+        // token-major schedule this equivalence was defined against. The S1b
+        // layer-major schedule's route/union equivalence is asserted in
+        // LayerMajorPrefillTests.
         let promptModel = try QwenMetalModel(modelDir: dir)
+        promptModel.prefillMode = .tokenMajor
         var promptFlat: [(layer: Int, experts: [Int])] = []
         promptModel.routedExpertObserver = { promptFlat.append(($0, $1)) }
         let promptState = QwenCPUModel.DecodeState()

@@ -259,10 +259,38 @@ public final class QwenMetalModel {
     /// phase scopes per buffer (2 samples each); headroom is harmless.
     private static let maxPhaseSamplesPerBuffer = 16
     /// Test hook (S1b-a): observes the routed expert list for every
-    /// (token, layer) exactly as the existing token-by-token path selects it.
-    /// The prefill expert-union planning oracle derives its input from these
-    /// outcomes; the hook changes no schedule and stays internal.
+    /// (token, layer) exactly as the current schedule selects it — token
+    /// order in the token-major paths, layer-major order (per layer, tokens
+    /// ascending) in the S1b prefill. The routes themselves are identical
+    /// either way; only the visit order differs. Stays internal.
     var routedExpertObserver: ((_ layer: Int, _ experts: [Int]) -> Void)?
+    /// Test hook (S1b): the expert union the layer-major prefill actually
+    /// fetched and encoded for one (chunk, layer), ascending expert order —
+    /// what the PrefillExpertUnionPlan oracle predicts. Stays internal.
+    var prefillExpertUnionObserver: ((_ layer: Int, _ experts: [Int]) -> Void)?
+
+    /// Prompt-prefill schedule for multi-token step calls. Single-token
+    /// decode steps never consult this.
+    public enum PrefillMode: Equatable, Sendable {
+        /// Legacy S1a schedule: the decode schedule repeated per token, with
+        /// intermediate LM heads elided.
+        case tokenMajor
+        /// S1b schedule: split the prompt into chunks of at most chunkTokens;
+        /// inside a chunk, sweep layer-by-layer across all tokens and touch
+        /// each layer's expert union once per chunk. chunkTokens bounds
+        /// scratch memory: the chunk keeps chunkTokens x Regions.total
+        /// scratch floats and chunkTokens hidden rows resident.
+        case layerMajor(chunkTokens: Int)
+    }
+
+    /// Default: layer-major with 32-token chunks. One 11-buffer sequence per
+    /// chunk instead of per token, and expert fetches per (layer, union)
+    /// instead of per (token, layer, pick). 32 keeps scratch bounded to a few
+    /// tens of MB on 80B-class configs while letting short prompts run as a
+    /// single chunk; unions saturate toward the full expert set beyond a few
+    /// dozen tokens, so larger chunks add memory faster than they add
+    /// expert-traffic savings. `.tokenMajor` restores the S1a schedule.
+    public var prefillMode: PrefillMode = .layerMajor(chunkTokens: 32)
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -291,6 +319,14 @@ public final class QwenMetalModel {
         var stacksLayer: Int
         var picks: [(Int, Float)]
     }
+
+    // S1b layer-major prefill scratch: one Regions stride and one hidden row
+    // per chunk token. Allocated lazily on the first layer-major prompt call
+    // and kept for the model's lifetime; failure to allocate falls back to
+    // the token-major schedule instead of crashing.
+    var prefillScratchBuf: MTLBuffer?
+    var prefillHiddenBuf: MTLBuffer?
+    var prefillSlotCapacity = 0
 
     public init(modelDir: URL, cacheBudgetGB: Double = 8) throws {
         config = try QwenConfig(url: modelDir.appendingPathComponent("config.json"))
@@ -812,14 +848,28 @@ public final class QwenMetalModel {
         }
 
         var logits: [Float] = []
-        for (index, t) in tokens.enumerated() {
-            // S1a LM-head elision: a multi-token call consumes only the final
-            // position's logits, so intermediate vocabulary projections are
-            // unnecessary.
-            let projectLogits = index == tokens.count - 1
-            logits = try stepOne(t, state: state, projectLogits: projectLogits)
-            state.position += 1
-            counters.tokensProcessed += 1
+        // S1b: multi-token prompt calls take the layer-major chunked schedule
+        // when enabled and the fast path plus chunk scratch are available;
+        // everything else keeps the token-major loop (single-token decode
+        // steps always do).
+        var chunkCapacity = 0
+        if tokens.count > 1, sBuf != nil, hBuf != nil,
+           case .layerMajor(let chunkTokens) = prefillMode {
+            let wanted = min(max(1, chunkTokens), tokens.count)
+            if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
+        }
+        if chunkCapacity > 0 {
+            logits = try prefillLayerMajor(tokens, state: state, chunkCapacity: chunkCapacity)
+        } else {
+            for (index, t) in tokens.enumerated() {
+                // S1a LM-head elision: a multi-token call consumes only the
+                // final position's logits, so intermediate vocabulary
+                // projections are unnecessary.
+                let projectLogits = index == tokens.count - 1
+                logits = try stepOne(t, state: state, projectLogits: projectLogits)
+                state.position += 1
+                counters.tokensProcessed += 1
+            }
         }
         counters.completedWithoutThrow = true
         return logits
@@ -1733,5 +1783,311 @@ extension QwenMetalModel {
                 x[base + half + j] = b * c + a * sn
             }
         }
+    }
+}
+
+// MARK: - S1b layer-major chunked prefill: inside a chunk, sweep each layer
+// across every token before moving on, so a layer's expert union is fetched
+// once per chunk and one 11-buffer sequence covers the whole chunk instead of
+// every token. Per-token math is encoded through the same slot helpers as the
+// decode path, so numerics match the token-major schedule exactly.
+extension QwenMetalModel {
+
+    /// One layer's deferred MoE for a whole chunk: per-token picks/weights in
+    /// the legacy order, plus the layer's ascending expert union with each
+    /// expert's resident buffer fetched exactly once (qpack mode; raw
+    /// checkpoints address stacked tensors by stride and keep this empty).
+    struct PendingChunkMoE {
+        var layer: Int
+        var union: [Int]
+        var buffers: [Int: MTLBuffer]
+        var perToken: [(picks: [(Int, Float)], weights: [Float])]
+    }
+
+    /// Grows the chunk scratch to hold `n` token slots. Returns false when
+    /// the device cannot allocate them (callers fall back to token-major).
+    private func ensurePrefillCapacity(_ n: Int) -> Bool {
+        if prefillSlotCapacity >= n, prefillScratchBuf != nil, prefillHiddenBuf != nil {
+            return true
+        }
+        let opts: MTLResourceOptions = [.storageModeShared, .hazardTrackingModeUntracked]
+        guard let scratch = engine.device.makeBuffer(length: n * reg.total * 4, options: opts),
+              let hidden = engine.device.makeBuffer(length: n * config.hiddenSize * 4, options: opts)
+        else { return false }
+        prefillScratchBuf = scratch
+        prefillHiddenBuf = hidden
+        prefillSlotCapacity = n
+        return true
+    }
+
+    private func prefillSlot(_ t: Int) -> TokenSlot {
+        TokenSlot(scratch: prefillScratchBuf!, base: t * reg.total,
+                  hidden: prefillHiddenBuf!, hiddenByteOffset: t * config.hiddenSize * 4)
+    }
+
+    /// Splits the prompt into chunks of at most `chunkCapacity` tokens and
+    /// prefills each chunk layer-major. Only the final chunk projects logits
+    /// (the S1a single-LM-head property).
+    func prefillLayerMajor(
+        _ tokens: [Int], state: QwenCPUModel.DecodeState, chunkCapacity: Int
+    ) throws -> [Float] {
+        var logits: [Float] = []
+        var start = 0
+        while start < tokens.count {
+            let end = min(start + chunkCapacity, tokens.count)
+            logits = try prefillChunkLayerMajor(
+                Array(tokens[start..<end]), state: state,
+                projectLogits: end == tokens.count
+            )
+            start = end
+        }
+        return logits
+    }
+
+    /// One chunk, layer-major. The buffer sequence per chunk is exactly the
+    /// legacy per-token shape (one buffer per DeltaNet layer, two per
+    /// attention layer, one tail), each buffer now carrying every chunk
+    /// token's work for that layer in per-token slots. Within a layer,
+    /// tokens are encoded in ascending order so the conv history, recurrence
+    /// state, and KV appends advance exactly as the token-major path does.
+    private func prefillChunkLayerMajor(
+        _ chunk: [Int], state: QwenCPUModel.DecodeState, projectLogits: Bool
+    ) throws -> [Float] {
+        let cfg = config
+        let D = cfg.hiddenSize
+        let S = chunk.count
+        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
+            boundStateID = ObjectIdentifier(state)
+            if state.position == 0 { resetGPUState() }
+        }
+        let basePosition = state.position
+
+        for (t, token) in chunk.enumerated() {
+            let h0 = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
+            h0.withUnsafeBufferPointer {
+                prefillHiddenBuf!.contents().advanced(by: t * D * 4)
+                    .copyMemory(from: $0.baseAddress!, byteCount: D * 4)
+            }
+        }
+
+        var pending: PendingChunkMoE?
+
+        for li in 0..<cfg.numHiddenLayers {
+            let L = layers[li]
+            let fl = fastLayers[li]
+
+            if let delta = L.delta {
+                let (cb, enc) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodeChunkMoE(enc, p) }
+                    pending = nil
+                }
+                try phase(.delta) {
+                    // Ascending token order: the conv history and recurrence
+                    // state are shared per layer, and the barriers inside
+                    // each token's sequence order token t+1 after token t.
+                    for t in 0..<S {
+                        try encDeltaCore(enc, delta: delta, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                try phase(.router) {
+                    for t in 0..<S {
+                        try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                enc.endEncoding()
+                commitAndWait(cb)
+            } else {
+                let attn = L.attn!
+                let (cb1, e1) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodeChunkMoE(e1, p) }
+                    pending = nil
+                }
+                try phase(.attention) {
+                    for t in 0..<S {
+                        try encAttentionProjections(e1, attn: attn, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                e1.endEncoding()
+                commitAndWait(cb1)
+
+                // CPU attention core in ascending token order: token t
+                // attends to the chunk's earlier tokens through the KV rows
+                // they appended just before it.
+                for t in 0..<S {
+                    let slot = prefillSlot(t)
+                    let attnOut = attnCoreCPU(
+                        layerIndex: li, state: state, attn: attn,
+                        position: basePosition + t, slot: slot
+                    )
+                    writeSlot(slot, reg.att, attnOut)
+                }
+
+                let (cb2, e2) = beginStepCommandBuffer()
+                try phase(.attention) {
+                    for t in 0..<S {
+                        try encAttentionFinish(e2, attn: attn, slot: prefillSlot(t))
+                    }
+                }
+                try phase(.router) {
+                    for t in 0..<S {
+                        try encRouterProbe(e2, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                e2.endEncoding()
+                commitAndWait(cb2)
+            }
+
+            // Routing on CPU for every chunk token, then one union fetch for
+            // the whole chunk: the schedule consumes exactly what the S1b-a
+            // plan predicts from these routes.
+            var perToken: [(picks: [(Int, Float)], weights: [Float])] = []
+            var unionSet = Set<Int>()
+            for t in 0..<S {
+                let (picks, weights) = routerPicks(slot: prefillSlot(t))
+                routedExpertObserver?(li, picks.map { $0.0 })
+                unionSet.formUnion(picks.map { $0.0 })
+                perToken.append((picks, weights))
+            }
+            let union = unionSet.sorted()
+            prefillExpertUnionObserver?(li, union)
+            var buffers: [Int: MTLBuffer] = [:]
+            if let cache = expertCache {
+                let bufs = try cache.buffers(layer: li, experts: union)
+                for (i, e) in union.enumerated() { buffers[e] = bufs[i] }
+            }
+            pending = PendingChunkMoE(
+                layer: li, union: union, buffers: buffers, perToken: perToken)
+        }
+
+        // Tail: flush the last layer's experts for the whole chunk; only the
+        // prompt's final token also needs final norm + vocabulary projection.
+        let (cb, enc) = beginStepCommandBuffer()
+        if let p = pending { try phase(.moe) { try encodeChunkMoE(enc, p) } }
+        if projectLogits {
+            try phase(.lmHead) {
+                try encFinalLMHead(enc, slot: prefillSlot(S - 1))
+            }
+            activeStepCounters?.logitProjections += 1
+        }
+        enc.endEncoding()
+        commitAndWait(cb)
+
+        state.position += S
+        activeStepCounters?.tokensProcessed += S
+
+        guard projectLogits else { return [] }
+        return Array(UnsafeBufferPointer(
+            start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
+            count: cfg.vocabSize))
+    }
+
+    /// One layer's MoE for a whole chunk. Every expert in the union is
+    /// touched once per stage, encoding the GEMVs of all tokens routed to it
+    /// back-to-back; outputs land in disjoint per-token slots so a stage runs
+    /// fully in parallel, and each token's weighted accumulation uses the
+    /// legacy pick order, keeping numerics identical to the token-major path.
+    private func encodeChunkMoE(_ enc: MTLComputeCommandEncoder, _ pend: PendingChunkMoE) throws {
+        let cfg = config
+        let D = cfg.hiddenSize, inter = cfg.moeIntermediateSize
+        let shInter = cfg.sharedExpertIntermediateSize
+        let moe = layers[pend.layer].moe
+        let fl = fastLayers[pend.layer]
+        let projs = expertProjs
+
+        // expert -> [(token, pick index)] in ascending token order.
+        var assignments: [Int: [(t: Int, ki: Int)]] = [:]
+        for (t, entry) in pend.perToken.enumerated() {
+            for (ki, pick) in entry.picks.enumerated() {
+                assignments[pick.0, default: []].append((t, ki))
+            }
+        }
+
+        func linears(for expert: Int) -> (g: GPULinear, u: GPULinear, d: GPULinear, e: Int) {
+            if let projs, let buf = pend.buffers[expert] {
+                return (projs.gate.linear(on: buf), projs.up.linear(on: buf),
+                        projs.down.linear(on: buf), 0)
+            }
+            let st = moe.stacks!
+            return (st.gate.lin, st.up.lin, st.down.lin, expert)
+        }
+
+        // Stage 1: routed gate/up grouped by expert, plus each token's shared
+        // gate/up and shared-gate logit.
+        for expert in pend.union {
+            let lin = linears(for: expert)
+            for a in assignments[expert] ?? [] {
+                let slot = prefillSlot(a.t)
+                let K = pend.perToken[a.t].picks.count
+                try engine.encodeGemv(enc, lin.g, rows: inter,
+                    wExtra: lin.e * (moe.stacks?.gate.wStride ?? 0),
+                    sExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                    bExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                    x: slot.scratch, xOff: slot.base + reg.xmoe,
+                    y: slot.scratch, yOff: slot.base + reg.exp + a.ki * inter)
+                try engine.encodeGemv(enc, lin.u, rows: inter,
+                    wExtra: lin.e * (moe.stacks?.up.wStride ?? 0),
+                    sExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                    bExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                    x: slot.scratch, xOff: slot.base + reg.xmoe,
+                    y: slot.scratch, yOff: slot.base + reg.exp + K * inter + a.ki * inter)
+            }
+        }
+        for t in 0..<pend.perToken.count {
+            let slot = prefillSlot(t)
+            try engine.encodeGemv(enc, moe.sharedGate, x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.sh)
+            try engine.encodeGemv(enc, moe.sharedUp, x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.sh + shInter)
+            try engine.encodeGemv(enc, fl.sharedGateLin, x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.shg)
+        }
+        barrier(enc)
+
+        // Stage 2: silu(gate) * up for every (token, pick) and shared chain.
+        for (t, entry) in pend.perToken.enumerated() {
+            let slot = prefillSlot(t)
+            let K = entry.picks.count
+            for ki in 0..<K {
+                try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
+                    gOff: slot.base + reg.exp + ki * inter,
+                    uOff: slot.base + reg.exp + K * inter + ki * inter,
+                    dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
+            }
+            try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
+                gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
+                dstOff: slot.base + reg.sh + 2 * shInter)
+        }
+        barrier(enc)
+
+        // Stage 3: down projections grouped by expert, plus shared down.
+        for expert in pend.union {
+            let lin = linears(for: expert)
+            for a in assignments[expert] ?? [] {
+                let slot = prefillSlot(a.t)
+                let K = pend.perToken[a.t].picks.count
+                try engine.encodeGemv(enc, lin.d, rows: D,
+                    wExtra: lin.e * (moe.stacks?.down.wStride ?? 0),
+                    sExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                    bExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                    x: slot.scratch, xOff: slot.base + reg.exp + 2 * K * inter + a.ki * inter,
+                    y: slot.scratch, yOff: slot.base + reg.dexp + a.ki * D)
+            }
+        }
+        for t in 0..<pend.perToken.count {
+            let slot = prefillSlot(t)
+            try engine.encodeGemv(enc, moe.sharedDown,
+                x: slot.scratch, xOff: slot.base + reg.sh + 2 * shInter,
+                y: slot.scratch, yOff: slot.base + reg.sh + 3 * shInter)
+        }
+        barrier(enc)
+
+        // Stage 4: weighted accumulation per token, legacy pick order.
+        for (t, entry) in pend.perToken.enumerated() {
+            try encWeightedAccum(enc, weights: entry.weights, count: entry.picks.count,
+                                 slot: prefillSlot(t))
+        }
+        barrier(enc)
     }
 }
