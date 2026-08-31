@@ -391,6 +391,235 @@ public final class MetalEngine {
         }
     }
 
+    // MARK: - S1b non-GEMV batch twins
+    //
+    // The chunked prefill's per-token glue destinations are slot-regular
+    // (token t's rows sit exactly one stride after token t-1's), so these
+    // twins batch via a token grid dimension plus stride parameters instead
+    // of the GEMV offset table. Every kernel body is the single-token
+    // kernel's verbatim, so batched rows are bitwise the per-token values.
+    // Callers keep single-token chunks on the legacy per-token encodes so
+    // the degenerate chunk stays byte-identical to the decode stream.
+
+    struct NormCopyBatchParams {
+        var dim: UInt32
+        var eps: Float
+        var dstOff: UInt32
+        var dstStride: UInt32
+        var hStride: UInt32
+    }
+
+    /// norm_copy over `tokens` hidden rows: row t reads `h` (from
+    /// `hByteOffset`) at t*hStride floats and writes dst[dstOff + t*dstStride...].
+    func encodeNormCopyBatch(
+        _ enc: MTLComputeCommandEncoder,
+        h: MTLBuffer, hByteOffset: Int, hStride: Int,
+        dst: MTLBuffer, weight: MTLBuffer,
+        dim: Int, eps: Float, dstOff: Int, dstStride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("norm_copy_batch"))
+        var p = NormCopyBatchParams(
+            dim: UInt32(dim), eps: eps, dstOff: UInt32(dstOff),
+            dstStride: UInt32(dstStride), hStride: UInt32(hStride)
+        )
+        enc.setBuffer(h, offset: hByteOffset, index: 0)
+        enc.setBuffer(dst, offset: 0, index: 1)
+        enc.setBuffer(weight, offset: 0, index: 2)
+        enc.setBytes(&p, length: MemoryLayout<NormCopyBatchParams>.stride, index: 3)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: tokens, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
+    /// silu_mul over `tokens` slots: slot t adds t*stride to every offset.
+    func encodeSiluMulBatch(
+        _ enc: MTLComputeCommandEncoder,
+        buf: MTLBuffer, count: Int, gOff: Int, uOff: Int, dstOff: Int,
+        stride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("silu_mul_batch"))
+        var po = SIMD4<UInt32>(UInt32(count), UInt32(gOff), UInt32(uOff), UInt32(dstOff))
+        var s = UInt32(stride)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.setBuffer(buf, offset: 0, index: 1)
+        enc.setBuffer(buf, offset: 0, index: 2)
+        enc.setBytes(&po, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 3)
+        enc.setBytes(&s, length: MemoryLayout<UInt32>.stride, index: 4)
+        dispatchThreads(
+            enc, threads: MTLSize(width: count, height: tokens, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(64, count), height: 1, depth: 1)
+        )
+    }
+
+    /// add_inplace over `tokens` hidden rows:
+    /// h[t*hStride + i] += r[rOff + t*rStride + i].
+    func encodeAddInplaceBatch(
+        _ enc: MTLComputeCommandEncoder,
+        h: MTLBuffer, hStride: Int, r: MTLBuffer, rOff: Int, rStride: Int,
+        count: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("add_inplace_batch"))
+        var po = SIMD4<UInt32>(
+            UInt32(count), UInt32(rOff), UInt32(hStride), UInt32(rStride))
+        enc.setBuffer(h, offset: 0, index: 0)
+        enc.setBuffer(r, offset: 0, index: 1)
+        enc.setBytes(&po, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 2)
+        dispatchThreads(
+            enc, threads: MTLSize(width: count, height: tokens, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(64, count), height: 1, depth: 1)
+        )
+    }
+
+    struct AccumBatchParams {
+        var D: UInt32
+        var K: UInt32
+        var dBase: UInt32
+        var shOff: UInt32
+        var gateOff: UInt32
+        var stride: UInt32
+        var hStride: UInt32
+    }
+
+    /// weighted_accum over `tokens`: token t reads its expert/shared rows at
+    /// t*stride, its own K weights at weights[t*K...], and accumulates into
+    /// hidden row t*hStride. The K-expert accumulation order stays inside
+    /// the kernel, exactly the single-token loop. weights.count == tokens*K.
+    func encodeWeightedAccumBatch(
+        _ enc: MTLComputeCommandEncoder,
+        h: MTLBuffer, hStride: Int, data: MTLBuffer,
+        count: Int, k: Int, dBase: Int, shOff: Int, gateOff: Int, stride: Int,
+        weights: [Float], tokens: Int
+    ) throws {
+        precondition(weights.count == tokens * k, "token-major weights table")
+        enc.setComputePipelineState(try pipeline("weighted_accum_batch"))
+        var p = AccumBatchParams(
+            D: UInt32(count), K: UInt32(k), dBase: UInt32(dBase),
+            shOff: UInt32(shOff), gateOff: UInt32(gateOff),
+            stride: UInt32(stride), hStride: UInt32(hStride)
+        )
+        enc.setBuffer(h, offset: 0, index: 0)
+        enc.setBuffer(data, offset: 0, index: 1)
+        enc.setBytes(&p, length: MemoryLayout<AccumBatchParams>.stride, index: 2)
+        weights.withUnsafeBufferPointer {
+            enc.setBytes($0.baseAddress!, length: max(1, $0.count) * 4, index: 3)
+        }
+        dispatchThreads(
+            enc, threads: MTLSize(width: count, height: tokens, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(64, count), height: 1, depth: 1)
+        )
+    }
+
+    struct DeintBatchParams {
+        var nk: UInt32
+        var dk: UInt32
+        var rep: UInt32
+        var dv: UInt32
+        var keyDim: UInt32
+        var srcOff: UInt32
+        var baOff: UInt32
+        var qkvOff: UInt32
+        var zOff: UInt32
+        var bOff: UInt32
+        var aOff: UInt32
+        var stride: UInt32
+    }
+
+    /// deinterleave_qkvz over `tokens` slots: slot t adds t*stride to every
+    /// source and destination offset.
+    func encodeDeinterleaveBatch(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer,
+        nk: Int, dk: Int, rep: Int, dv: Int, keyDim: Int,
+        srcOff: Int, baOff: Int, qkvOff: Int, zOff: Int, bOff: Int, aOff: Int,
+        stride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("deinterleave_qkvz_batch"))
+        var p = DeintBatchParams(
+            nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(rep), dv: UInt32(dv),
+            keyDim: UInt32(keyDim), srcOff: UInt32(srcOff), baOff: UInt32(baOff),
+            qkvOff: UInt32(qkvOff), zOff: UInt32(zOff), bOff: UInt32(bOff),
+            aOff: UInt32(aOff), stride: UInt32(stride)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBytes(&p, length: MemoryLayout<DeintBatchParams>.stride, index: 1)
+        dispatchThreads(
+            enc, threads: MTLSize(width: nk, height: tokens, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(64, nk), height: 1, depth: 1)
+        )
+    }
+
+    struct AttnPrepBatchParams {
+        var heads: UInt32
+        var headDim: UInt32
+        var rot: UInt32
+        var eps: Float
+        var theta: Float
+        var position: UInt32
+        var srcOff: UInt32
+        var dstOff: UInt32
+        var stride: UInt32
+    }
+
+    /// attn_q_prep over `tokens`: token t preps inside its own slot stride at
+    /// position basePosition + t. One simdgroup per (head, token).
+    func encodeAttnQPrepBatch(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer, weight: MTLBuffer,
+        heads: Int, headDim: Int, rotaryDims: Int, eps: Float, ropeTheta: Float,
+        basePosition: Int, srcOff: Int, dstOff: Int, slotStride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("attn_q_prep_batch"))
+        var p = AttnPrepBatchParams(
+            heads: UInt32(heads), headDim: UInt32(headDim), rot: UInt32(rotaryDims),
+            eps: eps, theta: ropeTheta, position: UInt32(basePosition),
+            srcOff: UInt32(srcOff), dstOff: UInt32(dstOff), stride: UInt32(slotStride)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(weight, offset: 0, index: 1)
+        enc.setBytes(&p, length: MemoryLayout<AttnPrepBatchParams>.stride, index: 2)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: heads, depth: tokens),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
+    struct AttnKVBatchParams {
+        var kvHeads: UInt32
+        var headDim: UInt32
+        var rot: UInt32
+        var eps: Float
+        var theta: Float
+        var position: UInt32
+        var kSrcOff: UInt32
+        var vSrcOff: UInt32
+        var stride: UInt32
+    }
+
+    /// attn_kv_append over `tokens`: token t appends at cache row index
+    /// basePosition + t — disjoint rows per token, so batching cannot
+    /// reorder any write. One simdgroup per (kv head, token).
+    func encodeAttnKVAppendBatch(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer, weight: MTLBuffer,
+        kCache: MTLBuffer, vCache: MTLBuffer,
+        kvHeads: Int, headDim: Int, rotaryDims: Int, eps: Float, ropeTheta: Float,
+        basePosition: Int, kSrcOff: Int, vSrcOff: Int, slotStride: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("attn_kv_append_batch"))
+        var p = AttnKVBatchParams(
+            kvHeads: UInt32(kvHeads), headDim: UInt32(headDim), rot: UInt32(rotaryDims),
+            eps: eps, theta: ropeTheta, position: UInt32(basePosition),
+            kSrcOff: UInt32(kSrcOff), vSrcOff: UInt32(vSrcOff), stride: UInt32(slotStride)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(weight, offset: 0, index: 1)
+        enc.setBuffer(kCache, offset: 0, index: 2)
+        enc.setBuffer(vCache, offset: 0, index: 3)
+        enc.setBytes(&p, length: MemoryLayout<AttnKVBatchParams>.stride, index: 4)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: kvHeads, depth: tokens),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
     func encodeSiluMul(
         _ enc: MTLComputeCommandEncoder,
         buf: MTLBuffer, count: Int, gOff: Int, uOff: Int, dstOff: Int

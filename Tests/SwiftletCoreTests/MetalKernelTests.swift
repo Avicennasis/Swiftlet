@@ -250,4 +250,318 @@ import Testing
         try Self.expectBatchMatches(
             engine, lin, label: "split table", tokens: 513, expectedBatchDispatches: 2)
     }
+
+    // MARK: - S1b non-GEMV batch twins
+
+    /// Encodes `body` into one command buffer, waits, and returns how many
+    /// compute dispatches it encoded (via the engine's dispatch observer).
+    static func runEncoded(
+        _ engine: MetalEngine, _ body: (MTLComputeCommandEncoder) throws -> Void
+    ) throws -> Int {
+        var dispatches = 0
+        engine.computeDispatchObserver = { dispatches += 1 }
+        defer { engine.computeDispatchObserver = nil }
+        let cb = engine.queue.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        do {
+            try body(enc)
+        } catch {
+            enc.endEncoding() // Metal aborts on encoders released mid-encode.
+            throw error
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        return dispatches
+    }
+
+    static func floats(_ buf: MTLBuffer, _ n: Int) -> [Float] {
+        Array(UnsafeBufferPointer(
+            start: buf.contents().bindMemory(to: Float.self, capacity: n), count: n))
+    }
+
+    static func expectBitwise(_ a: MTLBuffer, _ b: MTLBuffer, _ n: Int, _ label: String) {
+        #expect(floats(a, n).map(\.bitPattern) == floats(b, n).map(\.bitPattern),
+                "\(label): batched kernel diverges bitwise from per-token dispatches")
+    }
+
+    /// norm_copy_batch: per-token norm_copy dispatches vs one batched
+    /// dispatch over strided hidden rows and destinations, bitwise.
+    @Test func normCopyBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let dim = 64, tokens = 3, hStride = dim + 9, dstStride = dim + 21, dstOff = 5
+        var rng = Rand(11)
+        let h = (0..<tokens * hStride).map { _ in rng.float() }
+        let wgt = (0..<dim).map { _ in rng.float() }
+        let hBuf = engine.makeBuffer(h)
+        let wBuf = engine.makeBuffer(wgt)
+        let dstFloats = dstOff + tokens * dstStride
+
+        struct NormParams {
+            var rows: UInt32; var dim: UInt32; var eps: Float
+            var hasWeight: UInt32; var scale: Float; var off: UInt32
+        }
+        let dstA = engine.device.makeBuffer(length: dstFloats * 4)!
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("norm_copy"))
+                var p = NormParams(rows: 1, dim: UInt32(dim), eps: 1e-6, hasWeight: 1,
+                                   scale: 1, off: UInt32(dstOff + t * dstStride))
+                enc.setBuffer(hBuf, offset: t * hStride * 4, index: 0)
+                enc.setBuffer(dstA, offset: 0, index: 1)
+                enc.setBuffer(wBuf, offset: 0, index: 2)
+                enc.setBytes(&p, length: MemoryLayout<NormParams>.stride, index: 3)
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: 32, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+        }
+        let dstB = engine.device.makeBuffer(length: dstFloats * 4)!
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeNormCopyBatch(
+                enc, h: hBuf, hByteOffset: 0, hStride: hStride,
+                dst: dstB, weight: wBuf, dim: dim, eps: 1e-6,
+                dstOff: dstOff, dstStride: dstStride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "norm_copy: per-token dispatch count")
+        #expect(batched == 1, "norm_copy: batched dispatch count")
+        Self.expectBitwise(dstA, dstB, dstFloats, "norm_copy")
+    }
+
+    /// silu_mul_batch: per-token encodeSiluMul vs one strided batch, bitwise.
+    @Test func siluMulBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let count = 48, tokens = 4, stride = 200
+        let gOff = 3, uOff = 61, dstOff = 119
+        var rng = Rand(23)
+        let src = (0..<tokens * stride).map { _ in rng.float() }
+
+        func run(_ body: (MTLComputeCommandEncoder, MTLBuffer) throws -> Void)
+            throws -> (buf: MTLBuffer, dispatches: Int)
+        {
+            let buf = engine.makeBuffer(src)
+            let n = try Self.runEncoded(engine) { try body($0, buf) }
+            return (buf, n)
+        }
+        let perToken = try run { enc, buf in
+            for t in 0..<tokens {
+                try engine.encodeSiluMul(
+                    enc, buf: buf, count: count, gOff: gOff + t * stride,
+                    uOff: uOff + t * stride, dstOff: dstOff + t * stride)
+            }
+        }
+        let batched = try run { enc, buf in
+            try engine.encodeSiluMulBatch(
+                enc, buf: buf, count: count, gOff: gOff, uOff: uOff,
+                dstOff: dstOff, stride: stride, tokens: tokens)
+        }
+        #expect(perToken.dispatches == tokens, "silu_mul: per-token dispatch count")
+        #expect(batched.dispatches == 1, "silu_mul: batched dispatch count")
+        Self.expectBitwise(perToken.buf, batched.buf, tokens * stride, "silu_mul")
+    }
+
+    /// add_inplace_batch: per-token add_inplace dispatches vs one strided
+    /// batch over hidden rows, bitwise.
+    @Test func addInplaceBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let count = 64, tokens = 3, hStride = count + 5, rStride = 150, rOff = 7
+        var rng = Rand(31)
+        let h = (0..<tokens * hStride).map { _ in rng.float() }
+        let r = (0..<tokens * rStride).map { _ in rng.float() }
+        let rBuf = engine.makeBuffer(r)
+
+        let hA = engine.makeBuffer(h)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("add_inplace"))
+                var p = SIMD2<UInt32>(UInt32(count), UInt32(rOff + t * rStride))
+                enc.setBuffer(hA, offset: t * hStride * 4, index: 0)
+                enc.setBuffer(rBuf, offset: 0, index: 1)
+                enc.setBytes(&p, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 2)
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: count, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(64, count), height: 1, depth: 1))
+            }
+        }
+        let hB = engine.makeBuffer(h)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeAddInplaceBatch(
+                enc, h: hB, hStride: hStride, r: rBuf, rOff: rOff, rStride: rStride,
+                count: count, tokens: tokens)
+        }
+        #expect(perToken == tokens, "add_inplace: per-token dispatch count")
+        #expect(batched == 1, "add_inplace: batched dispatch count")
+        Self.expectBitwise(hA, hB, tokens * hStride, "add_inplace")
+    }
+
+    /// weighted_accum_batch: per-token weighted_accum (own weights each) vs
+    /// one batched dispatch with a token-major weights table, bitwise.
+    @Test func weightedAccumBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let d = 64, k = 2, tokens = 3, hStride = d + 3, stride = 400
+        let dBase = 11, shOff = 11 + k * d + 9, gateOff = shOff + d + 17
+        var rng = Rand(47)
+        let h = (0..<tokens * hStride).map { _ in rng.float() }
+        let data = (0..<tokens * stride).map { _ in rng.float() }
+        let weights = (0..<tokens * k).map { _ in rng.float() }
+        let dataBuf = engine.makeBuffer(data)
+
+        let hA = engine.makeBuffer(h)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("weighted_accum"))
+                var p = SIMD8<UInt32>(
+                    UInt32(d), UInt32(k), UInt32(dBase + t * stride),
+                    UInt32(shOff + t * stride), UInt32(gateOff + t * stride), 0, 0, 0)
+                enc.setBuffer(hA, offset: t * hStride * 4, index: 0)
+                enc.setBuffer(dataBuf, offset: 0, index: 1)
+                enc.setBytes(&p, length: MemoryLayout<SIMD8<UInt32>>.stride, index: 2)
+                let wk = Array(weights[t * k..<(t + 1) * k])
+                wk.withUnsafeBufferPointer {
+                    enc.setBytes($0.baseAddress!, length: $0.count * 4, index: 3)
+                }
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: d, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(64, d), height: 1, depth: 1))
+            }
+        }
+        let hB = engine.makeBuffer(h)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeWeightedAccumBatch(
+                enc, h: hB, hStride: hStride, data: dataBuf,
+                count: d, k: k, dBase: dBase, shOff: shOff, gateOff: gateOff,
+                stride: stride, weights: weights, tokens: tokens)
+        }
+        #expect(perToken == tokens, "weighted_accum: per-token dispatch count")
+        #expect(batched == 1, "weighted_accum: batched dispatch count")
+        Self.expectBitwise(hA, hB, tokens * hStride, "weighted_accum")
+    }
+
+    /// deinterleave_qkvz_batch: per-token deinterleaves vs one strided
+    /// batch, bitwise across the whole slotted scratch buffer.
+    @Test func deinterleaveBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let nk = 2, dk = 8, rep = 2, dv = 8, tokens = 3
+        let keyDim = nk * dk
+        let srcOff = 0, baOff = 96, qkvOff = 120, zOff = 190, bOff = 230, aOff = 240
+        let stride = 260
+        var rng = Rand(53)
+        let src = (0..<tokens * stride).map { _ in rng.float() }
+
+        struct DeintParams {
+            var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
+            var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
+            var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
+        }
+        let bufA = engine.makeBuffer(src)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
+                let b = t * stride
+                var p = DeintParams(
+                    nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(rep), dv: UInt32(dv),
+                    keyDim: UInt32(keyDim), srcOff: UInt32(srcOff + b),
+                    baOff: UInt32(baOff + b), qkvOff: UInt32(qkvOff + b),
+                    zOff: UInt32(zOff + b), bOff: UInt32(bOff + b), aOff: UInt32(aOff + b))
+                enc.setBuffer(bufA, offset: 0, index: 0)
+                enc.setBytes(&p, length: MemoryLayout<DeintParams>.stride, index: 1)
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: nk, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(64, nk), height: 1, depth: 1))
+            }
+        }
+        let bufB = engine.makeBuffer(src)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeDeinterleaveBatch(
+                enc, data: bufB, nk: nk, dk: dk, rep: rep, dv: dv, keyDim: keyDim,
+                srcOff: srcOff, baOff: baOff, qkvOff: qkvOff, zOff: zOff,
+                bOff: bOff, aOff: aOff, stride: stride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "deinterleave: per-token dispatch count")
+        #expect(batched == 1, "deinterleave: batched dispatch count")
+        Self.expectBitwise(bufA, bufB, tokens * stride, "deinterleave")
+    }
+
+    /// attn_q_prep_batch: per-token preps at ascending positions vs one
+    /// batched dispatch (position derived from the token grid slot), bitwise.
+    @Test func attnQPrepBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let heads = 4, headDim = 16, rot = 4, tokens = 3, basePosition = 9
+        let srcOff = 0
+        let dstOff = heads * 2 * headDim + 7
+        let stride = dstOff + heads * headDim + 5
+        var rng = Rand(61)
+        let src = (0..<tokens * stride).map { _ in rng.float() }
+        let wgt = (0..<headDim).map { _ in rng.float() }
+        let wBuf = engine.makeBuffer(wgt)
+
+        let bufA = engine.makeBuffer(src)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                try engine.encodeAttnQPrep(
+                    enc, data: bufA, weight: wBuf, heads: heads, headDim: headDim,
+                    rotaryDims: rot, eps: 1e-6, ropeTheta: 1e7,
+                    position: basePosition + t,
+                    srcOff: srcOff + t * stride, dstOff: dstOff + t * stride)
+            }
+        }
+        let bufB = engine.makeBuffer(src)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeAttnQPrepBatch(
+                enc, data: bufB, weight: wBuf, heads: heads, headDim: headDim,
+                rotaryDims: rot, eps: 1e-6, ropeTheta: 1e7,
+                basePosition: basePosition, srcOff: srcOff, dstOff: dstOff,
+                slotStride: stride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "attn_q_prep: per-token dispatch count")
+        #expect(batched == 1, "attn_q_prep: batched dispatch count")
+        Self.expectBitwise(bufA, bufB, tokens * stride, "attn_q_prep")
+    }
+
+    /// attn_kv_append_batch: per-token appends at ascending positions vs one
+    /// batched dispatch, bitwise over both caches and the scratch.
+    @Test func attnKVAppendBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let kvHeads = 2, headDim = 16, rot = 4, tokens = 3, basePosition = 5
+        let kSrcOff = 3
+        let vSrcOff = kSrcOff + kvHeads * headDim + 9
+        let stride = vSrcOff + kvHeads * headDim + 11
+        let cacheFloats = (basePosition + tokens) * kvHeads * headDim
+        var rng = Rand(71)
+        let src = (0..<tokens * stride).map { _ in rng.float() }
+        let wgt = (0..<headDim).map { _ in rng.float() }
+        let seed = (0..<cacheFloats).map { _ in rng.float() }
+        let wBuf = engine.makeBuffer(wgt)
+
+        func run(_ body: (MTLComputeCommandEncoder, MTLBuffer, MTLBuffer, MTLBuffer) throws -> Void)
+            throws -> (data: MTLBuffer, k: MTLBuffer, v: MTLBuffer, dispatches: Int)
+        {
+            let data = engine.makeBuffer(src)
+            let k = engine.makeBuffer(seed)
+            let v = engine.makeBuffer(seed)
+            let n = try Self.runEncoded(engine) { try body($0, data, k, v) }
+            return (data, k, v, n)
+        }
+        let perToken = try run { enc, data, k, v in
+            for t in 0..<tokens {
+                try engine.encodeAttnKVAppend(
+                    enc, data: data, weight: wBuf, kCache: k, vCache: v,
+                    kvHeads: kvHeads, headDim: headDim, rotaryDims: rot,
+                    eps: 1e-6, ropeTheta: 1e7, position: basePosition + t,
+                    kSrcOff: kSrcOff + t * stride, vSrcOff: vSrcOff + t * stride)
+            }
+        }
+        let batched = try run { enc, data, k, v in
+            try engine.encodeAttnKVAppendBatch(
+                enc, data: data, weight: wBuf, kCache: k, vCache: v,
+                kvHeads: kvHeads, headDim: headDim, rotaryDims: rot,
+                eps: 1e-6, ropeTheta: 1e7, basePosition: basePosition,
+                kSrcOff: kSrcOff, vSrcOff: vSrcOff, slotStride: stride, tokens: tokens)
+        }
+        #expect(perToken.dispatches == tokens, "attn_kv_append: per-token dispatch count")
+        #expect(batched.dispatches == 1, "attn_kv_append: batched dispatch count")
+        Self.expectBitwise(perToken.k, batched.k, cacheFloats, "attn_kv_append k cache")
+        Self.expectBitwise(perToken.v, batched.v, cacheFloats, "attn_kv_append v cache")
+        Self.expectBitwise(perToken.data, batched.data, tokens * stride, "attn_kv_append data")
+    }
 }

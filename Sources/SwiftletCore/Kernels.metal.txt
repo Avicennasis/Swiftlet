@@ -799,6 +799,183 @@ kernel void weighted_accum(
     h[i] += acc;
 }
 
+// ===== S1b batch twins for the per-token glue kernels above. The chunked
+// prefill's per-token destinations are slot-regular (token t's rows sit
+// exactly `stride` floats after token t-1's), so instead of an offset table
+// each twin gains a token grid dimension plus stride parameters. Bodies are
+// the single-token kernels' verbatim, so every token's rows are bitwise the
+// values the equivalent per-token dispatch writes.
+
+// norm_copy over n hidden rows: row t reads h[t*hStride...] and writes
+// dst[dstOff + t*dstStride...]. One simdgroup per row.
+struct NormCopyBatchParams {
+    uint dim;
+    float eps;
+    uint dstOff;
+    uint dstStride;
+    uint hStride;
+};
+
+kernel void norm_copy_batch(
+    device const float *h    [[buffer(0)]],
+    device float       *dst  [[buffer(1)]],
+    device const float *wgt  [[buffer(2)]],
+    constant NormCopyBatchParams &p [[buffer(3)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    device const float *hr = h + tpg.y * p.hStride;
+    device float *dr = dst + p.dstOff + tpg.y * p.dstStride;
+    float ss = 0;
+    for (uint i = lane; i < p.dim; i += 32) ss += hr[i] * hr[i];
+    ss = simd_sum(ss);
+    float inv = metal::rsqrt(ss / float(p.dim) + p.eps);
+    for (uint i = lane; i < p.dim; i += 32) {
+        dr[i] = hr[i] * inv * wgt[i];
+    }
+}
+
+// silu_mul over n token slots: slot t adds t*stride to every offset.
+kernel void silu_mul_batch(
+    device const float *g  [[buffer(0)]],
+    device const float *u  [[buffer(1)]],
+    device float       *h  [[buffer(2)]],
+    constant uint4     &po [[buffer(3)]],   // (count, gOff, uOff, dstOff)
+    constant uint      &stride [[buffer(4)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= po.x) return;
+    const uint b = tpg.y * stride;
+    float gv = g[po.y + b + i];
+    h[po.w + b + i] = (gv / (1.0f + metal::exp(-gv))) * u[po.z + b + i];
+}
+
+// add_inplace over n hidden rows: h[t*hStride + i] += r[rOff + t*rStride + i].
+kernel void add_inplace_batch(
+    device float       *h  [[buffer(0)]],
+    device const float *r  [[buffer(1)]],
+    constant uint4     &po [[buffer(2)]],   // (count, rOff, hStride, rStride)
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= po.x) return;
+    h[tpg.y * po.z + i] += r[po.y + tpg.y * po.w + i];
+}
+
+// weighted_accum over n tokens: token t reads its expert/shared rows at
+// t*stride, its own K weights at wk[t*K...], and accumulates into hidden row
+// t*hStride. The per-token K-expert accumulation order stays inside the
+// kernel, exactly the single-token loop.
+struct AccumBatchParams {
+    uint D;
+    uint K;
+    uint dBase;
+    uint shOff;
+    uint gateOff;
+    uint stride;    // scratch slot stride, floats
+    uint hStride;   // hidden row stride, floats
+};
+
+kernel void weighted_accum_batch(
+    device float       *h    [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant AccumBatchParams &p [[buffer(2)]],
+    constant float     *wk   [[buffer(3)]],   // n*K weights, token-major
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= p.D) return;
+    const uint t = tpg.y;
+    const uint b = t * p.stride;
+    float acc = 0;
+    for (uint k = 0; k < p.K; ++k) {
+        acc += wk[t * p.K + k] * data[p.dBase + b + k * p.D + i];
+    }
+    float gl = data[p.gateOff + b];
+    acc += (1.0f / (1.0f + metal::exp(-gl))) * data[p.shOff + b + i];
+    h[t * p.hStride + i] += acc;
+}
+
+// attn_q_prep over n tokens: token t works inside its own slot stride at
+// position p.position + t. One simdgroup per (head, token).
+struct AttnPrepBatchParams {
+    uint heads;
+    uint headDim;
+    uint rot;
+    float eps;
+    float theta;
+    uint position;   // base; token t uses position + t
+    uint srcOff;
+    uint dstOff;
+    uint stride;
+};
+
+kernel void attn_q_prep_batch(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],
+    constant AttnPrepBatchParams &p [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    const uint t = tpg.z;
+    device const float *src = data + p.srcOff + t * p.stride + head * 2 * p.headDim;
+    device float *dst = data + p.dstOff + t * p.stride + head * p.headDim;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += src[i] * src[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) dst[i] = src[i] * inv * wgt[i];
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(dst, p.rot, p.position + t, p.theta, lane);
+}
+
+// attn_kv_append over n tokens: token t appends at cache row index
+// p.position + t — rows are disjoint per token, so batching cannot reorder
+// any write. One simdgroup per (kv head, token).
+struct AttnKVBatchParams {
+    uint kvHeads;
+    uint headDim;
+    uint rot;
+    float eps;
+    float theta;
+    uint position;   // base; token t appends at position + t
+    uint kSrcOff;
+    uint vSrcOff;
+    uint stride;
+};
+
+kernel void attn_kv_append_batch(
+    device float       *data   [[buffer(0)]],
+    device const float *wgt    [[buffer(1)]],
+    device float       *kCache [[buffer(2)]],
+    device float       *vCache [[buffer(3)]],
+    constant AttnKVBatchParams &p [[buffer(4)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.kvHeads) return;
+    const uint t = tpg.z;
+    device const float *kSrc = data + p.kSrcOff + t * p.stride + head * p.headDim;
+    device const float *vSrc = data + p.vSrcOff + t * p.stride + head * p.headDim;
+    const ulong row = (ulong(p.position + t) * p.kvHeads + head) * p.headDim;
+    device float *kDst = kCache + row;
+    device float *vDst = vCache + row;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += kSrc[i] * kSrc[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) {
+        kDst[i] = kSrc[i] * inv * wgt[i];
+        vDst[i] = vSrc[i];
+    }
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(kDst, p.rot, p.position + t, p.theta, lane);
+}
+
 // qwen3_next fused projections: de-interleave the per-k-head packed
 // [q(dk) | k(dk) | v(rep*dv) | z(rep*dv)] layout plus [b(rep) | a(rep)] into
 // flat regions [q|k|v], z, b, a (what the conv/delta pipeline consumes).
@@ -837,5 +1014,49 @@ kernel void deinterleave_qkvz(
         const uint baSrc = p.baOff + hk * 2 * p.rep;
         data[p.bOff + hk * p.rep + ri] = data[baSrc + ri];
         data[p.aOff + hk * p.rep + ri] = data[baSrc + p.rep + ri];
+    }
+}
+
+// deinterleave_qkvz over n token slots (S1b batch twin): slot t adds
+// t*stride to every source and destination offset; per-slot copies are the
+// single-token kernel's verbatim.
+struct DeintBatchParams {
+    uint nk;
+    uint dk;
+    uint rep;
+    uint dv;
+    uint keyDim;
+    uint srcOff;
+    uint baOff;
+    uint qkvOff;
+    uint zOff;
+    uint bOff;
+    uint aOff;
+    uint stride;
+};
+
+kernel void deinterleave_qkvz_batch(
+    device float        *data [[buffer(0)]],
+    constant DeintBatchParams &p [[buffer(1)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint hk = tpg.x;
+    if (hk >= p.nk) return;
+    const uint b = tpg.y * p.stride;
+    const uint chunk = 2 * p.dk + 2 * p.rep * p.dv;
+    const uint src = p.srcOff + b + hk * chunk;
+    for (uint i = 0; i < p.dk; ++i) {
+        data[p.qkvOff + b + hk * p.dk + i] = data[src + i];
+        data[p.qkvOff + b + p.keyDim + hk * p.dk + i] = data[src + p.dk + i];
+    }
+    for (uint ri = 0; ri < p.rep; ++ri) {
+        const uint hv = hk * p.rep + ri;
+        for (uint i = 0; i < p.dv; ++i) {
+            data[p.qkvOff + b + 2 * p.keyDim + hv * p.dv + i] = data[src + 2 * p.dk + ri * p.dv + i];
+            data[p.zOff + b + hv * p.dv + i] = data[src + 2 * p.dk + p.rep * p.dv + ri * p.dv + i];
+        }
+        const uint baSrc = p.baOff + b + hk * 2 * p.rep;
+        data[p.bOff + b + hk * p.rep + ri] = data[baSrc + ri];
+        data[p.aOff + b + hk * p.rep + ri] = data[baSrc + p.rep + ri];
     }
 }
