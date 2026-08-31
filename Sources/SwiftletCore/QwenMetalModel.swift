@@ -4,14 +4,19 @@ import os.signpost
 
 /// GPU runtime: every linear (dense projections, router, experts, lm_head)
 /// runs as a quantized GEMV directly on mmapped checkpoint bytes — weights are
-/// never decompressed. The CPU keeps only glue math (norms, RoPE, conv step,
-/// delta recurrence, attention softmax over cached KV, top-k routing), all of
-/// it microseconds per token. Numerics mirror QwenCPUModel exactly.
+/// never decompressed. On the fast path the full-attention layers run their
+/// core on GPU too (S2): q/k prep + RoPE, KV append into a GPU-resident
+/// cache, and gated causal softmax attention. The CPU keeps only glue —
+/// top-k routing over GPU-computed router logits, expert-cache fetches,
+/// embedding row copies, and the state.kv mirror append — while the
+/// no-fast-path fallback still computes attention (norms, RoPE, softmax) on
+/// CPU. Numerics mirror QwenCPUModel exactly.
 public final class QwenMetalModel {
     /// S3b command-buffer phase labels. A label names the work a phase scope
     /// encoded; it claims nothing about when the GPU actually ran that work.
     public enum StepPhase: String, CaseIterable, Sendable {
-        /// Attention norm + q/k/v projections, output projection, residual add.
+        /// Attention norm + q/k/v projections, q/k prep + RoPE, KV append,
+        /// causal softmax attention, output projection, residual add.
         case attention
         /// DeltaNet mixer: projections, conv step, recurrence, gated norm,
         /// output projection, residual add.
@@ -283,8 +288,8 @@ public final class QwenMetalModel {
         case layerMajor(chunkTokens: Int)
     }
 
-    /// Default: layer-major with 32-token chunks. One 11-buffer sequence per
-    /// chunk instead of per token, and expert fetches per (layer, union)
+    /// Default: layer-major with 32-token chunks. One decode-shaped buffer
+    /// sequence per chunk instead of per token, and expert fetches per (layer, union)
     /// instead of per (token, layer, pick). 32 keeps scratch bounded to a few
     /// tens of MB on 80B-class configs while letting short prompts run as a
     /// single chunk; unions saturate toward the full expert set beyond a few
@@ -296,7 +301,7 @@ public final class QwenMetalModel {
     struct Regions {
         var x0 = 0, qkv = 0, z = 0, b = 0, a = 0, conv = 0, gb = 0
         var dy = 0, dn = 0, r = 0, xmoe = 0, rout = 0
-        var qout = 0, knew = 0, vnew = 0, att = 0
+        var qout = 0, knew = 0, vnew = 0, att = 0, qprep = 0
         var qkvzStage = 0, baStage = 0
         var exp = 0, dexp = 0, sh = 0, shg = 0
         var total = 0
@@ -306,6 +311,14 @@ public final class QwenMetalModel {
         var convW, aLog, dtBias, deltaNormW: MTLBuffer?
         var hist, state: MTLBuffer?
         var sharedGateLin: GPULinear
+        // S2, attention layers only: q/k norm weights and the GPU-resident
+        // KV cache ([position][kvHead][headDim] rows, grown on demand). Rows
+        // are indexed by absolute position, so a fresh state simply
+        // overwrites from row 0; rows past the current position are never
+        // read.
+        var qNormW, kNormW: MTLBuffer?
+        var kCache, vCache: MTLBuffer?
+        var kvCapacity = 0
     }
     var fastLayers: [FastLayer] = []
     var finalNormBuf: MTLBuffer?
@@ -512,6 +525,7 @@ public final class QwenMetalModel {
         o.knew = take(KVH * hd)
         o.vnew = take(KVH * hd)
         o.att = take(H * hd)
+        o.qprep = take(H * hd)
         o.qkvzStage = take(2 * cfg.keyDim + 2 * cfg.valueDim)
         o.baStage = take(2 * nv)
         o.exp = take(3 * K * inter)
@@ -542,6 +556,11 @@ public final class QwenMetalModel {
                 fl.hist = engine.device.makeBuffer(length: (cfg.linearConvKernelDim - 1) * cfg.convDim * 4, options: opts)
                 fl.state = engine.device.makeBuffer(
                     length: nv * cfg.linearValueHeadDim * cfg.linearKeyHeadDim * 4, options: opts)
+            }
+            if let a = L.attn {
+                fl.qNormW = engine.makeBuffer(a.qNorm)
+                fl.kNormW = engine.makeBuffer(a.kNorm)
+                // kCache/vCache grow on demand in ensureKVCapacity.
             }
             fastLayers.append(fl)
         }
@@ -1234,9 +1253,10 @@ public final class QwenMetalModel {
 }
 
 
-// MARK: - Fast path: one command buffer per DeltaNet layer, two per attention
-// layer, explicit barriers on an untracked scratch buffer so independent
-// dispatches (e.g. all expert GEMVs) actually run in parallel.
+// MARK: - Fast path: one command buffer per layer in decode (S2 folded the
+// attention layers' former two-buffer CPU round trip into one), explicit
+// barriers on an untracked scratch buffer so independent dispatches (e.g.
+// all expert GEMVs) actually run in parallel.
 extension QwenMetalModel {
 
     /// Where one token's fast-path scratch and hidden row live. The decode
@@ -1541,34 +1561,32 @@ extension QwenMetalModel {
                 enc.endEncoding()
                 commitAndWait(cb)
             } else {
-                // Attention: projections, CPU core, then out-proj + router.
-                let (cb1, e1) = beginStepCommandBuffer()
+                // S2: the whole attention layer in one command buffer — no
+                // CPU round trip. Projections, q prep + KV append into the
+                // GPU-resident cache, causal attention over it, out-proj +
+                // residual, then the router probe.
+                let attn = L.attn!
+                try ensureKVCapacity(li, rows: state.position + 1)
+                let (cb, enc) = beginStepCommandBuffer()
                 if let p = pending {
-                    try phase(.moe) { try encodePendingMoE(e1, p, slot: slot) }
+                    try phase(.moe) { try encodePendingMoE(enc, p, slot: slot) }
                     pending = nil
                 }
-                let attn = L.attn!
                 try phase(.attention) {
-                    try encAttentionProjections(e1, attn: attn, fl: fl, slot: slot)
-                }
-                e1.endEncoding()
-                commitAndWait(cb1)
-
-                let attnOut = attnCoreCPU(
-                    layerIndex: li, state: state, attn: attn,
-                    position: state.position, slot: slot
-                )
-                writeSlot(slot, reg.att, attnOut)
-
-                let (cb2, e2) = beginStepCommandBuffer()
-                try phase(.attention) {
-                    try encAttentionFinish(e2, attn: attn, slot: slot)
+                    try encAttentionProjections(enc, attn: attn, fl: fl, slot: slot)
+                    barrier(enc)
+                    try encAttentionPrep(enc, layer: li, position: state.position, slot: slot)
+                    barrier(enc)
+                    try encAttentionAttend(enc, layer: li, kvLen: state.position + 1, slot: slot)
+                    barrier(enc)
+                    try encAttentionFinish(enc, attn: attn, slot: slot)
                 }
                 try phase(.router) {
-                    try encRouterProbe(e2, moeGate: L.moe.gate, fl: fl, slot: slot)
+                    try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: slot)
                 }
-                e2.endEncoding()
-                commitAndWait(cb2)
+                enc.endEncoding()
+                commitAndWait(cb)
+                appendKVMirror(state, layer: li, position: state.position, count: 1)
             }
 
             let (picks, weights) = routerPicks(slot: slot)
@@ -1714,83 +1732,124 @@ extension QwenMetalModel {
         barrier(enc)
     }
 
-    private func attnCoreCPU(
-        layerIndex: Int, state: QwenCPUModel.DecodeState, attn: AttnGPU,
-        position: Int, slot: TokenSlot
-    ) -> [Float] {
+    // MARK: - S2 GPU-resident KV cache
+
+    /// GPU KV cache bookkeeping failed; the fast path has no CPU fallback
+    /// for attention, so the step surfaces the allocation failure.
+    public enum RuntimeError: Swift.Error {
+        case kvCacheAllocationFailed(layer: Int, rows: Int)
+    }
+
+    private var kvRowFloats: Int { config.numKeyValueHeads * config.headDim }
+
+    /// Grows layer `li`'s GPU KV cache to hold at least `rows` positions
+    /// (doubling; written rows copied across). Only called between command
+    /// buffers, when every prior buffer has been waited on.
+    func ensureKVCapacity(_ li: Int, rows: Int) throws {
+        let current = fastLayers[li].kvCapacity
+        if current >= rows, fastLayers[li].kCache != nil { return }
+        let newCapacity = max(rows, max(256, 2 * current))
+        let bytes = newCapacity * kvRowFloats * 4
+        let opts: MTLResourceOptions = [.storageModeShared, .hazardTrackingModeUntracked]
+        guard let k = engine.device.makeBuffer(length: bytes, options: opts),
+              let v = engine.device.makeBuffer(length: bytes, options: opts)
+        else { throw RuntimeError.kvCacheAllocationFailed(layer: li, rows: rows) }
+        if let oldK = fastLayers[li].kCache, let oldV = fastLayers[li].vCache, current > 0 {
+            memcpy(k.contents(), oldK.contents(), current * kvRowFloats * 4)
+            memcpy(v.contents(), oldV.contents(), current * kvRowFloats * 4)
+        }
+        fastLayers[li].kCache = k
+        fastLayers[li].vCache = v
+        fastLayers[li].kvCapacity = newCapacity
+    }
+
+    /// Appends rows [position, position + count) of layer `li`'s GPU KV
+    /// cache to the CPU-side mirror in state.kv. The GPU rows are the
+    /// source of truth for the attention math; the mirror keeps state.kv the
+    /// observable KV state (parity assertions and future persistence read
+    /// it) at the cost of one memcpy out of shared memory per layer.
+    func appendKVMirror(
+        _ state: QwenCPUModel.DecodeState, layer li: Int, position: Int, count: Int
+    ) {
+        guard let k = fastLayers[li].kCache, let v = fastLayers[li].vCache else { return }
+        let n = count * kvRowFloats
+        let byteOff = position * kvRowFloats * 4
+        var cache = state.kv[li] ?? (k: [], v: [])
+        cache.k.append(contentsOf: UnsafeBufferPointer(
+            start: k.contents().advanced(by: byteOff).bindMemory(to: Float.self, capacity: n),
+            count: n))
+        cache.v.append(contentsOf: UnsafeBufferPointer(
+            start: v.contents().advanced(by: byteOff).bindMemory(to: Float.self, capacity: n),
+            count: n))
+        state.kv[li] = cache
+    }
+
+    /// Test/introspection hook: layer `li`'s GPU-resident KV rows for
+    /// positions [0, count), or nil when the layer keeps no cache (DeltaNet
+    /// layers, or attention before its first step). Stays internal.
+    func attentionKVCacheRows(layer li: Int, count: Int) -> (k: [Float], v: [Float])? {
+        guard let k = fastLayers[li].kCache, let v = fastLayers[li].vCache,
+              fastLayers[li].kvCapacity >= count else { return nil }
+        let n = count * kvRowFloats
+        return (
+            k: Array(UnsafeBufferPointer(
+                start: k.contents().bindMemory(to: Float.self, capacity: n), count: n)),
+            v: Array(UnsafeBufferPointer(
+                start: v.contents().bindMemory(to: Float.self, capacity: n), count: n))
+        )
+    }
+
+    /// Attention core, stage 1 of 2 on GPU: query prep (extract + RMSNorm +
+    /// RoPE into reg.qprep) and the KV append for `position` (K normed +
+    /// roped, V verbatim). Callers barrier between the q/k/v projections and
+    /// this, and between this and the attend stage — batched prefill must
+    /// append every token's rows before any token attends.
+    func encAttentionPrep(
+        _ enc: MTLComputeCommandEncoder, layer li: Int, position: Int, slot: TokenSlot
+    ) throws {
         let cfg = config
-        let H = cfg.numAttentionHeads, KVH = cfg.numKeyValueHeads, hd = cfg.headDim
-        let eps = Float(cfg.rmsNormEps)
-        let past = position
-        let qOut = readSlot(slot, reg.qout, H * hd * 2)
-        var k = readSlot(slot, reg.knew, KVH * hd)
-        let v = readSlot(slot, reg.vnew, KVH * hd)
-
-        var q = [Float](repeating: 0, count: H * hd)
-        var gate = [Float](repeating: 0, count: H * hd)
-        for head in 0..<H {
-            for i in 0..<hd {
-                q[head * hd + i] = qOut[head * 2 * hd + i]
-                gate[head * hd + i] = qOut[head * 2 * hd + hd + i]
-            }
-        }
-        QwenCPUModel.rmsNorm(&q, rows: H, dim: hd, weight: attn.qNorm, eps: eps)
-        QwenCPUModel.rmsNorm(&k, rows: KVH, dim: hd, weight: attn.kNorm, eps: eps)
-        applyRopeFast(&q, heads: H, position: past)
-        applyRopeFast(&k, heads: KVH, position: past)
-
-        var cache = state.kv[layerIndex] ?? (k: [], v: [])
-        cache.k.append(contentsOf: k)
-        cache.v.append(contentsOf: v)
-        state.kv[layerIndex] = cache
-        let kAll = cache.k, vAll = cache.v
-        let kvLen = past + 1
-        let scale = 1 / Float(hd).squareRoot()
-        var attnOut = [Float](repeating: 0, count: H * hd)
-        let group = H / KVH
-        var scores = [Float](repeating: 0, count: kvLen)
-        for head in 0..<H {
-            let kvHead = head / group
-            for sj in 0..<kvLen {
-                var dot: Float = 0
-                for i in 0..<hd { dot += q[head * hd + i] * kAll[(sj * KVH + kvHead) * hd + i] }
-                scores[sj] = dot * scale
-            }
-            QwenCPUModel.softmaxRow(&scores, base: 0, count: kvLen)
-            for sj in 0..<kvLen {
-                let p = scores[sj]
-                let vBase = (sj * KVH + kvHead) * hd
-                for i in 0..<hd { attnOut[head * hd + i] += p * vAll[vBase + i] }
-            }
-        }
-        for i in 0..<attnOut.count { attnOut[i] *= QwenCPUModel.sigmoid(gate[i]) }
-        return attnOut
+        let fl = fastLayers[li] // fresh copy: ensureKVCapacity may have swapped buffers
+        try engine.encodeAttnQPrep(
+            enc, data: slot.scratch, weight: fl.qNormW!,
+            heads: cfg.numAttentionHeads, headDim: cfg.headDim,
+            rotaryDims: cfg.rotaryDims, eps: Float(cfg.rmsNormEps),
+            ropeTheta: Float(cfg.ropeTheta), position: position,
+            srcOff: slot.base + reg.qout, dstOff: slot.base + reg.qprep
+        )
+        try engine.encodeAttnKVAppend(
+            enc, data: slot.scratch, weight: fl.kNormW!,
+            kCache: fl.kCache!, vCache: fl.vCache!,
+            kvHeads: cfg.numKeyValueHeads, headDim: cfg.headDim,
+            rotaryDims: cfg.rotaryDims, eps: Float(cfg.rmsNormEps),
+            ropeTheta: Float(cfg.ropeTheta), position: position,
+            kSrcOff: slot.base + reg.knew, vSrcOff: slot.base + reg.vnew
+        )
     }
 
-    private func applyRopeFast(_ x: inout [Float], heads: Int, position: Int) {
-        let hd = config.headDim
-        let rot = config.rotaryDims
-        let half = rot / 2
-        for head in 0..<heads {
-            let base = head * hd
-            for j in 0..<half {
-                let invFreq = powf(Float(config.ropeTheta), -Float(2 * j) / Float(rot))
-                let angle = Float(position) * invFreq
-                let c = cosf(angle), sn = sinf(angle)
-                let a = x[base + j]
-                let b = x[base + half + j]
-                x[base + j] = a * c - b * sn
-                x[base + half + j] = b * c + a * sn
-            }
-        }
+    /// Attention core, stage 2 of 2: gated causal softmax attention over
+    /// cache rows [0, kvLen) into the slot's att region.
+    func encAttentionAttend(
+        _ enc: MTLComputeCommandEncoder, layer li: Int, kvLen: Int, slot: TokenSlot
+    ) throws {
+        let cfg = config
+        let fl = fastLayers[li] // fresh copy: ensureKVCapacity may have swapped buffers
+        try engine.encodeAttnDecode(
+            enc, data: slot.scratch, kCache: fl.kCache!, vCache: fl.vCache!,
+            heads: cfg.numAttentionHeads, kvHeads: cfg.numKeyValueHeads,
+            headDim: cfg.headDim, kvLen: kvLen,
+            qOff: slot.base + reg.qprep, qoutOff: slot.base + reg.qout,
+            outOff: slot.base + reg.att
+        )
     }
+
 }
 
 // MARK: - S1b layer-major chunked prefill: inside a chunk, sweep each layer
 // across every token before moving on, so a layer's expert union is fetched
-// once per chunk and one 11-buffer sequence covers the whole chunk instead of
-// every token. Per-token math is encoded through the same slot helpers as the
-// decode path, so numerics match the token-major schedule exactly.
+// once per chunk and one decode-shaped buffer sequence covers the whole chunk
+// instead of every token. Per-token math is encoded through the same slot
+// helpers as the decode path, so numerics match the token-major schedule
+// exactly; S2 batches the attention core across the chunk's tokens on GPU.
 extension QwenMetalModel {
 
     /// One layer's deferred MoE for a whole chunk: per-token picks/weights in
@@ -1845,11 +1904,11 @@ extension QwenMetalModel {
     }
 
     /// One chunk, layer-major. The buffer sequence per chunk is exactly the
-    /// legacy per-token shape (one buffer per DeltaNet layer, two per
-    /// attention layer, one tail), each buffer now carrying every chunk
-    /// token's work for that layer in per-token slots. Within a layer,
-    /// tokens are encoded in ascending order so the conv history, recurrence
-    /// state, and KV appends advance exactly as the token-major path does.
+    /// decode per-token shape (one buffer per layer, one tail), each buffer
+    /// now carrying every chunk token's work for that layer in per-token
+    /// slots. Within a layer, tokens are encoded in ascending order so the
+    /// conv history, recurrence state, and KV appends advance exactly as the
+    /// token-major path does.
     private func prefillChunkLayerMajor(
         _ chunk: [Int], state: QwenCPUModel.DecodeState, projectLogits: Bool
     ) throws -> [Float] {
@@ -1898,45 +1957,48 @@ extension QwenMetalModel {
                 enc.endEncoding()
                 commitAndWait(cb)
             } else {
+                // S2 batched attention: one command buffer carries the whole
+                // chunk. Every token's q/k/v projections, then every token's
+                // KV append (rows land at disjoint absolute positions), one
+                // barrier, and only then the per-token causal attention —
+                // token t reads rows [0, basePosition + t + 1), which the
+                // append stage has fully written. Ascending-token state
+                // semantics hold because position order, not encode order,
+                // indexes the cache.
                 let attn = L.attn!
-                let (cb1, e1) = beginStepCommandBuffer()
+                try ensureKVCapacity(li, rows: basePosition + S)
+                let (cb, enc) = beginStepCommandBuffer()
                 if let p = pending {
-                    try phase(.moe) { try encodeChunkMoE(e1, p) }
+                    try phase(.moe) { try encodeChunkMoE(enc, p) }
                     pending = nil
                 }
                 try phase(.attention) {
                     for t in 0..<S {
-                        try encAttentionProjections(e1, attn: attn, fl: fl, slot: prefillSlot(t))
+                        try encAttentionProjections(enc, attn: attn, fl: fl, slot: prefillSlot(t))
                     }
-                }
-                e1.endEncoding()
-                commitAndWait(cb1)
-
-                // CPU attention core in ascending token order: token t
-                // attends to the chunk's earlier tokens through the KV rows
-                // they appended just before it.
-                for t in 0..<S {
-                    let slot = prefillSlot(t)
-                    let attnOut = attnCoreCPU(
-                        layerIndex: li, state: state, attn: attn,
-                        position: basePosition + t, slot: slot
-                    )
-                    writeSlot(slot, reg.att, attnOut)
-                }
-
-                let (cb2, e2) = beginStepCommandBuffer()
-                try phase(.attention) {
+                    barrier(enc)
                     for t in 0..<S {
-                        try encAttentionFinish(e2, attn: attn, slot: prefillSlot(t))
+                        try encAttentionPrep(
+                            enc, layer: li, position: basePosition + t, slot: prefillSlot(t))
+                    }
+                    barrier(enc)
+                    for t in 0..<S {
+                        try encAttentionAttend(
+                            enc, layer: li, kvLen: basePosition + t + 1, slot: prefillSlot(t))
+                    }
+                    barrier(enc)
+                    for t in 0..<S {
+                        try encAttentionFinish(enc, attn: attn, slot: prefillSlot(t))
                     }
                 }
                 try phase(.router) {
                     for t in 0..<S {
-                        try encRouterProbe(e2, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
+                        try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
                     }
                 }
-                e2.endEncoding()
-                commitAndWait(cb2)
+                enc.endEncoding()
+                commitAndWait(cb)
+                appendKVMirror(state, layer: li, position: basePosition, count: S)
             }
 
             // Routing on CPU for every chunk token, then one union fetch for
