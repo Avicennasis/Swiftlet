@@ -1479,16 +1479,10 @@ extension QwenMetalModel {
     private func encAttentionFinish(
         _ enc: MTLComputeCommandEncoder, attn: AttnGPU, slot: TokenSlot
     ) throws {
-        let D = config.hiddenSize
         try engine.encodeGemv(enc, attn.oProj, x: slot.scratch, xOff: slot.base + reg.att,
             y: slot.scratch, yOff: slot.base + reg.r)
         barrier(enc)
-        var np = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
-        enc.setComputePipelineState(try engine.pipeline("add_inplace"))
-        enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
-        enc.setBuffer(slot.scratch, offset: 0, index: 1)
-        setBytesParams(enc, &np, index: 2)
-        dispatchN(enc, D)
+        try encResidualAdd(enc, slot: slot)
         barrier(enc)
     }
 
@@ -1611,53 +1605,81 @@ extension QwenMetalModel {
     }
 
     /// DeltaNet mixer for one token, entirely on GPU: projections, conv step,
-    /// gated recurrence, gated norm, output projection, residual add.
+    /// gated recurrence, gated norm, output projection, residual add. Encoded
+    /// through the stage helpers below in exactly the legacy order; the
+    /// chunked prefill reuses the stages but batches the projection GEMVs
+    /// across tokens (S1b token batching).
     private func encDeltaCore(
         _ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, slot: TokenSlot
     ) throws {
+        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: slot)
+        barrier(enc)
+        for proj in deltaInProjections(delta) {
+            try engine.encodeGemv(enc, proj.lin, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + proj.dst)
+        }
+        barrier(enc)
+        if config.deltaLayout == .fusedInterleaved {
+            try encDeltaDeinterleave(enc, slot: slot)
+            barrier(enc)
+        }
+        try encDeltaRecurrence(enc, fl: fl, slot: slot)
+        try engine.encodeGemv(enc, delta.outProj, x: slot.scratch, xOff: slot.base + reg.dn,
+            y: slot.scratch, yOff: slot.base + reg.r)
+        barrier(enc)
+        try encResidualAdd(enc, slot: slot)
+        barrier(enc)
+    }
+
+    /// The DeltaNet input projections as (linear, destination region) pairs
+    /// in the layout's canonical encode order; the decode core and the
+    /// batched chunk pass dispatch exactly these.
+    private func deltaInProjections(_ delta: DeltaGPU) -> [(lin: GPULinear, dst: Int)] {
+        switch config.deltaLayout {
+        case .split:
+            return [(delta.qkv!, reg.qkv), (delta.zProj!, reg.z),
+                    (delta.bProj!, reg.b), (delta.aProj!, reg.a)]
+        case .fusedInterleaved:
+            return [(delta.qkvz!, reg.qkvzStage), (delta.ba!, reg.baStage)]
+        }
+    }
+
+    /// Splits the fused qkvz/ba staging rows into the flat qkv/z/b/a regions
+    /// (fusedInterleaved layout only).
+    private func encDeltaDeinterleave(_ enc: MTLComputeCommandEncoder, slot: TokenSlot) throws {
         let cfg = config
-        let D = cfg.hiddenSize
+        let nk = cfg.linearNumKeyHeads, nv = cfg.linearNumValueHeads
+        let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
+        enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
+        struct DeintParams {
+            var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
+            var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
+            var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
+        }
+        var dip = DeintParams(
+            nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
+            keyDim: UInt32(cfg.keyDim),
+            srcOff: UInt32(slot.base + reg.qkvzStage), baOff: UInt32(slot.base + reg.baStage),
+            qkvOff: UInt32(slot.base + reg.qkv), zOff: UInt32(slot.base + reg.z),
+            bOff: UInt32(slot.base + reg.b), aOff: UInt32(slot.base + reg.a)
+        )
+        enc.setBuffer(slot.scratch, offset: 0, index: 0)
+        setBytesParams(enc, &dip, index: 1)
+        dispatchN(enc, nk)
+    }
+
+    /// Conv step, decay/beta preparation, q/k norms, gated recurrence, and
+    /// the gated output norm for one token, ending on a barrier. Reads the
+    /// slot's projection regions and advances the layer's shared conv
+    /// history and recurrent state, so chunked callers must encode tokens in
+    /// ascending order (the decode core encodes exactly one).
+    private func encDeltaRecurrence(
+        _ enc: MTLComputeCommandEncoder, fl: FastLayer, slot: TokenSlot
+    ) throws {
+        let cfg = config
         let nk = cfg.linearNumKeyHeads, nv = cfg.linearNumValueHeads
         let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
         let keyDim = cfg.keyDim, convDim = cfg.convDim
-
-        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: slot)
-        barrier(enc)
-        switch config.deltaLayout {
-        case .split:
-            try engine.encodeGemv(enc, delta.qkv!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.qkv)
-            try engine.encodeGemv(enc, delta.zProj!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.z)
-            try engine.encodeGemv(enc, delta.bProj!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.b)
-            try engine.encodeGemv(enc, delta.aProj!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.a)
-            barrier(enc)
-        case .fusedInterleaved:
-            try engine.encodeGemv(enc, delta.qkvz!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.qkvzStage)
-            try engine.encodeGemv(enc, delta.ba!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.baStage)
-            barrier(enc)
-            enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
-            struct DeintParams {
-                var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
-                var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
-                var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
-            }
-            var dip = DeintParams(
-                nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
-                keyDim: UInt32(keyDim),
-                srcOff: UInt32(slot.base + reg.qkvzStage), baOff: UInt32(slot.base + reg.baStage),
-                qkvOff: UInt32(slot.base + reg.qkv), zOff: UInt32(slot.base + reg.z),
-                bOff: UInt32(slot.base + reg.b), aOff: UInt32(slot.base + reg.a)
-            )
-            enc.setBuffer(slot.scratch, offset: 0, index: 0)
-            setBytesParams(enc, &dip, index: 1)
-            dispatchN(enc, nk)
-            barrier(enc)
-        }
 
         enc.setComputePipelineState(try engine.pipeline("conv_step"))
         var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim),
@@ -1712,17 +1734,17 @@ extension QwenMetalModel {
         setBytesParams(enc, &gp, index: 2)
         dispatchRows(enc, rows: nv)
         barrier(enc)
+    }
 
-        try engine.encodeGemv(enc, delta.outProj, x: slot.scratch, xOff: slot.base + reg.dn,
-            y: slot.scratch, yOff: slot.base + reg.r)
-        barrier(enc)
-        var ap = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
+    /// h[slot] += the slot's reg.r row (a mixer's output-projection result).
+    private func encResidualAdd(_ enc: MTLComputeCommandEncoder, slot: TokenSlot) throws {
+        let D = config.hiddenSize
         enc.setComputePipelineState(try engine.pipeline("add_inplace"))
+        var p = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
         enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
         enc.setBuffer(slot.scratch, offset: 0, index: 1)
-        setBytesParams(enc, &ap, index: 2)
+        setBytesParams(enc, &p, index: 2)
         dispatchN(enc, D)
-        barrier(enc)
     }
 
     // MARK: - S2 GPU-resident KV cache
