@@ -3,6 +3,31 @@ import Testing
 @testable import SwiftletCore
 
 @Suite struct TextGeneratorTests {
+    private enum RecursiveGenerateOutcome: Equatable, Sendable {
+        case pending
+        case rejected(TextGenerator.Error)
+        case innerSucceeded
+        case unexpectedInnerError
+        case outerFailed
+    }
+
+    private final class RecursiveGenerateResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _outcome = RecursiveGenerateOutcome.pending
+
+        var outcome: RecursiveGenerateOutcome {
+            lock.lock()
+            defer { lock.unlock() }
+            return _outcome
+        }
+
+        func record(_ outcome: RecursiveGenerateOutcome) {
+            lock.lock()
+            _outcome = outcome
+            lock.unlock()
+        }
+    }
+
     private final class CancellationProbeModel: InferenceModel, @unchecked Sendable {
         enum ProbeError: Swift.Error { case timedOutWaitingForCancellation }
 
@@ -162,6 +187,39 @@ import Testing
         #expect(model.cancellableCalls == 0)
         #expect(model.legacyCalls == 0)
         #expect(!model.observedCancellation)
+    }
+
+    @Test func recursiveGenerateFromTokenCallbackIsRejectedWithoutDeadlock() throws {
+        let model = try CancellationProbeModel(
+            modelDir: Self.fixturesDir.appendingPathComponent("tiny-model"),
+            waitForCancellation: false
+        )
+        let generator = TextGenerator(model: model)
+        let result = RecursiveGenerateResult()
+        let completed = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global().async {
+            defer { completed.signal() }
+            do {
+                _ = try generator.generate(promptIds: [1], maxNew: 1) { _ in
+                    do {
+                        _ = try generator.generate(promptIds: [2], maxNew: 0) { _ in true }
+                        result.record(.innerSucceeded)
+                    } catch let error as TextGenerator.Error {
+                        result.record(.rejected(error))
+                    } catch {
+                        result.record(.unexpectedInnerError)
+                    }
+                    return false
+                }
+            } catch {
+                result.record(.outerFailed)
+            }
+        }
+
+        #expect(completed.wait(timeout: .now() + .seconds(2)) == .success)
+        #expect(result.outcome == .rejected(.reentrantGeneration))
+        #expect(model.cancellableCalls == 1)
     }
 
     @Test func concurrentTokenStreamsNeverOverlapModelCalls() async throws {
