@@ -258,6 +258,11 @@ public final class QwenMetalModel {
     /// Sample slots per command buffer: the fast path encodes at most three
     /// phase scopes per buffer (2 samples each); headroom is harmless.
     private static let maxPhaseSamplesPerBuffer = 16
+    /// Test hook (S1b-a): observes the routed expert list for every
+    /// (token, layer) exactly as the existing token-by-token path selects it.
+    /// The prefill expert-union planning oracle derives its input from these
+    /// outcomes; the hook changes no schedule and stays internal.
+    var routedExpertObserver: ((_ layer: Int, _ experts: [Int]) -> Void)?
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -1090,6 +1095,7 @@ public final class QwenMetalModel {
                 picks.sort { $0.1 > $1.1 }
             }
         }
+        routedExpertObserver?(layerIndex, picks.map { $0.0 })
 
         // Scratch layout in yBuf (floats):
         //   [0, K*inter)                        expert gate outputs
@@ -1425,6 +1431,7 @@ extension QwenMetalModel {
             }
 
             let (picks, weights) = routerPicks()
+            routedExpertObserver?(li, picks.map { $0.0 })
             var bufs: [MTLBuffer] = []
             if let cache = expertCache {
                 bufs = try cache.buffers(layer: li, experts: picks.map { $0.0 })
