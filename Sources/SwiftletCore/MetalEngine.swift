@@ -620,6 +620,46 @@ public final class MetalEngine {
         )
     }
 
+    struct DeltaGatherParams {
+        var keyDim: UInt32
+        var valueDim: UInt32
+        var nv: UInt32
+        var slotStride: UInt32
+        var convOff: UInt32
+        var gbOff: UInt32
+        var qOut: UInt32
+        var kOut: UInt32
+        var vOut: UInt32
+        var gOut: UInt32
+        var bOut: UInt32
+    }
+
+    /// Packs every chunk token's normed q/k/v conv rows and g/beta pairs
+    /// from slot-strided regions into contiguous [tokens, row] blocks — the
+    /// layout gated_delta_step's T-step scan expects. Pure element copies;
+    /// staging cannot perturb numerics.
+    func encodeDeltaGather(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer,
+        keyDim: Int, valueDim: Int, nv: Int,
+        slotStride: Int, convOff: Int, gbOff: Int,
+        qOut: Int, kOut: Int, vOut: Int, gOut: Int, bOut: Int, tokens: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("delta_gather"))
+        var p = DeltaGatherParams(
+            keyDim: UInt32(keyDim), valueDim: UInt32(valueDim), nv: UInt32(nv),
+            slotStride: UInt32(slotStride), convOff: UInt32(convOff), gbOff: UInt32(gbOff),
+            qOut: UInt32(qOut), kOut: UInt32(kOut), vOut: UInt32(vOut),
+            gOut: UInt32(gOut), bOut: UInt32(bOut)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBytes(&p, length: MemoryLayout<DeltaGatherParams>.stride, index: 1)
+        let width = 2 * keyDim + valueDim + 2 * nv
+        dispatchThreads(
+            enc, threads: MTLSize(width: width, height: tokens, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(64, width), height: 1, depth: 1)
+        )
+    }
+
     func encodeSiluMul(
         _ enc: MTLComputeCommandEncoder,
         buf: MTLBuffer, count: Int, gOff: Int, uOff: Int, dstOff: Int

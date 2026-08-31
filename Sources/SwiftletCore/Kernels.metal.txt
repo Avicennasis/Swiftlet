@@ -976,6 +976,48 @@ kernel void attn_kv_append_batch(
     rope_row(kDst, p.rot, p.position + t, p.theta, lane);
 }
 
+// ===== S1b chunked DeltaNet staging: pack every chunk token's normed
+// q/k/v conv rows and g/beta pairs from slot-strided regions into the
+// contiguous [T, row] blocks gated_delta_step's T-step scan expects. Pure
+// element copies with no arithmetic, so staging cannot perturb numerics.
+struct DeltaGatherParams {
+    uint keyDim;
+    uint valueDim;
+    uint nv;
+    uint slotStride;
+    uint convOff;   // slot conv rows: [q(keyDim) | k(keyDim) | v(valueDim)]
+    uint gbOff;     // slot decay/beta rows: [g(nv) | beta(nv)]
+    uint qOut;
+    uint kOut;
+    uint vOut;
+    uint gOut;
+    uint bOut;
+};
+
+kernel void delta_gather(
+    device float *data [[buffer(0)]],
+    constant DeltaGatherParams &p [[buffer(1)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    const uint t = tpg.y;
+    const uint slot = t * p.slotStride;
+    const uint convWidth = 2 * p.keyDim + p.valueDim;
+    if (i < p.keyDim) {
+        data[p.qOut + t * p.keyDim + i] = data[slot + p.convOff + i];
+    } else if (i < 2 * p.keyDim) {
+        data[p.kOut + t * p.keyDim + (i - p.keyDim)] = data[slot + p.convOff + i];
+    } else if (i < convWidth) {
+        data[p.vOut + t * p.valueDim + (i - 2 * p.keyDim)] = data[slot + p.convOff + i];
+    } else if (i < convWidth + p.nv) {
+        const uint j = i - convWidth;
+        data[p.gOut + t * p.nv + j] = data[slot + p.gbOff + j];
+    } else if (i < convWidth + 2 * p.nv) {
+        const uint j = i - convWidth - p.nv;
+        data[p.bOut + t * p.nv + j] = data[slot + p.gbOff + p.nv + j];
+    }
+}
+
 // qwen3_next fused projections: de-interleave the per-k-head packed
 // [q(dk) | k(dk) | v(rep*dv) | z(rep*dv)] layout plus [b(rep) | a(rep)] into
 // flat regions [q|k|v], z, b, a (what the conv/delta pipeline consumes).

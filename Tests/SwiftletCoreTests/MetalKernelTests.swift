@@ -564,4 +564,96 @@ import Testing
         Self.expectBitwise(perToken.v, batched.v, cacheFloats, "attn_kv_append v cache")
         Self.expectBitwise(perToken.data, batched.data, tokens * stride, "attn_kv_append data")
     }
+
+    // MARK: - S1b chunked DeltaNet recurrence (T-step scan)
+
+    /// gated_delta_step's T parameter is a sequential in-dispatch scan: one
+    /// T=5 dispatch must reproduce five chained T=1 dispatches bitwise (all
+    /// y rows and the final state), because the step loop performs the
+    /// identical ascending arithmetic with state carried in f32 registers
+    /// instead of a per-token f32 device round trip. This is the oracle the
+    /// chunked prefill recurrence stands on.
+    @Test func gatedDeltaChunkedScanMatchesSequentialBitwise() throws {
+        let engine = try MetalEngine()
+        let T = 5, Hk = 2, Hv = 4, Dk = 32, Dv = 8
+        var rng = Rand(97)
+        let q = (0..<T * Hk * Dk).map { _ in rng.float() }
+        let k = (0..<T * Hk * Dk).map { _ in rng.float() }
+        let v = (0..<T * Hv * Dv).map { _ in rng.float() }
+        let g = (0..<T * Hv).map { _ in abs(rng.float()) * 0.9 }
+        let beta = (0..<T * Hv).map { _ in abs(rng.float()) }
+        let state0 = (0..<Hv * Dv * Dk).map { _ in rng.float() * 0.1 }
+
+        var seqY: [Float] = []
+        var seqState = state0
+        for t in 0..<T {
+            let (y, s) = try engine.gatedDeltaStep(
+                q: Array(q[t * Hk * Dk..<(t + 1) * Hk * Dk]),
+                k: Array(k[t * Hk * Dk..<(t + 1) * Hk * Dk]),
+                v: Array(v[t * Hv * Dv..<(t + 1) * Hv * Dv]),
+                g: Array(g[t * Hv..<(t + 1) * Hv]),
+                beta: Array(beta[t * Hv..<(t + 1) * Hv]),
+                state: seqState, T: 1, Hk: Hk, Hv: Hv, Dk: Dk, Dv: Dv
+            )
+            seqY.append(contentsOf: y)
+            seqState = s
+        }
+
+        let (y, state) = try engine.gatedDeltaStep(
+            q: q, k: k, v: v, g: g, beta: beta, state: state0,
+            T: T, Hk: Hk, Hv: Hv, Dk: Dk, Dv: Dv
+        )
+        #expect(y.map(\.bitPattern) == seqY.map(\.bitPattern),
+                "T-step scan y diverges bitwise from chained T=1 steps")
+        #expect(state.map(\.bitPattern) == seqState.map(\.bitPattern),
+                "T-step scan state diverges bitwise from chained T=1 steps")
+    }
+
+    /// delta_gather packs slot-strided q/k/v/g/beta into the contiguous
+    /// [T, row] staging blocks as pure copies — bitwise against a CPU
+    /// reference, one dispatch, sources untouched.
+    @Test func deltaGatherPacksSlotsBitwise() throws {
+        let engine = try MetalEngine()
+        let keyDim = 16, valueDim = 32, nv = 4, tokens = 3
+        let convOff = 7
+        let gbOff = convOff + 2 * keyDim + valueDim + 5
+        let slotStride = gbOff + 2 * nv + 9
+        let stageBase = tokens * slotStride
+        let qOut = stageBase
+        let kOut = qOut + tokens * keyDim
+        let vOut = kOut + tokens * keyDim
+        let gOut = vOut + tokens * valueDim
+        let bOut = gOut + tokens * nv
+        let total = bOut + tokens * nv
+        var rng = Rand(101)
+        let data = (0..<total).map { _ in rng.float() }
+
+        var expected = data
+        for t in 0..<tokens {
+            let slot = t * slotStride
+            for i in 0..<keyDim {
+                expected[qOut + t * keyDim + i] = data[slot + convOff + i]
+                expected[kOut + t * keyDim + i] = data[slot + convOff + keyDim + i]
+            }
+            for i in 0..<valueDim {
+                expected[vOut + t * valueDim + i] = data[slot + convOff + 2 * keyDim + i]
+            }
+            for i in 0..<nv {
+                expected[gOut + t * nv + i] = data[slot + gbOff + i]
+                expected[bOut + t * nv + i] = data[slot + gbOff + nv + i]
+            }
+        }
+
+        let buf = engine.makeBuffer(data)
+        let dispatches = try Self.runEncoded(engine) { enc in
+            try engine.encodeDeltaGather(
+                enc, data: buf, keyDim: keyDim, valueDim: valueDim, nv: nv,
+                slotStride: slotStride, convOff: convOff, gbOff: gbOff,
+                qOut: qOut, kOut: kOut, vOut: vOut, gOut: gOut, bOut: bOut,
+                tokens: tokens)
+        }
+        #expect(dispatches == 1, "delta_gather: dispatch count")
+        #expect(Self.floats(buf, total).map(\.bitPattern) == expected.map(\.bitPattern),
+                "delta_gather diverges from the CPU copy reference")
+    }
 }
