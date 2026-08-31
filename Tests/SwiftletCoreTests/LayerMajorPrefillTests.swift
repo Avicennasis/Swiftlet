@@ -17,13 +17,14 @@ import Testing
 
     /// Layer-major token-batched baseline: one decode-token-shaped buffer
     /// sequence per chunk (the S2 9-buffer shape), with the dispatch cost
-    /// decomposed into per-token kernels (the order-sensitive DeltaNet
-    /// recurrence chain and the per-token causal attends), per-chunk batched
-    /// dispatches (each dense/shared/router GEMV plus each glue twin — norm
-    /// copies, deinterleave, silu, residual adds, weighted accumulation,
-    /// attention q prep / KV append — encodes once per chunk regardless of
-    /// chunk size), and per-union-expert batched GEMVs (gate/up/down encode
-    /// once per (expert, projection) per chunk). A single-token chunk
+    /// decomposed into per-token kernels (only the order-sensitive DeltaNet
+    /// conv step, whose history each token advances for the next), per-chunk
+    /// batched dispatches (each dense/shared/router GEMV plus each batch
+    /// twin — norm copies, deinterleave, silu, residual adds, weighted
+    /// accumulation, attention q prep / KV append / causal attend, decay/
+    /// beta prep, q/k norms, gated norm — encodes once per chunk regardless
+    /// of chunk size), and per-union-expert batched GEMVs (gate/up/down
+    /// encode once per (expert, projection) per chunk). A single-token chunk
     /// delegates every batch encode to the legacy per-token path and lands
     /// exactly on the pre-batching decomposition. Exact assertions, S3a
     /// style.
@@ -63,28 +64,29 @@ import Testing
         }
     }
 
-    /// Batching the causal attend re-pins the prefill dispatch baselines.
-    /// Old (glue twins + chunked scan): per token the DeltaNet
-    /// conv/prep/norm chain (conv, decay/beta prep, q/k norms, gated norm;
-    /// 5 per delta layer) plus the causal attend (1 per attention layer):
-    /// q4/q35 32 = 6x5 + 2x1; per chunk q4 144 = 66 GEMVs + 6x6 + 2x5 +
-    /// 8x4 (q35: 150 = 78 + 6x5 + 2x5 + 8x4).
-    /// New: attn_decode_gqa_batch derives each token's kvLen from the token
-    /// grid, so the attend moves to the per-chunk column — per token only
-    /// the order-sensitive DeltaNet chain remains: q4/q35 30 = 6x5. Per
-    /// chunk the GEMVs plus the glue twins, the chunked scan, and the
-    /// batched attend: q4 146 = 66 + 6x6 (input norm, deinterleave, gather,
-    /// T-step scan, residual, post norm) + 2x6 (input norm, q prep, KV
-    /// append, attend, residual, post norm) + 8x4 (top-2 silus, shared
-    /// silu, weighted accum); q35 152 = 78 + 6x5 (no deinterleave) + 2x6 +
-    /// 8x4.
+    /// Batching the DeltaNet prep chain (after the causal attend) re-pins
+    /// the prefill dispatch baselines.
+    /// Old (glue twins + chunked scan + batched attend): per token the
+    /// DeltaNet conv/prep/norm chain — conv, decay/beta prep, q/k norms,
+    /// gated norm; q4/q35 30 = 6x5 — with per chunk q4 146 = 66 GEMVs +
+    /// 6x6 + 2x6 + 8x4 (q35: 152 = 78 + 6x5 + 2x6 + 8x4).
+    /// New: decay/beta prep, the weightless q/k norms, and the gated norm
+    /// are independent per token, so they encode once per chunk through
+    /// their stride twins — per token only the genuinely order-sensitive
+    /// kernel remains, the depthwise conv step advancing the layer's shared
+    /// history: q4/q35 6 = 6x1. Per chunk the GEMVs plus every batched
+    /// stage: q4 170 = 66 + 6x10 (input norm, deinterleave, decay/beta
+    /// prep, q norm, k norm, gather, T-step scan, gated norm, residual,
+    /// post norm) + 2x6 (input norm, q prep, KV append, attend, residual,
+    /// post norm) + 8x4 (top-2 silus, shared silu, weighted accum);
+    /// q35 176 = 78 + 6x9 (no deinterleave) + 2x6 + 8x4.
     /// Per union expert 3 (gate/up/down). A single-token chunk delegates to
     /// the legacy path and lands exactly on the old pin: 104 + 66 + 3x16
     /// = 218 and 98 + 78 + 3x16 = 224 (16 = 8 layers x top-2 picks).
     static let q4Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        perTokenDispatches: 30,
-        perChunkDispatches: 146,
+        perTokenDispatches: 6,
+        perChunkDispatches: 170,
         perUnionExpertDispatches: 3,
         lmHeadDispatches: 2,
         legacyPerTokenDispatches: 104,
@@ -93,8 +95,8 @@ import Testing
     )
     static let q35Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        perTokenDispatches: 30,
-        perChunkDispatches: 152,
+        perTokenDispatches: 6,
+        perChunkDispatches: 176,
         perUnionExpertDispatches: 3,
         lmHeadDispatches: 2,
         legacyPerTokenDispatches: 98,

@@ -1674,9 +1674,10 @@ extension QwenMetalModel {
     /// slot's projection regions and advances the layer's shared conv
     /// history and recurrent state, so chunked callers must encode tokens in
     /// ascending order (the decode core encodes exactly one). Assembled
-    /// from the stage helpers below; the chunked prefill reuses them but
-    /// runs the gated scan once per chunk with T = chunk length (S1b
-    /// chunked recurrence).
+    /// from the stage helpers below; the chunked prefill keeps only the
+    /// conv steps per token, batches decay/beta prep, the q/k norms, and
+    /// the gated norm through their stride twins, and runs the gated scan
+    /// once per chunk with T = chunk length (S1b chunked recurrence).
     private func encDeltaRecurrence(
         _ enc: MTLComputeCommandEncoder, fl: FastLayer, slot: TokenSlot
     ) throws {
@@ -2258,8 +2259,9 @@ extension QwenMetalModel {
     /// One DeltaNet layer over the whole chunk (S1b token batching): one
     /// batched input norm, then one batched dispatch per in_proj tensor
     /// covering all tokens, one batched deinterleave, then the chunked
-    /// recurrence (per-token conv/prep/norms in ascending order feeding one
-    /// T=n gated scan), then one batched output projection and one batched
+    /// recurrence (per-token conv steps in ascending order, batched
+    /// decay/beta prep and q/k norms, one T=n gated scan, one batched gated
+    /// norm), then one batched output projection and one batched
     /// residual add. One token degenerates to exactly the decode core's
     /// encode stream, keeping the per-token scan alive as the chunked
     /// path's oracle.
@@ -2292,27 +2294,45 @@ extension QwenMetalModel {
     }
 
     /// The chunk's recurrence stage with the T-step scan (S1b chunked
-    /// recurrence): conv steps and decay/beta prep stay per token in
-    /// ascending order (the conv history is shared state, so a barrier
-    /// separates consecutive tokens), the q/k norms run per token on each
-    /// slot's conv rows, one delta_gather packs the normed rows into the
-    /// contiguous [T, row] staging blocks, and a single T=n gated_delta_step
-    /// replaces the n per-token scans. The kernel's internal step loop
-    /// performs the same ascending-order arithmetic the per-token dispatches
-    /// did — state carried in f32 registers instead of a per-token f32
-    /// device round trip — so every y row and the final state are bitwise
-    /// identical. Ends on a barrier like the decode core.
+    /// recurrence): only the conv steps stay per token in ascending order
+    /// (the conv history is shared state, so a barrier separates consecutive
+    /// tokens); decay/beta prep and the weightless q/k norms are independent
+    /// per token and encode once per chunk through their stride twins; one
+    /// delta_gather packs the normed rows into the contiguous [T, row]
+    /// staging blocks, a single T=n gated_delta_step replaces the n
+    /// per-token scans, and one batched gated norm reads the scan's staged y
+    /// rows. Every batched row is the single-token kernel's arithmetic
+    /// verbatim and the scan's internal step loop performs the same
+    /// ascending-order arithmetic the per-token dispatches did — state
+    /// carried in f32 registers instead of a per-token f32 device round trip
+    /// — so every y row and the final state are bitwise identical. Ends on a
+    /// barrier like the decode core.
     private func encChunkDeltaRecurrence(
         _ enc: MTLComputeCommandEncoder, fl: FastLayer, tokens n: Int
     ) throws {
-        let valueDim = config.valueDim
+        let cfg = config
+        let valueDim = cfg.valueDim
         for t in 0..<n {
-            let slot = prefillSlot(t)
-            try encConvStep(enc, fl: fl, slot: slot)
-            try encDeltaPre(enc, fl: fl, slot: slot)
+            try encConvStep(enc, fl: fl, slot: prefillSlot(t))
             barrier(enc)   // token t+1's conv reads the advanced history
         }
-        for t in 0..<n { try encDeltaQKNorms(enc, slot: prefillSlot(t)) }
+        // Reads the slots' a/b projection rows (behind encChunkDelta's
+        // barrier) and writes gb, disjoint from the conv rows the norms
+        // touch in place — one barrier below covers both for the gather.
+        try engine.encodeDeltaPreBatch(
+            enc, data: prefillScratchBuf!, aLog: fl.aLog!, dtBias: fl.dtBias!,
+            nv: cfg.linearNumValueHeads, aOff: reg.a, bOff: reg.b, outOff: reg.gb,
+            slotStride: reg.total, tokens: n)
+        let nk = cfg.linearNumKeyHeads, dk = cfg.linearKeyHeadDim
+        let invScale = 1 / Float(dk).squareRoot()
+        try engine.encodeRMSNormRowsBatch(
+            enc, data: prefillScratchBuf!, weight: nil, off: reg.conv,
+            rows: nk, dim: dk, scale: invScale * invScale, eps: 1e-6,
+            slotStride: reg.total, tokens: n)
+        try engine.encodeRMSNormRowsBatch(
+            enc, data: prefillScratchBuf!, weight: nil, off: reg.conv + cfg.keyDim,
+            rows: nk, dim: dk, scale: invScale, eps: 1e-6,
+            slotStride: reg.total, tokens: n)
         barrier(enc)
         try engine.encodeDeltaGather(
             enc, data: prefillScratchBuf!,
@@ -2326,12 +2346,13 @@ extension QwenMetalModel {
             qOff: prefillStage.q, kOff: prefillStage.k, vOff: prefillStage.v,
             gOff: prefillStage.g, bOff: prefillStage.b, yOff: prefillStage.y)
         barrier(enc)
-        for t in 0..<n {
-            try encGatedNormMul(
-                enc, fl: fl, data: prefillScratchBuf!,
-                yOff: prefillStage.y + t * valueDim,
-                zOff: t * reg.total + reg.z, outOff: t * reg.total + reg.dn)
-        }
+        try engine.encodeGatedNormMulBatch(
+            enc, data: prefillScratchBuf!, weight: fl.deltaNormW!,
+            nv: cfg.linearNumValueHeads, dv: cfg.linearValueHeadDim,
+            eps: Float(cfg.rmsNormEps),
+            yOff: prefillStage.y, yStride: valueDim,
+            zOff: reg.z, zStride: reg.total,
+            outOff: reg.dn, outStride: reg.total, tokens: n)
         barrier(enc)
     }
 
