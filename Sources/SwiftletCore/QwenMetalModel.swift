@@ -1862,9 +1862,12 @@ extension QwenMetalModel {
 // MARK: - S1b layer-major chunked prefill: inside a chunk, sweep each layer
 // across every token before moving on, so a layer's expert union is fetched
 // once per chunk and one decode-shaped buffer sequence covers the whole chunk
-// instead of every token. Per-token math is encoded through the same slot
-// helpers as the decode path, so numerics match the token-major schedule
-// exactly; S2 batches the attention core across the chunk's tokens on GPU.
+// instead of every token. Independent per-token projection GEMVs over shared
+// weights encode as token-batched dispatches (one per projection per chunk,
+// one per (expert, projection) for routed experts); every batched row is the
+// single-token kernel's arithmetic verbatim and the recurrent stages keep
+// ascending token order, so numerics match the token-major schedule exactly.
+// S2 batches the attention core across the chunk's tokens on GPU.
 extension QwenMetalModel {
 
     /// One layer's deferred MoE for a whole chunk: per-token picks/weights in
@@ -1897,6 +1900,12 @@ extension QwenMetalModel {
     private func prefillSlot(_ t: Int) -> TokenSlot {
         TokenSlot(scratch: prefillScratchBuf!, base: t * reg.total,
                   hidden: prefillHiddenBuf!, hiddenByteOffset: t * config.hiddenSize * 4)
+    }
+
+    /// Offset table for one token-batched projection: chunk token t reads
+    /// `src` and writes `dst` inside its own slot stride.
+    private func chunkGemvSlots(_ n: Int, src: Int, dst: Int) -> [(xOff: Int, yOff: Int)] {
+        (0..<n).map { t in (xOff: t * reg.total + src, yOff: t * reg.total + dst) }
     }
 
     /// Splits the prompt into chunks of at most `chunkCapacity` tokens and
@@ -1957,17 +1966,10 @@ extension QwenMetalModel {
                     pending = nil
                 }
                 try phase(.delta) {
-                    // Ascending token order: the conv history and recurrence
-                    // state are shared per layer, and the barriers inside
-                    // each token's sequence order token t+1 after token t.
-                    for t in 0..<S {
-                        try encDeltaCore(enc, delta: delta, fl: fl, slot: prefillSlot(t))
-                    }
+                    try encChunkDelta(enc, delta: delta, fl: fl, tokens: S)
                 }
                 try phase(.router) {
-                    for t in 0..<S {
-                        try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
-                    }
+                    try encChunkRouterProbe(enc, moeGate: L.moe.gate, fl: fl, tokens: S)
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
@@ -1988,8 +1990,17 @@ extension QwenMetalModel {
                     pending = nil
                 }
                 try phase(.attention) {
+                    // Input norms per token, then q/k/v each as one
+                    // token-batched dispatch over every slot.
                     for t in 0..<S {
-                        try encAttentionProjections(enc, attn: attn, fl: fl, slot: prefillSlot(t))
+                        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: prefillSlot(t))
+                    }
+                    barrier(enc)
+                    for proj in [(attn.qProj, reg.qout), (attn.kProj, reg.knew),
+                                 (attn.vProj, reg.vnew)] {
+                        try engine.encodeGemvBatch(
+                            enc, proj.0, x: prefillScratchBuf!, y: prefillScratchBuf!,
+                            slots: chunkGemvSlots(S, src: reg.x0, dst: proj.1))
                     }
                     barrier(enc)
                     for t in 0..<S {
@@ -2002,14 +2013,15 @@ extension QwenMetalModel {
                             enc, layer: li, kvLen: basePosition + t + 1, slot: prefillSlot(t))
                     }
                     barrier(enc)
-                    for t in 0..<S {
-                        try encAttentionFinish(enc, attn: attn, slot: prefillSlot(t))
-                    }
+                    try engine.encodeGemvBatch(
+                        enc, attn.oProj, x: prefillScratchBuf!, y: prefillScratchBuf!,
+                        slots: chunkGemvSlots(S, src: reg.att, dst: reg.r))
+                    barrier(enc)
+                    for t in 0..<S { try encResidualAdd(enc, slot: prefillSlot(t)) }
+                    barrier(enc)
                 }
                 try phase(.router) {
-                    for t in 0..<S {
-                        try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
-                    }
+                    try encChunkRouterProbe(enc, moeGate: L.moe.gate, fl: fl, tokens: S)
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
@@ -2060,9 +2072,58 @@ extension QwenMetalModel {
             count: cfg.vocabSize))
     }
 
-    /// One layer's MoE for a whole chunk. Every expert in the union is
-    /// touched once per stage, encoding the GEMVs of all tokens routed to it
-    /// back-to-back; outputs land in disjoint per-token slots so a stage runs
+    /// One DeltaNet layer over the whole chunk (S1b token batching): every
+    /// token's input norm, then one batched dispatch per in_proj tensor
+    /// covering all tokens, then the recurrence token-by-token in ascending
+    /// order (the conv history and recurrent state are shared per layer, and
+    /// the barriers inside each token's recurrence order token t+1 after
+    /// token t), then one batched output projection and the per-token
+    /// residual adds. One token degenerates to exactly the decode core's
+    /// encode stream.
+    private func encChunkDelta(
+        _ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, tokens n: Int
+    ) throws {
+        for t in 0..<n {
+            try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: prefillSlot(t))
+        }
+        barrier(enc)
+        for proj in deltaInProjections(delta) {
+            try engine.encodeGemvBatch(
+                enc, proj.lin, x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: chunkGemvSlots(n, src: reg.x0, dst: proj.dst))
+        }
+        barrier(enc)
+        if config.deltaLayout == .fusedInterleaved {
+            for t in 0..<n { try encDeltaDeinterleave(enc, slot: prefillSlot(t)) }
+            barrier(enc)
+        }
+        for t in 0..<n { try encDeltaRecurrence(enc, fl: fl, slot: prefillSlot(t)) }
+        try engine.encodeGemvBatch(
+            enc, delta.outProj, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(n, src: reg.dn, dst: reg.r))
+        barrier(enc)
+        for t in 0..<n { try encResidualAdd(enc, slot: prefillSlot(t)) }
+        barrier(enc)
+    }
+
+    /// Post-attention norms for every chunk token, then the router logits as
+    /// one token-batched dispatch.
+    private func encChunkRouterProbe(
+        _ enc: MTLComputeCommandEncoder, moeGate: GPULinear, fl: FastLayer, tokens n: Int
+    ) throws {
+        for t in 0..<n {
+            try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe, slot: prefillSlot(t))
+        }
+        barrier(enc)
+        try engine.encodeGemvBatch(
+            enc, moeGate, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(n, src: reg.xmoe, dst: reg.rout))
+    }
+
+    /// One layer's MoE for a whole chunk. Each routed projection encodes as
+    /// one token-batched dispatch per union expert covering every token
+    /// routed to it, and each shared projection as one dispatch covering the
+    /// whole chunk; outputs land in disjoint per-token slots so a stage runs
     /// fully in parallel, and each token's weighted accumulation uses the
     /// legacy pick order, keeping numerics identical to the token-major path.
     private func encodeChunkMoE(_ enc: MTLComputeCommandEncoder, _ pend: PendingChunkMoE) throws {
@@ -2090,36 +2151,39 @@ extension QwenMetalModel {
             return (st.gate.lin, st.up.lin, st.down.lin, expert)
         }
 
-        // Stage 1: routed gate/up grouped by expert, plus each token's shared
-        // gate/up and shared-gate logit.
+        // Stage 1: routed gate/up, one token-batched dispatch per (expert,
+        // projection); then the shared gate/up and shared-gate logit, each
+        // one dispatch covering every chunk token.
+        let S = pend.perToken.count
         for expert in pend.union {
             let lin = linears(for: expert)
-            for a in assignments[expert] ?? [] {
-                let slot = prefillSlot(a.t)
-                let K = pend.perToken[a.t].picks.count
-                try engine.encodeGemv(enc, lin.g, rows: inter,
-                    wExtra: lin.e * (moe.stacks?.gate.wStride ?? 0),
-                    sExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
-                    bExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
-                    x: slot.scratch, xOff: slot.base + reg.xmoe,
-                    y: slot.scratch, yOff: slot.base + reg.exp + a.ki * inter)
-                try engine.encodeGemv(enc, lin.u, rows: inter,
-                    wExtra: lin.e * (moe.stacks?.up.wStride ?? 0),
-                    sExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
-                    bExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
-                    x: slot.scratch, xOff: slot.base + reg.xmoe,
-                    y: slot.scratch, yOff: slot.base + reg.exp + K * inter + a.ki * inter)
-            }
+            let assigned = assignments[expert] ?? []
+            try engine.encodeGemvBatch(enc, lin.g, rows: inter,
+                wExtra: lin.e * (moe.stacks?.gate.wStride ?? 0),
+                sExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                bExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: assigned.map { a in
+                    (xOff: a.t * reg.total + reg.xmoe,
+                     yOff: a.t * reg.total + reg.exp + a.ki * inter)
+                })
+            try engine.encodeGemvBatch(enc, lin.u, rows: inter,
+                wExtra: lin.e * (moe.stacks?.up.wStride ?? 0),
+                sExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                bExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: assigned.map { a in
+                    let K = pend.perToken[a.t].picks.count
+                    return (xOff: a.t * reg.total + reg.xmoe,
+                            yOff: a.t * reg.total + reg.exp + K * inter + a.ki * inter)
+                })
         }
-        for t in 0..<pend.perToken.count {
-            let slot = prefillSlot(t)
-            try engine.encodeGemv(enc, moe.sharedGate, x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.sh)
-            try engine.encodeGemv(enc, moe.sharedUp, x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.sh + shInter)
-            try engine.encodeGemv(enc, fl.sharedGateLin, x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.shg)
-        }
+        try engine.encodeGemvBatch(enc, moe.sharedGate, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.xmoe, dst: reg.sh))
+        try engine.encodeGemvBatch(enc, moe.sharedUp, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.xmoe, dst: reg.sh + shInter))
+        try engine.encodeGemvBatch(enc, fl.sharedGateLin, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.xmoe, dst: reg.shg))
         barrier(enc)
 
         // Stage 2: silu(gate) * up for every (token, pick) and shared chain.
@@ -2138,26 +2202,23 @@ extension QwenMetalModel {
         }
         barrier(enc)
 
-        // Stage 3: down projections grouped by expert, plus shared down.
+        // Stage 3: down projections, one token-batched dispatch per union
+        // expert, plus the shared down covering every chunk token.
         for expert in pend.union {
             let lin = linears(for: expert)
-            for a in assignments[expert] ?? [] {
-                let slot = prefillSlot(a.t)
-                let K = pend.perToken[a.t].picks.count
-                try engine.encodeGemv(enc, lin.d, rows: D,
-                    wExtra: lin.e * (moe.stacks?.down.wStride ?? 0),
-                    sExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
-                    bExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
-                    x: slot.scratch, xOff: slot.base + reg.exp + 2 * K * inter + a.ki * inter,
-                    y: slot.scratch, yOff: slot.base + reg.dexp + a.ki * D)
-            }
+            try engine.encodeGemvBatch(enc, lin.d, rows: D,
+                wExtra: lin.e * (moe.stacks?.down.wStride ?? 0),
+                sExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                bExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: (assignments[expert] ?? []).map { a in
+                    let K = pend.perToken[a.t].picks.count
+                    return (xOff: a.t * reg.total + reg.exp + 2 * K * inter + a.ki * inter,
+                            yOff: a.t * reg.total + reg.dexp + a.ki * D)
+                })
         }
-        for t in 0..<pend.perToken.count {
-            let slot = prefillSlot(t)
-            try engine.encodeGemv(enc, moe.sharedDown,
-                x: slot.scratch, xOff: slot.base + reg.sh + 2 * shInter,
-                y: slot.scratch, yOff: slot.base + reg.sh + 3 * shInter)
-        }
+        try engine.encodeGemvBatch(enc, moe.sharedDown, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.sh + 2 * shInter, dst: reg.sh + 3 * shInter))
         barrier(enc)
 
         // Stage 4: weighted accumulation per token, legacy pick order.
