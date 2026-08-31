@@ -38,12 +38,21 @@ extension QwenMetalModel: InferenceModel {
 
 /// Engine-agnostic greedy generation loop shared by the CLI and server.
 public final class TextGenerator: @unchecked Sendable {
+    public enum Error: Swift.Error, Equatable, Sendable {
+        /// `generate` was called again from a synchronous callback made by an
+        /// active generation on this same generator.
+        case reentrantGeneration
+    }
+
     public let model: any InferenceModel
     public let eosTokens: Set<Int>
     /// Inference models own mutable decode/GPU scratch state. Keep every
     /// public generation entry point single-flight even when callers create
-    /// several token streams from the same generator concurrently.
-    private let generationLock = NSLock()
+    /// several token streams from the same generator concurrently. A recursive
+    /// call can reacquire this lock only long enough to reject the call instead
+    /// of deadlocking inside a public token callback.
+    private let generationLock = NSRecursiveLock()
+    private var generationInProgress = false
 
     public init(model: any InferenceModel) {
         self.model = model
@@ -132,7 +141,9 @@ public final class TextGenerator: @unchecked Sendable {
     }
 
     /// Cancellable form of `generate`. Any cancellation error invalidates the
-    /// method-local DecodeState, which is discarded while unwinding.
+    /// method-local DecodeState, which is discarded while unwinding. Concurrent
+    /// callers are serialized; a call made recursively from `onToken` throws
+    /// `Error.reentrantGeneration`.
     @discardableResult
     public func generate(
         promptIds: [Int],
@@ -141,7 +152,15 @@ public final class TextGenerator: @unchecked Sendable {
         onToken: (Int) -> Bool
     ) throws -> Stats {
         generationLock.lock()
-        defer { generationLock.unlock() }
+        if generationInProgress {
+            generationLock.unlock()
+            throw Error.reentrantGeneration
+        }
+        generationInProgress = true
+        defer {
+            generationInProgress = false
+            generationLock.unlock()
+        }
 
         // A stream can be cancelled while it waits behind another generation.
         // Observe that before allocating or passing any DecodeState to the
