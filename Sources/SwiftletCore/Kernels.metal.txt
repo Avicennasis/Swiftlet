@@ -566,9 +566,133 @@ kernel void attn_kv_append(
     rope_row(kDst, p.rot, p.position, p.theta, lane);
 }
 
-// Gated causal GQA attention for one query token over cache rows [0, kvLen):
-// out = sigmoid(gate) * softmax(q K^T / sqrt(hd)) V, online softmax in f32.
-// One simdgroup per query head; per-lane accumulators cover headDim <= 256.
+// Gated causal GQA attention core, shared by attn_decode_gqa and its
+// token-grid batch twin: out = sigmoid(gate) * softmax(q K^T / sqrt(hd)) V
+// over cache rows [0, kvLen), online softmax in f32 throughout. The KV loop
+// is tiled across ATTN_DECODE_SG simdgroups per (head, token): simdgroup g
+// scans rows g, g + SG, ... with its own running (max, sum, accumulator),
+// merged once at the end through threadgroup memory — each partial rescaled
+// by exp(m_g - M) against the global max, the same f32 correction the
+// online recurrence applies per row (a simdgroup whose row subset was empty
+// contributes exp(-inf - M) = 0). K/V rows are read as float4 when
+// headDim % 4 == 0 (cache rows are 16-byte aligned then; q is preloaded
+// into registers either way, so scratch offsets never need alignment); odd
+// head dims keep the lane-strided scalar loop. Per-lane accumulators and
+// the threadgroup tile cover headDim <= 256.
+#define ATTN_DECODE_SG 4
+
+inline void attn_decode_head(
+    device float *data,
+    device const float *kCache,
+    device const float *vCache,
+    uint kvHeads, uint headDim, uint kvLen,
+    uint qOff, uint gateOff, uint outOff, uint kvHead,
+    uint sg, uint lane,
+    threadgroup float *tgM, threadgroup float *tgS, threadgroup float4 *tgAcc)
+{
+    device const float *q = data + qOff;
+    const float scale = metal::rsqrt(float(headDim));
+    const bool vec = headDim % 4 == 0;
+    const uint hd4 = headDim / 4;
+
+    float m = -INFINITY;
+    float s = 0;
+    float4 acc4[2] = {float4(0.0f), float4(0.0f)};
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float4 q4[2] = {float4(0.0f), float4(0.0f)};
+    float qs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint cnt = 0;
+    if (vec) {
+        for (uint i = lane; i < hd4; i += 32) {
+            q4[cnt++] = float4(q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]);
+        }
+    } else {
+        for (uint i = lane; i < headDim; i += 32) qs[cnt++] = q[i];
+    }
+
+    for (uint sj = sg; sj < kvLen; sj += ATTN_DECODE_SG) {
+        const ulong row = (ulong(sj) * kvHeads + kvHead) * headDim;
+        float dot = 0;
+        if (vec) {
+            device const float4 *kr = (device const float4 *)(kCache + row);
+            cnt = 0;
+            for (uint i = lane; i < hd4; i += 32) dot += metal::dot(q4[cnt++], kr[i]);
+        } else {
+            device const float *kr = kCache + row;
+            cnt = 0;
+            for (uint i = lane; i < headDim; i += 32) dot += qs[cnt++] * kr[i];
+        }
+        dot = simd_sum(dot) * scale;
+        const float mNew = metal::max(m, dot);
+        const float corr = metal::exp(m - mNew);   // first row: exp(-inf) = 0
+        const float w = metal::exp(dot - mNew);
+        s = s * corr + w;
+        if (vec) {
+            device const float4 *vr = (device const float4 *)(vCache + row);
+            cnt = 0;
+            for (uint i = lane; i < hd4; i += 32) {
+                acc4[cnt] = acc4[cnt] * corr + w * vr[i];
+                ++cnt;
+            }
+        } else {
+            device const float *vr = vCache + row;
+            cnt = 0;
+            for (uint i = lane; i < headDim; i += 32) {
+                acc[cnt] = acc[cnt] * corr + w * vr[i];
+                ++cnt;
+            }
+        }
+        m = mNew;
+    }
+
+    if (lane == 0) {
+        tgM[sg] = m;
+        tgS[sg] = s;
+    }
+    threadgroup float *tgAccF = (threadgroup float *)tgAcc;
+    if (vec) {
+        cnt = 0;
+        for (uint i = lane; i < hd4; i += 32) tgAcc[sg * hd4 + i] = acc4[cnt++];
+    } else {
+        cnt = 0;
+        for (uint i = lane; i < headDim; i += 32) tgAccF[sg * headDim + i] = acc[cnt++];
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    float M = tgM[0];
+    for (uint g = 1; g < ATTN_DECODE_SG; ++g) M = metal::max(M, tgM[g]);
+    float sTot = 0;
+    for (uint g = 0; g < ATTN_DECODE_SG; ++g) sTot += tgS[g] * metal::exp(tgM[g] - M);
+    const float invS = 1.0f / sTot;
+    if (sg != 0) return;
+    device const float *gate = data + gateOff;
+    device float *out = data + outOff;
+    if (vec) {
+        for (uint i = lane; i < hd4; i += 32) {
+            float4 a = float4(0.0f);
+            for (uint g = 0; g < ATTN_DECODE_SG; ++g) {
+                a += tgAcc[g * hd4 + i] * metal::exp(tgM[g] - M);
+            }
+            for (uint j = 0; j < 4; ++j) {
+                const float gv = gate[4 * i + j];
+                out[4 * i + j] = a[j] * invS * (1.0f / (1.0f + metal::exp(-gv)));
+            }
+        }
+    } else {
+        for (uint i = lane; i < headDim; i += 32) {
+            float a = 0;
+            for (uint g = 0; g < ATTN_DECODE_SG; ++g) {
+                a += tgAccF[g * headDim + i] * metal::exp(tgM[g] - M);
+            }
+            const float gv = gate[i];
+            out[i] = a * invS * (1.0f / (1.0f + metal::exp(-gv)));
+        }
+    }
+}
+
+// Gated causal GQA attention for one query token over cache rows [0, kvLen),
+// via the tiled core above. One threadgroup of ATTN_DECODE_SG simdgroups
+// per query head; headDim <= 256.
 struct AttnDecodeParams {
     uint heads;
     uint kvHeads;
@@ -585,43 +709,21 @@ kernel void attn_decode_gqa(
     device const float *vCache [[buffer(2)]],
     constant AttnDecodeParams &p [[buffer(3)]],
     uint2 tpg [[thread_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
+    threadgroup float tgM[ATTN_DECODE_SG];
+    threadgroup float tgS[ATTN_DECODE_SG];
+    threadgroup float4 tgAcc[ATTN_DECODE_SG * 64];
     const uint head = tpg.y;
     if (head >= p.heads) return;
-    const uint kvHead = head / (p.heads / p.kvHeads);
-    device const float *q = data + p.qOff + head * p.headDim;
-    const float scale = metal::rsqrt(float(p.headDim));
-    float m = -INFINITY;
-    float s = 0;
-    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    for (uint sj = 0; sj < p.kvLen; ++sj) {
-        const ulong row = (ulong(sj) * p.kvHeads + kvHead) * p.headDim;
-        device const float *kr = kCache + row;
-        float dot = 0;
-        for (uint i = lane; i < p.headDim; i += 32) dot += q[i] * kr[i];
-        dot = simd_sum(dot) * scale;
-        const float mNew = metal::max(m, dot);
-        const float corr = metal::exp(m - mNew);   // first row: exp(-inf) = 0
-        const float w = metal::exp(dot - mNew);
-        s = s * corr + w;
-        device const float *vr = vCache + row;
-        uint cnt = 0;
-        for (uint i = lane; i < p.headDim; i += 32) {
-            acc[cnt] = acc[cnt] * corr + w * vr[i];
-            ++cnt;
-        }
-        m = mNew;
-    }
-    const float invS = 1.0f / s;
-    device const float *gate = data + p.qoutOff + head * 2 * p.headDim + p.headDim;
-    device float *out = data + p.outOff + head * p.headDim;
-    uint cnt = 0;
-    for (uint i = lane; i < p.headDim; i += 32) {
-        float gv = gate[i];
-        out[i] = acc[cnt] * invS * (1.0f / (1.0f + metal::exp(-gv)));
-        ++cnt;
-    }
+    attn_decode_head(
+        data, kCache, vCache, p.kvHeads, p.headDim, p.kvLen,
+        p.qOff + head * p.headDim,
+        p.qoutOff + head * 2 * p.headDim + p.headDim,
+        p.outOff + head * p.headDim,
+        head / (p.heads / p.kvHeads),
+        sg, lane, tgM, tgS, tgAcc);
 }
 
 // ===== Small glue kernels so a token needs few command buffers. =====
@@ -1024,7 +1126,8 @@ kernel void attn_kv_append_batch(
 // [0, position + t + 1) — the causal kvLen derived from the token grid, so
 // one dispatch covers the whole chunk once every KV append has landed
 // (callers barrier between the appends and this). Per-token arithmetic is
-// the single-token kernel's verbatim. One simdgroup per (head, token).
+// the single-token kernel's verbatim: both run the tiled attn_decode_head
+// core. One threadgroup of ATTN_DECODE_SG simdgroups per (head, token).
 struct AttnDecodeBatchParams {
     uint heads;
     uint kvHeads;
@@ -1042,46 +1145,22 @@ kernel void attn_decode_gqa_batch(
     device const float *vCache [[buffer(2)]],
     constant AttnDecodeBatchParams &p [[buffer(3)]],
     uint3 tpg [[thread_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
+    threadgroup float tgM[ATTN_DECODE_SG];
+    threadgroup float tgS[ATTN_DECODE_SG];
+    threadgroup float4 tgAcc[ATTN_DECODE_SG * 64];
     const uint head = tpg.y;
     if (head >= p.heads) return;
-    const uint t = tpg.z;
-    const uint b = t * p.stride;
-    const uint kvLen = p.position + t + 1;
-    const uint kvHead = head / (p.heads / p.kvHeads);
-    device const float *q = data + p.qOff + b + head * p.headDim;
-    const float scale = metal::rsqrt(float(p.headDim));
-    float m = -INFINITY;
-    float s = 0;
-    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    for (uint sj = 0; sj < kvLen; ++sj) {
-        const ulong row = (ulong(sj) * p.kvHeads + kvHead) * p.headDim;
-        device const float *kr = kCache + row;
-        float dot = 0;
-        for (uint i = lane; i < p.headDim; i += 32) dot += q[i] * kr[i];
-        dot = simd_sum(dot) * scale;
-        const float mNew = metal::max(m, dot);
-        const float corr = metal::exp(m - mNew);   // first row: exp(-inf) = 0
-        const float w = metal::exp(dot - mNew);
-        s = s * corr + w;
-        device const float *vr = vCache + row;
-        uint cnt = 0;
-        for (uint i = lane; i < p.headDim; i += 32) {
-            acc[cnt] = acc[cnt] * corr + w * vr[i];
-            ++cnt;
-        }
-        m = mNew;
-    }
-    const float invS = 1.0f / s;
-    device const float *gate = data + p.qoutOff + b + head * 2 * p.headDim + p.headDim;
-    device float *out = data + p.outOff + b + head * p.headDim;
-    uint cnt = 0;
-    for (uint i = lane; i < p.headDim; i += 32) {
-        float gv = gate[i];
-        out[i] = acc[cnt] * invS * (1.0f / (1.0f + metal::exp(-gv)));
-        ++cnt;
-    }
+    const uint b = tpg.z * p.stride;
+    attn_decode_head(
+        data, kCache, vCache, p.kvHeads, p.headDim, p.position + tpg.z + 1,
+        p.qOff + b + head * p.headDim,
+        p.qoutOff + b + head * 2 * p.headDim + p.headDim,
+        p.outOff + b + head * p.headDim,
+        head / (p.heads / p.kvHeads),
+        sg, lane, tgM, tgS, tgAcc);
 }
 
 // delta_pre over n token slots: slot t adds t*stride to every offset;

@@ -635,7 +635,8 @@ public final class MetalEngine {
     /// stride over cache rows [0, basePosition + t + 1) — the causal kvLen
     /// derived in-kernel from the token grid. Callers must barrier between
     /// the chunk's KV appends and this dispatch, because the youngest token
-    /// reads every appended row. One simdgroup per (head, token).
+    /// reads every appended row. One threadgroup of `attnDecodeSimdgroups`
+    /// simdgroups per (head, token), tiled across the KV rows.
     func encodeAttnDecodeBatch(
         _ enc: MTLComputeCommandEncoder, data: MTLBuffer,
         kCache: MTLBuffer, vCache: MTLBuffer,
@@ -653,9 +654,10 @@ public final class MetalEngine {
         enc.setBuffer(kCache, offset: 0, index: 1)
         enc.setBuffer(vCache, offset: 0, index: 2)
         enc.setBytes(&p, length: MemoryLayout<AttnDecodeBatchParams>.stride, index: 3)
+        let width = 32 * Self.attnDecodeSimdgroups
         dispatchThreads(
-            enc, threads: MTLSize(width: 32, height: heads, depth: tokens),
-            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+            enc, threads: MTLSize(width: width, height: heads, depth: tokens),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
         )
     }
 
@@ -985,11 +987,18 @@ public final class MetalEngine {
         )
     }
 
+    /// Simdgroups cooperating on one (head, token) in the causal attends,
+    /// each scanning a strided subset of the KV rows with its own online
+    /// softmax, merged in-threadgroup. Must match ATTN_DECODE_SG in
+    /// Kernels.metal.txt.
+    static let attnDecodeSimdgroups = 4
+
     /// Gated causal GQA attention for one query token over cache rows
     /// [0, kvLen): out = sigmoid(gate) * softmax(qK^T/sqrt(hd)) V, with the
     /// online-softmax running max/sum in f32. Prepped q at `qOff`, the gate
     /// half read from the raw projection at `qoutOff`, gated context written
-    /// to `outOff`. One simdgroup per query head; headDim <= 256.
+    /// to `outOff`. One threadgroup of `attnDecodeSimdgroups` simdgroups
+    /// per query head, tiled across the KV rows; headDim <= 256.
     func encodeAttnDecode(
         _ enc: MTLComputeCommandEncoder, data: MTLBuffer,
         kCache: MTLBuffer, vCache: MTLBuffer,
@@ -1007,9 +1016,10 @@ public final class MetalEngine {
         enc.setBuffer(kCache, offset: 0, index: 1)
         enc.setBuffer(vCache, offset: 0, index: 2)
         enc.setBytes(&p, length: MemoryLayout<AttnDecodeParams>.stride, index: 3)
+        let width = 32 * Self.attnDecodeSimdgroups
         dispatchThreads(
-            enc, threads: MTLSize(width: 32, height: heads, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+            enc, threads: MTLSize(width: width, height: heads, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
         )
     }
 
