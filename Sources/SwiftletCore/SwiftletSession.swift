@@ -64,7 +64,10 @@ public final class SwiftletSession: @unchecked Sendable {
     public let config: QwenConfig
     private let model: any InferenceModel
     private let generator: TextGenerator
-    private let tokenizer: Tokenizer
+    private let encodeText: (String) -> [Int]
+    private let decodeTokens: ([Int]) -> String
+    private let renderMessages: ([[String: String]]) throws -> [Int]
+    private let generationCleanupHook: (() -> Void)?
     private let metricsLock = NSLock()
     private var _lastMetrics = Metrics()
     /// True when running on the Metal engine (vs the CPU reference fallback).
@@ -82,7 +85,11 @@ public final class SwiftletSession: @unchecked Sendable {
     public init(modelDir: URL, retainAllLayers: Bool = false, cacheBudgetGB: Double = 2) async throws {
         self.modelDir = modelDir
         print("[SwiftletSession] loading tokenizer...")
-        tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+        let tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+        encodeText = { tokenizer.encode(text: $0) }
+        decodeTokens = { tokenizer.decode(tokens: $0) }
+        renderMessages = { try tokenizer.applyChatTemplate(messages: $0) }
+        generationCleanupHook = nil
         print("[SwiftletSession] tokenizer ok; building Metal model...")
         if let gpu = try? QwenMetalModel(modelDir: modelDir, cacheBudgetGB: cacheBudgetGB) {
             model = gpu
@@ -128,6 +135,31 @@ public final class SwiftletSession: @unchecked Sendable {
             && Array(probe.suffix(thinkOpen.count)) == thinkOpen
     }
 
+    /// Dependency-injected construction for deterministic session-boundary
+    /// tests. Production callers use the async model/tokenizer initializer.
+    init(
+        testingModel model: any InferenceModel,
+        modelDir: URL,
+        encodeText: @escaping (String) -> [Int],
+        decodeTokens: @escaping ([Int]) -> String,
+        renderMessages: @escaping ([[String: String]]) throws -> [Int],
+        suppressedIds: Set<Int> = [],
+        usesThinkPrompt: Bool = false,
+        generationCleanupHook: (() -> Void)? = nil
+    ) {
+        self.modelDir = modelDir
+        self.model = model
+        self.config = model.config
+        self.generator = TextGenerator(model: model)
+        self.usesGPU = model is QwenMetalModel
+        self.encodeText = encodeText
+        self.decodeTokens = decodeTokens
+        self.renderMessages = renderMessages
+        self.suppressedIds = suppressedIds
+        self.usesThinkPrompt = usesThinkPrompt
+        self.generationCleanupHook = generationCleanupHook
+    }
+
     private let suppressedIds: Set<Int>
     private let usesThinkPrompt: Bool
 
@@ -144,7 +176,16 @@ public final class SwiftletSession: @unchecked Sendable {
     private var statePrimed = false
 
     /// Drops the cached conversation (e.g. when the user starts a new chat).
+    /// A reset requested during generation is ordered after that request so
+    /// it cannot replace DecodeState while the model is using it.
     public func resetConversation() {
+        generationQueue.sync {
+            resetConversationState()
+        }
+    }
+
+    /// The queue-confined form used by streamChat itself.
+    private func resetConversationState() {
         convState = QwenCPUModel.DecodeState()
         lastMessages = []
         lastReplyText = ""
@@ -159,6 +200,11 @@ public final class SwiftletSession: @unchecked Sendable {
     private let genLock = NSLock()
     private var generationActive = false
     private var pendingShrinkGB: Double?
+    /// Conversation state and the underlying model are both mutable. This is
+    /// the session's single-flight boundary for every public streamChat call.
+    private let generationQueue = DispatchQueue(
+        label: "swiftlet.session.generation", qos: .userInitiated
+    )
 
     /// Frees most of the expert cache in response to OS memory pressure; it
     /// refills lazily as generation continues. Safe to call from any thread.
@@ -188,6 +234,34 @@ public final class SwiftletSession: @unchecked Sendable {
         }
     }
 
+    private func beginGeneration() {
+        genLock.lock()
+        generationActive = true
+        genLock.unlock()
+    }
+
+    /// Completes all shared lifecycle cleanup before the stream continuation
+    /// is finished. Otherwise a waiting consumer can enqueue the next request
+    /// while the preceding request still advertises stale active/shrink state.
+    private func endGeneration() {
+        // Keep advertising an active generation until every deferred shrink
+        // has drained. A warning racing one shrink therefore queues another
+        // pass instead of invoking shrinkCache concurrently.
+        while true {
+            genLock.lock()
+            guard let gb = pendingShrinkGB else {
+                generationActive = false
+                genLock.unlock()
+                break
+            }
+            pendingShrinkGB = nil
+            genLock.unlock()
+            (model as? QwenMetalModel)?.shrinkCache(toGB: gb)
+            print("[SwiftletSession] deferred cache shrink applied")
+        }
+        generationCleanupHook?()
+    }
+
     /// Full prompt for a fresh conversation, with reasoning disabled: the
     /// Qwen3.6 template ends the generation prompt with "<think>\n", which
     /// makes the model reason in the open — and since the literal <think>
@@ -195,13 +269,13 @@ public final class SwiftletSession: @unchecked Sendable {
     /// Appending the rest of an empty think block reproduces the template's
     /// own enable_thinking=false rendering byte for byte.
     private func freshPromptIds(_ messages: [[String: String]]) throws -> [Int] {
-        var ids = try tokenizer.applyChatTemplate(messages: messages)
+        var ids = try renderMessages(messages)
         // Compare token ids, not decoded text — decode can normalize or skip
         // special tokens and silently defeat a string comparison.
         if usesThinkPrompt {
-            let thinkOpen = tokenizer.encode(text: "<think>\n")
+            let thinkOpen = encodeText("<think>\n")
             if ids.count >= thinkOpen.count, Array(ids.suffix(thinkOpen.count)) == thinkOpen {
-                ids += tokenizer.encode(text: "\n</think>\n\n")
+                ids += encodeText("\n</think>\n\n")
             }
         }
         return ids
@@ -229,7 +303,7 @@ public final class SwiftletSession: @unchecked Sendable {
         let turn = "<|im_end|>\n<|im_start|>user\n" + (newUser["content"] ?? "")
             + "<|im_end|>\n<|im_start|>assistant\n"
             + (usesThinkPrompt ? "<think>\n\n</think>\n\n" : "")
-        return tokenizer.encode(text: turn)
+        return encodeText(turn)
     }
 
     /// Drops the replacement characters an incomplete trailing multi-byte
@@ -339,15 +413,16 @@ public final class SwiftletSession: @unchecked Sendable {
             continuation.onTermination = { termination in
                 if case .cancelled = termination { control.cancel() }
             }
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.genLock.lock()
-                self.generationActive = true
-                self.genLock.unlock()
+            self.generationQueue.async {
+                self.beginGeneration()
+                var terminalError: Swift.Error?
                 defer {
-                    self.genLock.lock()
-                    self.generationActive = false
-                    self.genLock.unlock()
-                    self.applyPendingShrink()
+                    self.endGeneration()
+                    if let terminalError {
+                        continuation.finish(throwing: terminalError)
+                    } else {
+                        continuation.finish()
+                    }
                 }
                 do {
                     // A server request can be cancelled while waiting behind
@@ -357,7 +432,6 @@ public final class SwiftletSession: @unchecked Sendable {
                     // the preceding request.
                     if control.isCancelled {
                         self.storeMetrics(Metrics(finishReason: .cancelled))
-                        continuation.finish()
                         return
                     }
 
@@ -365,7 +439,7 @@ public final class SwiftletSession: @unchecked Sendable {
                     if let delta = self.continuationIds(messages) {
                         suffix = delta
                     } else {
-                        self.resetConversation()
+                        self.resetConversationState()
                         suffix = try self.freshPromptIds(messages)
                     }
 
@@ -426,7 +500,7 @@ public final class SwiftletSession: @unchecked Sendable {
                             // token boundaries. The filter also owns the UTF-8
                             // and potential-stop-prefix hold-back.
                             let update = stopFilter.consume(
-                                decoded: self.tokenizer.decode(tokens: generated)
+                                decoded: self.decodeTokens(generated)
                             )
                             guard update.isConsistent else {
                                 throw GenerationInterruption.invalidTextStream
@@ -465,7 +539,7 @@ public final class SwiftletSession: @unchecked Sendable {
                     // not release anything further.
                     if finishReason != .cancelled, !matchedTextStop {
                         let finalUpdate = stopFilter.finishUpdate(
-                            decoded: self.tokenizer.decode(tokens: generated)
+                            decoded: self.decodeTokens(generated)
                         )
                         guard finalUpdate.isConsistent else {
                             throw GenerationInterruption.invalidTextStream
@@ -499,7 +573,7 @@ public final class SwiftletSession: @unchecked Sendable {
                         self.lastReplyText = stopFilter.output
                         self.statePrimed = true
                     } else {
-                        self.resetConversation()
+                        self.resetConversationState()
                     }
 
                     self.storeMetrics(Metrics(
@@ -509,10 +583,9 @@ public final class SwiftletSession: @unchecked Sendable {
                         tokensPerSecond: decodeSeconds > 0 ? Double(generated.count) / decodeSeconds : 0,
                         finishReason: finishReason
                     ))
-                    continuation.finish()
                 } catch {
-                    self.resetConversation()
-                    continuation.finish(throwing: error)
+                    self.resetConversationState()
+                    terminalError = error
                 }
             }
         }
