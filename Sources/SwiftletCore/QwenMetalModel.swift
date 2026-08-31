@@ -1341,13 +1341,6 @@ extension QwenMetalModel {
             count: n))
     }
 
-    private func writeSlot(_ slot: TokenSlot, _ off: Int, _ v: [Float]) {
-        v.withUnsafeBufferPointer {
-            slot.scratch.contents().advanced(by: (slot.base + off) * 4)
-                .copyMemory(from: $0.baseAddress!, byteCount: v.count * 4)
-        }
-    }
-
     private func resetGPUState() {
         for fl in fastLayers {
             if let h = fl.hist { memset(h.contents(), 0, h.length) }
