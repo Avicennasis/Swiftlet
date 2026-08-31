@@ -976,6 +976,71 @@ kernel void attn_kv_append_batch(
     rope_row(kDst, p.rot, p.position + t, p.theta, lane);
 }
 
+// attn_decode_gqa over n tokens: token t reads its prepped q and gate rows
+// inside its own slot stride and attends over cache rows
+// [0, position + t + 1) — the causal kvLen derived from the token grid, so
+// one dispatch covers the whole chunk once every KV append has landed
+// (callers barrier between the appends and this). Per-token arithmetic is
+// the single-token kernel's verbatim. One simdgroup per (head, token).
+struct AttnDecodeBatchParams {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint position;  // base; token t attends over position + t + 1 rows
+    uint qOff;      // prepped q rows (head * headDim)
+    uint qoutOff;   // raw interleaved projection; gate at head*2*hd + hd
+    uint outOff;    // gated context rows (head * headDim)
+    uint stride;
+};
+
+kernel void attn_decode_gqa_batch(
+    device float       *data   [[buffer(0)]],
+    device const float *kCache [[buffer(1)]],
+    device const float *vCache [[buffer(2)]],
+    constant AttnDecodeBatchParams &p [[buffer(3)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    const uint t = tpg.z;
+    const uint b = t * p.stride;
+    const uint kvLen = p.position + t + 1;
+    const uint kvHead = head / (p.heads / p.kvHeads);
+    device const float *q = data + p.qOff + b + head * p.headDim;
+    const float scale = metal::rsqrt(float(p.headDim));
+    float m = -INFINITY;
+    float s = 0;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint sj = 0; sj < kvLen; ++sj) {
+        const ulong row = (ulong(sj) * p.kvHeads + kvHead) * p.headDim;
+        device const float *kr = kCache + row;
+        float dot = 0;
+        for (uint i = lane; i < p.headDim; i += 32) dot += q[i] * kr[i];
+        dot = simd_sum(dot) * scale;
+        const float mNew = metal::max(m, dot);
+        const float corr = metal::exp(m - mNew);   // first row: exp(-inf) = 0
+        const float w = metal::exp(dot - mNew);
+        s = s * corr + w;
+        device const float *vr = vCache + row;
+        uint cnt = 0;
+        for (uint i = lane; i < p.headDim; i += 32) {
+            acc[cnt] = acc[cnt] * corr + w * vr[i];
+            ++cnt;
+        }
+        m = mNew;
+    }
+    const float invS = 1.0f / s;
+    device const float *gate = data + p.qoutOff + b + head * 2 * p.headDim + p.headDim;
+    device float *out = data + p.outOff + b + head * p.headDim;
+    uint cnt = 0;
+    for (uint i = lane; i < p.headDim; i += 32) {
+        float gv = gate[i];
+        out[i] = acc[cnt] * invS * (1.0f / (1.0f + metal::exp(-gv)));
+        ++cnt;
+    }
+}
+
 // ===== S1b chunked DeltaNet staging: pack every chunk token's normed
 // q/k/v conv rows and g/beta pairs from slot-strided regions into the
 // contiguous [T, row] blocks gated_delta_step's T-step scan expects. Pure

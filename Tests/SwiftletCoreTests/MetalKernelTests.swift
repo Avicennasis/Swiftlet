@@ -565,6 +565,47 @@ import Testing
         Self.expectBitwise(perToken.data, batched.data, tokens * stride, "attn_kv_append data")
     }
 
+    /// attn_decode_gqa_batch: per-token causal attends at ascending kvLens
+    /// vs one batched dispatch whose kernel derives token t's kvLen from
+    /// basePosition + the token grid slot, bitwise over the whole slotted
+    /// scratch. headDim 64 exercises multi-register accumulators.
+    @Test func attnDecodeBatchMatchesPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        let heads = 4, kvHeads = 2, headDim = 64, tokens = 3, basePosition = 5
+        let qoutOff = 3
+        let qOff = qoutOff + heads * 2 * headDim + 7
+        let outOff = qOff + heads * headDim + 5
+        let stride = outOff + heads * headDim + 9
+        let cacheFloats = (basePosition + tokens) * kvHeads * headDim
+        var rng = Rand(83)
+        let src = (0..<tokens * stride).map { _ in rng.float() }
+        let kBuf = engine.makeBuffer((0..<cacheFloats).map { _ in rng.float() })
+        let vBuf = engine.makeBuffer((0..<cacheFloats).map { _ in rng.float() })
+
+        let bufA = engine.makeBuffer(src)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                try engine.encodeAttnDecode(
+                    enc, data: bufA, kCache: kBuf, vCache: vBuf,
+                    heads: heads, kvHeads: kvHeads, headDim: headDim,
+                    kvLen: basePosition + t + 1,
+                    qOff: qOff + t * stride, qoutOff: qoutOff + t * stride,
+                    outOff: outOff + t * stride)
+            }
+        }
+        let bufB = engine.makeBuffer(src)
+        let batched = try Self.runEncoded(engine) { enc in
+            try engine.encodeAttnDecodeBatch(
+                enc, data: bufB, kCache: kBuf, vCache: vBuf,
+                heads: heads, kvHeads: kvHeads, headDim: headDim,
+                basePosition: basePosition, qOff: qOff, qoutOff: qoutOff,
+                outOff: outOff, slotStride: stride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "attn_decode: per-token dispatch count")
+        #expect(batched == 1, "attn_decode: batched dispatch count")
+        Self.expectBitwise(bufA, bufB, tokens * stride, "attn_decode")
+    }
+
     // MARK: - S1b chunked DeltaNet recurrence (T-step scan)
 
     /// gated_delta_step's T parameter is a sequential in-dispatch scan: one

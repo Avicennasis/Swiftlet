@@ -620,6 +620,45 @@ public final class MetalEngine {
         )
     }
 
+    struct AttnDecodeBatchParams {
+        var heads: UInt32
+        var kvHeads: UInt32
+        var headDim: UInt32
+        var position: UInt32
+        var qOff: UInt32
+        var qoutOff: UInt32
+        var outOff: UInt32
+        var stride: UInt32
+    }
+
+    /// attn_decode_gqa over `tokens`: token t attends inside its own slot
+    /// stride over cache rows [0, basePosition + t + 1) — the causal kvLen
+    /// derived in-kernel from the token grid. Callers must barrier between
+    /// the chunk's KV appends and this dispatch, because the youngest token
+    /// reads every appended row. One simdgroup per (head, token).
+    func encodeAttnDecodeBatch(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer,
+        kCache: MTLBuffer, vCache: MTLBuffer,
+        heads: Int, kvHeads: Int, headDim: Int, basePosition: Int,
+        qOff: Int, qoutOff: Int, outOff: Int, slotStride: Int, tokens: Int
+    ) throws {
+        precondition(headDim <= 256, "attn_decode_gqa accumulators cover headDim <= 256")
+        enc.setComputePipelineState(try pipeline("attn_decode_gqa_batch"))
+        var p = AttnDecodeBatchParams(
+            heads: UInt32(heads), kvHeads: UInt32(kvHeads), headDim: UInt32(headDim),
+            position: UInt32(basePosition), qOff: UInt32(qOff),
+            qoutOff: UInt32(qoutOff), outOff: UInt32(outOff), stride: UInt32(slotStride)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(kCache, offset: 0, index: 1)
+        enc.setBuffer(vCache, offset: 0, index: 2)
+        enc.setBytes(&p, length: MemoryLayout<AttnDecodeBatchParams>.stride, index: 3)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: heads, depth: tokens),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
     struct DeltaGatherParams {
         var keyDim: UInt32
         var valueDim: UInt32
