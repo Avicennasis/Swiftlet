@@ -363,6 +363,120 @@ public final class MetalEngine {
         ))
     }
 
+    // MARK: - Full-attention kernels (S2)
+
+    struct AttnPrepParams {
+        var heads: UInt32
+        var headDim: UInt32
+        var rot: UInt32
+        var eps: Float
+        var theta: Float
+        var position: UInt32
+        var srcOff: UInt32
+        var dstOff: UInt32
+    }
+
+    struct AttnKVParams {
+        var kvHeads: UInt32
+        var headDim: UInt32
+        var rot: UInt32
+        var eps: Float
+        var theta: Float
+        var position: UInt32
+        var kSrcOff: UInt32
+        var vSrcOff: UInt32
+    }
+
+    struct AttnDecodeParams {
+        var heads: UInt32
+        var kvHeads: UInt32
+        var headDim: UInt32
+        var kvLen: UInt32
+        var qOff: UInt32
+        var qoutOff: UInt32
+        var outOff: UInt32
+    }
+
+    /// Extract each head's query from the interleaved q|gate projection at
+    /// `srcOff` (floats, per head [q(hd) | gate(hd)]), RMSNorm it with
+    /// `weight`, apply partial RoPE for `position`, and write flat rows at
+    /// `dstOff`. The gate half stays untouched at `srcOff` for the attention
+    /// kernel. One simdgroup per head.
+    func encodeAttnQPrep(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer, weight: MTLBuffer,
+        heads: Int, headDim: Int, rotaryDims: Int, eps: Float, ropeTheta: Float,
+        position: Int, srcOff: Int, dstOff: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("attn_q_prep"))
+        var p = AttnPrepParams(
+            heads: UInt32(heads), headDim: UInt32(headDim), rot: UInt32(rotaryDims),
+            eps: eps, theta: ropeTheta, position: UInt32(position),
+            srcOff: UInt32(srcOff), dstOff: UInt32(dstOff)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(weight, offset: 0, index: 1)
+        enc.setBytes(&p, length: MemoryLayout<AttnPrepParams>.stride, index: 2)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: heads, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
+    /// Append one position's K/V rows to the caches at row index `position`
+    /// (layout [position][kvHead][headDim], matching the CPU reference): K is
+    /// RMSNormed with `weight` and roped, V copies verbatim. One simdgroup
+    /// per kv head.
+    func encodeAttnKVAppend(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer, weight: MTLBuffer,
+        kCache: MTLBuffer, vCache: MTLBuffer,
+        kvHeads: Int, headDim: Int, rotaryDims: Int, eps: Float, ropeTheta: Float,
+        position: Int, kSrcOff: Int, vSrcOff: Int
+    ) throws {
+        enc.setComputePipelineState(try pipeline("attn_kv_append"))
+        var p = AttnKVParams(
+            kvHeads: UInt32(kvHeads), headDim: UInt32(headDim), rot: UInt32(rotaryDims),
+            eps: eps, theta: ropeTheta, position: UInt32(position),
+            kSrcOff: UInt32(kSrcOff), vSrcOff: UInt32(vSrcOff)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(weight, offset: 0, index: 1)
+        enc.setBuffer(kCache, offset: 0, index: 2)
+        enc.setBuffer(vCache, offset: 0, index: 3)
+        enc.setBytes(&p, length: MemoryLayout<AttnKVParams>.stride, index: 4)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: kvHeads, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
+    /// Gated causal GQA attention for one query token over cache rows
+    /// [0, kvLen): out = sigmoid(gate) * softmax(qK^T/sqrt(hd)) V, with the
+    /// online-softmax running max/sum in f32. Prepped q at `qOff`, the gate
+    /// half read from the raw projection at `qoutOff`, gated context written
+    /// to `outOff`. One simdgroup per query head; headDim <= 256.
+    func encodeAttnDecode(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer,
+        kCache: MTLBuffer, vCache: MTLBuffer,
+        heads: Int, kvHeads: Int, headDim: Int, kvLen: Int,
+        qOff: Int, qoutOff: Int, outOff: Int
+    ) throws {
+        precondition(headDim <= 256, "attn_decode_gqa accumulators cover headDim <= 256")
+        enc.setComputePipelineState(try pipeline("attn_decode_gqa"))
+        var p = AttnDecodeParams(
+            heads: UInt32(heads), kvHeads: UInt32(kvHeads), headDim: UInt32(headDim),
+            kvLen: UInt32(kvLen), qOff: UInt32(qOff), qoutOff: UInt32(qoutOff),
+            outOff: UInt32(outOff)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(kCache, offset: 0, index: 1)
+        enc.setBuffer(vCache, offset: 0, index: 2)
+        enc.setBytes(&p, length: MemoryLayout<AttnDecodeParams>.stride, index: 3)
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: heads, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
     struct DeltaParams {
         var T: UInt32
         var Hk: UInt32
