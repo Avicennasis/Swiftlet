@@ -7,8 +7,60 @@ import Metal
 /// delta recurrence, attention softmax over cached KV, top-k routing), all of
 /// it microseconds per token. Numerics mirror QwenCPUModel exactly.
 public final class QwenMetalModel {
-    /// S3a whole-step aggregate baseline. These totals do not identify phases,
-    /// layer costs, overlap, or command-buffer timeline gaps.
+    /// S3b command-buffer phase labels. A label names the work a phase scope
+    /// encoded; it claims nothing about when the GPU actually ran that work.
+    public enum StepPhase: String, CaseIterable, Sendable {
+        /// Attention norm + q/k/v projections, output projection, residual add.
+        case attention
+        /// DeltaNet mixer: projections, conv step, recurrence, gated norm,
+        /// output projection, residual add.
+        case delta
+        /// Routed expert GEMVs plus the shared-expert chain and accumulation.
+        case moe
+        /// Pre-MoE norm and the router logits projection.
+        case router
+        /// Final norm and vocabulary projection.
+        case lmHead
+        /// Dispatches encoded outside every labeled scope (must stay empty).
+        case other
+    }
+
+    /// One committed command buffer, in commit order. Encode time and
+    /// dispatch counts are attributed to phases exactly (encoding is CPU work
+    /// under our control); blocking-wait and GPU time exist only at
+    /// command-buffer granularity, so a buffer spanning several phases cannot
+    /// split them per phase.
+    public struct CommandBufferSample: Equatable, Sendable {
+        /// Compute dispatches encoded into this buffer, per phase.
+        public let phaseDispatches: [StepPhase: Int]
+        /// CPU wall time inside each phase's encode scope for this buffer.
+        public let phaseEncodeSeconds: [StepPhase: Double]
+        /// CPU wall time from encoder creation to commit (>= the phase sum).
+        public let encodeSeconds: Double
+        /// Wall time inside this buffer's waitUntilCompleted call.
+        public let waitSeconds: Double
+        /// GPU start-to-end duration; nil when the buffer failed or reported
+        /// invalid timestamps. Not proof of exclusive GPU occupancy.
+        public let gpuSeconds: Double?
+        /// Whether status was .completed after the blocking wait.
+        public let completed: Bool
+
+        /// Phases encoded into this buffer, in declaration order (a canonical
+        /// label, not the encode order within the buffer).
+        public var phases: [StepPhase] {
+            StepPhase.allCases.filter {
+                phaseDispatches[$0] != nil || phaseEncodeSeconds[$0] != nil
+            }
+        }
+
+        public var dispatchesEncoded: Int { phaseDispatches.values.reduce(0, +) }
+    }
+
+    /// S3a whole-step aggregates plus the S3b committed-buffer timeline.
+    /// The aggregates still cannot identify overlap; the timeline labels each
+    /// buffer's encoded phases and reports per-buffer encode/wait/GPU cost,
+    /// but it is not an Instruments trace: it cannot see gaps between buffers
+    /// or split a multi-phase buffer's wait/GPU time by phase.
     public struct StepMetrics: Equatable, Sendable {
         public let tokensProcessed: Int
         public let logitProjections: Int
@@ -28,6 +80,16 @@ public final class QwenMetalModel {
         public let gpuUntimedCommandBuffers: Int
         /// False when step exited by throwing after publishing partial counters.
         public let completedWithoutThrow: Bool
+        /// S3b: committed command buffers in commit order. A throwing step's
+        /// never-committed encodes are absent here but still counted in
+        /// computeDispatchesEncoded and the phase totals below.
+        public let commandBufferTimeline: [CommandBufferSample]
+        /// Encode-side dispatch totals per phase, including partial work from
+        /// a buffer the step never committed before throwing.
+        public let phaseDispatchesEncoded: [StepPhase: Int]
+        /// CPU wall time inside per-phase encode scopes; same partial-work
+        /// semantics as phaseDispatchesEncoded.
+        public let phaseEncodeSeconds: [StepPhase: Double]
 
         public var avoidedLogitProjections: Int {
             max(0, tokensProcessed - logitProjections)
@@ -46,6 +108,14 @@ public final class QwenMetalModel {
         var gpuTimedCommandBuffers = 0
         var gpuUntimedCommandBuffers = 0
         var completedWithoutThrow = false
+        var timeline: [CommandBufferSample] = []
+        var phaseDispatches: [StepPhase: Int] = [:]
+        var phaseEncodeSeconds: [StepPhase: Double] = [:]
+        var currentPhase: StepPhase?
+        var bufferOpen = false
+        var bufferEncodeStart = 0.0
+        var bufferPhaseDispatches: [StepPhase: Int] = [:]
+        var bufferPhaseEncodeSeconds: [StepPhase: Double] = [:]
     }
 
     public let config: QwenConfig
@@ -119,7 +189,8 @@ public final class QwenMetalModel {
         commandBuffersCommitted: 0, blockingWaits: 0, blockingWaitSeconds: 0,
         computeDispatchesEncoded: 0, stepWallSeconds: 0, commandBufferErrors: 0,
         gpuExecutionSeconds: 0, gpuTimedCommandBuffers: 0, gpuUntimedCommandBuffers: 0,
-        completedWithoutThrow: false
+        completedWithoutThrow: false,
+        commandBufferTimeline: [], phaseDispatchesEncoded: [:], phaseEncodeSeconds: [:]
     )
     private var activeStepCounters: StepCounters?
 
@@ -387,34 +458,89 @@ public final class QwenMetalModel {
         }
     }
 
-    private func commitAndWait(_ cb: MTLCommandBuffer) {
-        cb.commit()
-        activeStepCounters?.commandBuffersCommitted += 1
-        let waitStart = ProcessInfo.processInfo.systemUptime
-        cb.waitUntilCompleted()
-        activeStepCounters?.blockingWaits += 1
-        activeStepCounters?.blockingWaitSeconds += max(
-            0, ProcessInfo.processInfo.systemUptime - waitStart
-        )
-
-        guard cb.status == .completed else {
-            activeStepCounters?.commandBufferErrors += 1
-            return
-        }
-        let start = cb.gpuStartTime
-        let end = cb.gpuEndTime
-        guard start.isFinite, end.isFinite, start > 0, end > 0, end >= start else {
-            activeStepCounters?.gpuUntimedCommandBuffers += 1
-            return
-        }
-        activeStepCounters?.gpuExecutionSeconds += end - start
-        activeStepCounters?.gpuTimedCommandBuffers += 1
-    }
-
-    private func runPhase(_ body: (MTLComputeCommandEncoder) throws -> Void) throws {
+    /// Starts a step command buffer and opens its S3b timeline accumulator so
+    /// encode time and dispatches attribute to this buffer until commit.
+    private func beginStepCommandBuffer() -> (MTLCommandBuffer, MTLComputeCommandEncoder) {
         let cb = engine.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
-        try body(enc)
+        if let counters = activeStepCounters {
+            counters.bufferOpen = true
+            counters.bufferEncodeStart = ProcessInfo.processInfo.systemUptime
+            counters.bufferPhaseDispatches = [:]
+            counters.bufferPhaseEncodeSeconds = [:]
+        }
+        return (cb, enc)
+    }
+
+    /// Attributes encode-side work (CPU encode wall time and dispatch counts)
+    /// to a phase label. Scopes never nest in the current schedule; if one
+    /// ever did, its elapsed time would double-count, so keep call sites flat.
+    private func phase<T>(_ p: StepPhase, _ body: () throws -> T) rethrows -> T {
+        guard let counters = activeStepCounters else { return try body() }
+        let previous = counters.currentPhase
+        counters.currentPhase = p
+        let start = ProcessInfo.processInfo.systemUptime
+        defer {
+            let elapsed = max(0, ProcessInfo.processInfo.systemUptime - start)
+            counters.phaseEncodeSeconds[p, default: 0] += elapsed
+            if counters.bufferOpen {
+                counters.bufferPhaseEncodeSeconds[p, default: 0] += elapsed
+            }
+            counters.currentPhase = previous
+        }
+        return try body()
+    }
+
+    private func commitAndWait(_ cb: MTLCommandBuffer) {
+        let counters = activeStepCounters
+        var encodeSeconds = 0.0
+        if let counters, counters.bufferOpen {
+            encodeSeconds = max(
+                0, ProcessInfo.processInfo.systemUptime - counters.bufferEncodeStart
+            )
+        }
+        cb.commit()
+        counters?.commandBuffersCommitted += 1
+        let waitStart = ProcessInfo.processInfo.systemUptime
+        cb.waitUntilCompleted()
+        counters?.blockingWaits += 1
+        let waitSeconds = max(0, ProcessInfo.processInfo.systemUptime - waitStart)
+        counters?.blockingWaitSeconds += waitSeconds
+
+        let completed = cb.status == .completed
+        var gpuSeconds: Double?
+        if !completed {
+            counters?.commandBufferErrors += 1
+        } else {
+            let start = cb.gpuStartTime
+            let end = cb.gpuEndTime
+            if start.isFinite, end.isFinite, start > 0, end > 0, end >= start {
+                gpuSeconds = end - start
+                counters?.gpuExecutionSeconds += end - start
+                counters?.gpuTimedCommandBuffers += 1
+            } else {
+                counters?.gpuUntimedCommandBuffers += 1
+            }
+        }
+        guard let counters else { return }
+        counters.timeline.append(CommandBufferSample(
+            phaseDispatches: counters.bufferPhaseDispatches,
+            phaseEncodeSeconds: counters.bufferPhaseEncodeSeconds,
+            encodeSeconds: encodeSeconds,
+            waitSeconds: waitSeconds,
+            gpuSeconds: gpuSeconds,
+            completed: completed
+        ))
+        counters.bufferOpen = false
+        counters.bufferPhaseDispatches = [:]
+        counters.bufferPhaseEncodeSeconds = [:]
+    }
+
+    private func runPhase(
+        _ label: StepPhase, _ body: (MTLComputeCommandEncoder) throws -> Void
+    ) throws {
+        let (cb, enc) = beginStepCommandBuffer()
+        try phase(label) { try body(enc) }
         enc.endEncoding()
         commitAndWait(cb)
     }
@@ -433,7 +559,14 @@ public final class QwenMetalModel {
         let counters = StepCounters()
         let wallStart = ProcessInfo.processInfo.systemUptime
         activeStepCounters = counters
-        engine.computeDispatchObserver = { counters.computeDispatchesEncoded += 1 }
+        engine.computeDispatchObserver = {
+            counters.computeDispatchesEncoded += 1
+            let bucket = counters.currentPhase ?? .other
+            counters.phaseDispatches[bucket, default: 0] += 1
+            if counters.bufferOpen {
+                counters.bufferPhaseDispatches[bucket, default: 0] += 1
+            }
+        }
         defer {
             engine.computeDispatchObserver = nil
             activeStepCounters = nil
@@ -449,7 +582,10 @@ public final class QwenMetalModel {
                 gpuExecutionSeconds: counters.gpuExecutionSeconds,
                 gpuTimedCommandBuffers: counters.gpuTimedCommandBuffers,
                 gpuUntimedCommandBuffers: counters.gpuUntimedCommandBuffers,
-                completedWithoutThrow: counters.completedWithoutThrow
+                completedWithoutThrow: counters.completedWithoutThrow,
+                commandBufferTimeline: counters.timeline,
+                phaseDispatchesEncoded: counters.phaseDispatches,
+                phaseEncodeSeconds: counters.phaseEncodeSeconds
             )
         }
 
@@ -500,7 +636,7 @@ public final class QwenMetalModel {
         guard projectLogits else { return [] }
         QwenCPUModel.rmsNorm(&h, rows: 1, dim: D, weight: finalNorm, eps: Float(cfg.rmsNormEps))
         loadX(h)
-        try runPhase { enc in
+        try runPhase(.lmHead) { enc in
             try engine.encodeGemv(enc, lmHead, x: xBuf, y: logitsBuf, yOff: 0)
         }
         activeStepCounters?.logitProjections += 1
@@ -521,7 +657,7 @@ public final class QwenMetalModel {
         let kvDim = KVH * hd
 
         loadX(x)
-        try runPhase { enc in
+        try runPhase(.attention) { enc in
             try engine.encodeGemv(enc, w.qProj, x: xBuf, y: yBuf, yOff: 0)
             try engine.encodeGemv(enc, w.kProj, x: xBuf, y: yBuf, yOff: qOutDim)
             try engine.encodeGemv(enc, w.vProj, x: xBuf, y: yBuf, yOff: qOutDim + kvDim)
@@ -571,7 +707,7 @@ public final class QwenMetalModel {
         for i in 0..<attnOut.count { attnOut[i] *= QwenCPUModel.sigmoid(gate[i]) }
 
         loadX(attnOut)
-        try runPhase { enc in
+        try runPhase(.attention) { enc in
             try engine.encodeGemv(enc, w.oProj, x: xBuf, y: yBuf, yOff: 0)
         }
         return readY(0, cfg.hiddenSize)
@@ -614,7 +750,7 @@ public final class QwenMetalModel {
         switch cfg.deltaLayout {
         case .fusedInterleaved:
             let qkvzDim = 2 * keyDim + 2 * valueDim
-            try runPhase { enc in
+            try runPhase(.delta) { enc in
                 try engine.encodeGemv(enc, w.qkvz!, x: xBuf, y: yBuf, yOff: 0)
                 try engine.encodeGemv(enc, w.ba!, x: xBuf, y: yBuf, yOff: qkvzDim)
             }
@@ -644,7 +780,7 @@ public final class QwenMetalModel {
                 }
             }
         case .split:
-            try runPhase { enc in
+            try runPhase(.delta) { enc in
                 try engine.encodeGemv(enc, w.qkv!, x: xBuf, y: yBuf, yOff: 0)
                 try engine.encodeGemv(enc, w.zProj!, x: xBuf, y: yBuf, yOff: convDim)
                 try engine.encodeGemv(enc, w.bProj!, x: xBuf, y: yBuf, yOff: convDim + valueDim)
@@ -706,7 +842,7 @@ public final class QwenMetalModel {
         for i in 0..<normed.count { normed[i] *= QwenCPUModel.silu(z[i]) }
 
         loadX(normed)
-        try runPhase { enc in
+        try runPhase(.delta) { enc in
             try engine.encodeGemv(enc, w.outProj, x: xBuf, y: yBuf, yOff: 0)
         }
         return readY(0, cfg.hiddenSize)
@@ -721,7 +857,7 @@ public final class QwenMetalModel {
         let topK = cfg.numExpertsPerTok
 
         loadX(x)
-        try runPhase { enc in
+        try runPhase(.router) { enc in
             try engine.encodeGemv(enc, w.gate, x: xBuf, y: yBuf, yOff: 0)
         }
         var router = readY(0, E)
@@ -756,7 +892,7 @@ public final class QwenMetalModel {
             expertBufs = try cache.buffers(layer: layerIndex, experts: picks.map { $0.0 })
         }
 
-        try runPhase { enc in
+        try runPhase(.moe) { enc in
             for (ki, pick) in picks.enumerated() {
                 let e = pick.0
                 if let projs = expertProjs {
@@ -1021,43 +1157,52 @@ extension QwenMetalModel {
             let fl = fastLayers[li]
 
             if let delta = L.delta {
-                let cb = engine.queue.makeCommandBuffer()!
-                let enc = cb.makeComputeCommandEncoder()!
-                if let p = pending { try encodePendingMoE(enc, p); pending = nil }
+                let (cb, enc) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodePendingMoE(enc, p) }
+                    pending = nil
+                }
                 try encDeltaLayer(enc, delta: delta, fl: fl, moeGate: L.moe.gate)
                 enc.endEncoding()
                 commitAndWait(cb)
             } else {
                 // Attention: projections, CPU core, then out-proj + router.
-                let cb1 = engine.queue.makeCommandBuffer()!
-                let e1 = cb1.makeComputeCommandEncoder()!
-                if let p = pending { try encodePendingMoE(e1, p); pending = nil }
-                try encNormCopy(e1, w: fl.inputNorm, dstOff: reg.x0)
-                barrier(e1)
+                let (cb1, e1) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodePendingMoE(e1, p) }
+                    pending = nil
+                }
                 let attn = L.attn!
-                try engine.encodeGemv(e1, attn.qProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qout)
-                try engine.encodeGemv(e1, attn.kProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.knew)
-                try engine.encodeGemv(e1, attn.vProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.vnew)
+                try phase(.attention) {
+                    try encNormCopy(e1, w: fl.inputNorm, dstOff: reg.x0)
+                    barrier(e1)
+                    try engine.encodeGemv(e1, attn.qProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qout)
+                    try engine.encodeGemv(e1, attn.kProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.knew)
+                    try engine.encodeGemv(e1, attn.vProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.vnew)
+                }
                 e1.endEncoding()
                 commitAndWait(cb1)
 
                 let attnOut = attnCoreCPU(layerIndex: li, state: state, attn: attn)
                 writeS(reg.att, attnOut)
 
-                let cb2 = engine.queue.makeCommandBuffer()!
-                let e2 = cb2.makeComputeCommandEncoder()!
-                try engine.encodeGemv(e2, attn.oProj, x: sBuf!, xOff: reg.att, y: sBuf!, yOff: reg.r)
-                barrier(e2)
-                var np = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
-                e2.setComputePipelineState(try engine.pipeline("add_inplace"))
-                e2.setBuffer(hBuf!, offset: 0, index: 0)
-                e2.setBuffer(sBuf!, offset: 0, index: 1)
-                setBytesParams(e2, &np, index: 2)
-                dispatchN(e2, D)
-                barrier(e2)
-                try encNormCopy(e2, w: fl.postNorm, dstOff: reg.xmoe)
-                barrier(e2)
-                try engine.encodeGemv(e2, L.moe.gate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+                let (cb2, e2) = beginStepCommandBuffer()
+                try phase(.attention) {
+                    try engine.encodeGemv(e2, attn.oProj, x: sBuf!, xOff: reg.att, y: sBuf!, yOff: reg.r)
+                    barrier(e2)
+                    var np = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
+                    e2.setComputePipelineState(try engine.pipeline("add_inplace"))
+                    e2.setBuffer(hBuf!, offset: 0, index: 0)
+                    e2.setBuffer(sBuf!, offset: 0, index: 1)
+                    setBytesParams(e2, &np, index: 2)
+                    dispatchN(e2, D)
+                    barrier(e2)
+                }
+                try phase(.router) {
+                    try encNormCopy(e2, w: fl.postNorm, dstOff: reg.xmoe)
+                    barrier(e2)
+                    try engine.encodeGemv(e2, L.moe.gate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+                }
                 e2.endEncoding()
                 commitAndWait(cb2)
             }
@@ -1072,19 +1217,20 @@ extension QwenMetalModel {
 
         // Always apply the last layer's experts. Only the final token in a
         // multi-token call also needs final norm + vocabulary projection.
-        let cb = engine.queue.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
-        if let p = pending { try encodePendingMoE(enc, p) }
+        let (cb, enc) = beginStepCommandBuffer()
+        if let p = pending { try phase(.moe) { try encodePendingMoE(enc, p) } }
         if projectLogits {
-            enc.setComputePipelineState(try engine.pipeline("norm_copy"))
-            var np = NormParams(rows: 1, dim: UInt32(D), eps: Float(cfg.rmsNormEps), hasWeight: 1, scale: 1, off: UInt32(reg.x0))
-            enc.setBuffer(hBuf!, offset: 0, index: 0)
-            enc.setBuffer(sBuf!, offset: 0, index: 1)
-            enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
-            setBytesParams(enc, &np, index: 3)
-            dispatchRows(enc, rows: 1)
-            barrier(enc)
-            try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
+            try phase(.lmHead) {
+                enc.setComputePipelineState(try engine.pipeline("norm_copy"))
+                var np = NormParams(rows: 1, dim: UInt32(D), eps: Float(cfg.rmsNormEps), hasWeight: 1, scale: 1, off: UInt32(reg.x0))
+                enc.setBuffer(hBuf!, offset: 0, index: 0)
+                enc.setBuffer(sBuf!, offset: 0, index: 1)
+                enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
+                setBytesParams(enc, &np, index: 3)
+                dispatchRows(enc, rows: 1)
+                barrier(enc)
+                try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
+            }
             activeStepCounters?.logitProjections += 1
         }
         enc.endEncoding()
@@ -1103,97 +1249,101 @@ extension QwenMetalModel {
         let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
         let keyDim = cfg.keyDim, convDim = cfg.convDim
 
-        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0)
-        barrier(enc)
-        switch config.deltaLayout {
-        case .split:
-            try engine.encodeGemv(enc, delta.qkv!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkv)
-            try engine.encodeGemv(enc, delta.zProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.z)
-            try engine.encodeGemv(enc, delta.bProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.b)
-            try engine.encodeGemv(enc, delta.aProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.a)
+        try phase(.delta) {
+            try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0)
             barrier(enc)
-        case .fusedInterleaved:
-            try engine.encodeGemv(enc, delta.qkvz!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkvzStage)
-            try engine.encodeGemv(enc, delta.ba!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.baStage)
-            barrier(enc)
-            enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
-            struct DeintParams {
-                var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
-                var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
-                var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
+            switch config.deltaLayout {
+            case .split:
+                try engine.encodeGemv(enc, delta.qkv!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkv)
+                try engine.encodeGemv(enc, delta.zProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.z)
+                try engine.encodeGemv(enc, delta.bProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.b)
+                try engine.encodeGemv(enc, delta.aProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.a)
+                barrier(enc)
+            case .fusedInterleaved:
+                try engine.encodeGemv(enc, delta.qkvz!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkvzStage)
+                try engine.encodeGemv(enc, delta.ba!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.baStage)
+                barrier(enc)
+                enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
+                struct DeintParams {
+                    var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
+                    var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
+                    var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
+                }
+                var dip = DeintParams(
+                    nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
+                    keyDim: UInt32(keyDim), srcOff: UInt32(reg.qkvzStage), baOff: UInt32(reg.baStage),
+                    qkvOff: UInt32(reg.qkv), zOff: UInt32(reg.z), bOff: UInt32(reg.b), aOff: UInt32(reg.a)
+                )
+                enc.setBuffer(sBuf!, offset: 0, index: 0)
+                setBytesParams(enc, &dip, index: 1)
+                dispatchN(enc, nk)
+                barrier(enc)
             }
-            var dip = DeintParams(
-                nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
-                keyDim: UInt32(keyDim), srcOff: UInt32(reg.qkvzStage), baOff: UInt32(reg.baStage),
-                qkvOff: UInt32(reg.qkv), zOff: UInt32(reg.z), bOff: UInt32(reg.b), aOff: UInt32(reg.a)
-            )
+
+            enc.setComputePipelineState(try engine.pipeline("conv_step"))
+            var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim), UInt32(reg.qkv), UInt32(reg.conv))
             enc.setBuffer(sBuf!, offset: 0, index: 0)
-            setBytesParams(enc, &dip, index: 1)
-            dispatchN(enc, nk)
+            enc.setBuffer(fl.hist!, offset: 0, index: 1)
+            enc.setBuffer(fl.convW!, offset: 0, index: 2)
+            setBytesParams(enc, &cp, index: 3)
+            dispatchN(enc, convDim)
+
+            enc.setComputePipelineState(try engine.pipeline("delta_pre"))
+            var dp = SIMD4<UInt32>(UInt32(nv), UInt32(reg.a), UInt32(reg.b), UInt32(reg.gb))
+            enc.setBuffer(sBuf!, offset: 0, index: 0)
+            enc.setBuffer(fl.aLog!, offset: 0, index: 1)
+            enc.setBuffer(fl.dtBias!, offset: 0, index: 2)
+            setBytesParams(enc, &dp, index: 3)
+            dispatchN(enc, nv)
+            barrier(enc)
+
+            let invScale = 1 / Float(dk).squareRoot()
+            try encRMSNorm(enc, off: reg.conv, rows: nk, dim: dk, w: nil, scale: invScale * invScale, eps: 1e-6)
+            try encRMSNorm(enc, off: reg.conv + keyDim, rows: nk, dim: dk, w: nil, scale: invScale, eps: 1e-6)
+            barrier(enc)
+
+            enc.setComputePipelineState(try engine.pipeline("gated_delta_step"))
+            var delp = MetalEngine.DeltaParams(T: 1, Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
+            enc.setBuffer(sBuf!, offset: reg.conv * 4, index: 0)                    // q
+            enc.setBuffer(sBuf!, offset: (reg.conv + keyDim) * 4, index: 1)         // k
+            enc.setBuffer(sBuf!, offset: (reg.conv + 2 * keyDim) * 4, index: 2)     // v
+            enc.setBuffer(sBuf!, offset: reg.gb * 4, index: 3)                      // g
+            enc.setBuffer(sBuf!, offset: (reg.gb + nv) * 4, index: 4)               // beta
+            enc.setBuffer(fl.state!, offset: 0, index: 5)
+            enc.setBuffer(sBuf!, offset: reg.dy * 4, index: 6)
+            enc.setBuffer(fl.state!, offset: 0, index: 7)
+            setBytesParams(enc, &delp, index: 8)
+            engine.dispatchThreads(
+                enc, threads: MTLSize(width: 32, height: dv, depth: nv),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
+            )
+            barrier(enc)
+
+            enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
+            struct GNP { var nv: UInt32; var dv: UInt32; var eps: Float; var yOff: UInt32; var zOff: UInt32; var outOff: UInt32 }
+            var gp = GNP(nv: UInt32(nv), dv: UInt32(dv), eps: Float(cfg.rmsNormEps),
+                         yOff: UInt32(reg.dy), zOff: UInt32(reg.z), outOff: UInt32(reg.dn))
+            enc.setBuffer(sBuf!, offset: 0, index: 0)
+            enc.setBuffer(fl.deltaNormW!, offset: 0, index: 1)
+            setBytesParams(enc, &gp, index: 2)
+            dispatchRows(enc, rows: nv)
+            barrier(enc)
+
+            try engine.encodeGemv(enc, delta.outProj, x: sBuf!, xOff: reg.dn, y: sBuf!, yOff: reg.r)
+            barrier(enc)
+            var ap = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
+            enc.setComputePipelineState(try engine.pipeline("add_inplace"))
+            enc.setBuffer(hBuf!, offset: 0, index: 0)
+            enc.setBuffer(sBuf!, offset: 0, index: 1)
+            setBytesParams(enc, &ap, index: 2)
+            dispatchN(enc, D)
             barrier(enc)
         }
-
-        enc.setComputePipelineState(try engine.pipeline("conv_step"))
-        var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim), UInt32(reg.qkv), UInt32(reg.conv))
-        enc.setBuffer(sBuf!, offset: 0, index: 0)
-        enc.setBuffer(fl.hist!, offset: 0, index: 1)
-        enc.setBuffer(fl.convW!, offset: 0, index: 2)
-        setBytesParams(enc, &cp, index: 3)
-        dispatchN(enc, convDim)
-
-        enc.setComputePipelineState(try engine.pipeline("delta_pre"))
-        var dp = SIMD4<UInt32>(UInt32(nv), UInt32(reg.a), UInt32(reg.b), UInt32(reg.gb))
-        enc.setBuffer(sBuf!, offset: 0, index: 0)
-        enc.setBuffer(fl.aLog!, offset: 0, index: 1)
-        enc.setBuffer(fl.dtBias!, offset: 0, index: 2)
-        setBytesParams(enc, &dp, index: 3)
-        dispatchN(enc, nv)
-        barrier(enc)
-
-        let invScale = 1 / Float(dk).squareRoot()
-        try encRMSNorm(enc, off: reg.conv, rows: nk, dim: dk, w: nil, scale: invScale * invScale, eps: 1e-6)
-        try encRMSNorm(enc, off: reg.conv + keyDim, rows: nk, dim: dk, w: nil, scale: invScale, eps: 1e-6)
-        barrier(enc)
-
-        enc.setComputePipelineState(try engine.pipeline("gated_delta_step"))
-        var delp = MetalEngine.DeltaParams(T: 1, Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
-        enc.setBuffer(sBuf!, offset: reg.conv * 4, index: 0)                    // q
-        enc.setBuffer(sBuf!, offset: (reg.conv + keyDim) * 4, index: 1)         // k
-        enc.setBuffer(sBuf!, offset: (reg.conv + 2 * keyDim) * 4, index: 2)     // v
-        enc.setBuffer(sBuf!, offset: reg.gb * 4, index: 3)                      // g
-        enc.setBuffer(sBuf!, offset: (reg.gb + nv) * 4, index: 4)               // beta
-        enc.setBuffer(fl.state!, offset: 0, index: 5)
-        enc.setBuffer(sBuf!, offset: reg.dy * 4, index: 6)
-        enc.setBuffer(fl.state!, offset: 0, index: 7)
-        setBytesParams(enc, &delp, index: 8)
-        engine.dispatchThreads(
-            enc, threads: MTLSize(width: 32, height: dv, depth: nv),
-            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
-        )
-        barrier(enc)
-
-        enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
-        struct GNP { var nv: UInt32; var dv: UInt32; var eps: Float; var yOff: UInt32; var zOff: UInt32; var outOff: UInt32 }
-        var gp = GNP(nv: UInt32(nv), dv: UInt32(dv), eps: Float(cfg.rmsNormEps),
-                     yOff: UInt32(reg.dy), zOff: UInt32(reg.z), outOff: UInt32(reg.dn))
-        enc.setBuffer(sBuf!, offset: 0, index: 0)
-        enc.setBuffer(fl.deltaNormW!, offset: 0, index: 1)
-        setBytesParams(enc, &gp, index: 2)
-        dispatchRows(enc, rows: nv)
-        barrier(enc)
-
-        try engine.encodeGemv(enc, delta.outProj, x: sBuf!, xOff: reg.dn, y: sBuf!, yOff: reg.r)
-        barrier(enc)
-        var ap = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
-        enc.setComputePipelineState(try engine.pipeline("add_inplace"))
-        enc.setBuffer(hBuf!, offset: 0, index: 0)
-        enc.setBuffer(sBuf!, offset: 0, index: 1)
-        setBytesParams(enc, &ap, index: 2)
-        dispatchN(enc, D)
-        barrier(enc)
-        try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe)
-        barrier(enc)
-        try engine.encodeGemv(enc, moeGate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+        try phase(.router) {
+            try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe)
+            barrier(enc)
+            try engine.encodeGemv(enc, moeGate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+        }
     }
 
     private func attnCoreCPU(layerIndex: Int, state: QwenCPUModel.DecodeState, attn: AttnGPU) -> [Float] {
