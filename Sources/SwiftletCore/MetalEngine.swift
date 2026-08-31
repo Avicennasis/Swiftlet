@@ -991,7 +991,7 @@ public final class MetalEngine {
     /// each scanning a strided subset of the KV rows with its own online
     /// softmax, merged in-threadgroup. Must match ATTN_DECODE_SG in
     /// Kernels.metal.txt.
-    static let attnDecodeSimdgroups = 4
+    static let attnDecodeSimdgroups = 8
 
     /// Gated causal GQA attention for one query token over cache rows
     /// [0, kvLen): out = sigmoid(gate) * softmax(qK^T/sqrt(hd)) V, with the

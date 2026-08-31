@@ -579,7 +579,7 @@ kernel void attn_kv_append(
 // into registers either way, so scratch offsets never need alignment); odd
 // head dims keep the lane-strided scalar loop. Per-lane accumulators and
 // the threadgroup tile cover headDim <= 256.
-#define ATTN_DECODE_SG 4
+#define ATTN_DECODE_SG 8
 
 inline void attn_decode_head(
     device float *data,
