@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import os.signpost
 
 /// GPU runtime: every linear (dense projections, router, experts, lm_head)
 /// runs as a quantized GEMV directly on mmapped checkpoint bytes — weights are
@@ -25,11 +26,29 @@ public final class QwenMetalModel {
         case other
     }
 
+    /// How real a per-phase GPU/wait split can be on this device without
+    /// changing the schedule. The fast path deliberately encodes several
+    /// phases into one encoder per command buffer, so splitting a shared
+    /// buffer's GPU time by phase requires timestamp samples *inside* the
+    /// encoder — dispatch-boundary counter sampling. Devices that sample only
+    /// at encoder/stage boundaries (Apple GPUs) cannot provide that split for
+    /// this schedule, and the API says so instead of inventing numbers.
+    public enum PhaseGpuSplitSupport: Equatable, Sendable {
+        /// The device samples GPU timestamps at compute dispatch boundaries;
+        /// per-phase GPU time is measured inside shared buffers.
+        case dispatchBoundaryCounters
+        /// No in-encoder sampling on this device; per-phase GPU time is
+        /// absent (nil), never zeros. The reason names the device and the
+        /// missing capability.
+        case unsupported(reason: String)
+    }
+
     /// One committed command buffer, in commit order. Encode time and
     /// dispatch counts are attributed to phases exactly (encoding is CPU work
-    /// under our control); blocking-wait and GPU time exist only at
-    /// command-buffer granularity, so a buffer spanning several phases cannot
-    /// split them per phase.
+    /// under our control); blocking-wait time exists only at command-buffer
+    /// granularity, and GPU time splits per phase only when the device
+    /// supports dispatch-boundary counter sampling (see PhaseGpuSplitSupport)
+    /// — otherwise a buffer spanning several phases cannot split it.
     public struct CommandBufferSample: Equatable, Sendable {
         /// Compute dispatches encoded into this buffer, per phase.
         public let phaseDispatches: [StepPhase: Int]
@@ -42,6 +61,11 @@ public final class QwenMetalModel {
         /// GPU start-to-end duration; nil when the buffer failed or reported
         /// invalid timestamps. Not proof of exclusive GPU occupancy.
         public let gpuSeconds: Double?
+        /// GPU seconds per phase from dispatch-boundary counter samples
+        /// resolved for this buffer. nil when the device cannot sample inside
+        /// an encoder, or when any of this buffer's samples failed to resolve
+        /// — a partial split would silently under-report a phase.
+        public let phaseGpuSeconds: [StepPhase: Double]?
         /// Whether status was .completed after the blocking wait.
         public let completed: Bool
 
@@ -90,10 +114,23 @@ public final class QwenMetalModel {
         /// CPU wall time inside per-phase encode scopes; same partial-work
         /// semantics as phaseDispatchesEncoded.
         public let phaseEncodeSeconds: [StepPhase: Double]
+        /// GPU seconds per phase, summed over the buffers whose
+        /// dispatch-boundary counter samples resolved. nil whenever the
+        /// device cannot sample inside an encoder (phaseGpuSplitSupport is
+        /// .unsupported) — absent, never zeros that look like measurements.
+        public let phaseGpuSeconds: [StepPhase: Double]?
 
         public var avoidedLogitProjections: Int {
             max(0, tokensProcessed - logitProjections)
         }
+    }
+
+    /// Count of os_signpost intervals one step emitted, per interval name.
+    /// Rebuilt per step; exists so tests can pin emission to the timeline.
+    struct SignpostTally: Equatable {
+        var stepIntervals = 0
+        var phaseIntervals = 0
+        var commandBufferIntervals = 0
     }
 
     private final class StepCounters {
@@ -111,11 +148,23 @@ public final class QwenMetalModel {
         var timeline: [CommandBufferSample] = []
         var phaseDispatches: [StepPhase: Int] = [:]
         var phaseEncodeSeconds: [StepPhase: Double] = [:]
+        /// Step totals of resolved per-phase GPU seconds; nil unless the
+        /// device supports dispatch-boundary sampling.
+        var phaseGpuSeconds: [StepPhase: Double]?
         var currentPhase: StepPhase?
         var bufferOpen = false
         var bufferEncodeStart = 0.0
         var bufferPhaseDispatches: [StepPhase: Int] = [:]
         var bufferPhaseEncodeSeconds: [StepPhase: Double] = [:]
+        /// Encoder of the open buffer, for in-encoder counter samples only.
+        var currentEncoder: MTLComputeCommandEncoder?
+        var bufferSampleBuffer: MTLCounterSampleBuffer?
+        var bufferSampleIndex = 0
+        var bufferPhaseSampleRanges: [(phase: StepPhase, start: Int, end: Int)] = []
+        var bufferSamplingBroken = false
+        /// CPU/GPU correlation captured when the open buffer began encoding.
+        var bufferCorrelationStart: (cpu: MTLTimestamp, gpu: MTLTimestamp)?
+        var signpostTally = SignpostTally()
     }
 
     public let config: QwenConfig
@@ -190,9 +239,25 @@ public final class QwenMetalModel {
         computeDispatchesEncoded: 0, stepWallSeconds: 0, commandBufferErrors: 0,
         gpuExecutionSeconds: 0, gpuTimedCommandBuffers: 0, gpuUntimedCommandBuffers: 0,
         completedWithoutThrow: false,
-        commandBufferTimeline: [], phaseDispatchesEncoded: [:], phaseEncodeSeconds: [:]
+        commandBufferTimeline: [], phaseDispatchesEncoded: [:], phaseEncodeSeconds: [:],
+        phaseGpuSeconds: nil
     )
     private var activeStepCounters: StepCounters?
+    /// Whether a per-phase GPU split is real on this device, decided by the
+    /// runtime counter probe at init — never assumed from the OS or GPU name.
+    public let phaseGpuSplitSupport: PhaseGpuSplitSupport
+    /// The raw probe behind phaseGpuSplitSupport, for reporting.
+    public var counterSamplingSupport: MetalEngine.CounterSamplingSupport {
+        engine.probeCounterSampling()
+    }
+    /// Signpost intervals emitted by the latest step; mirrors the timeline.
+    internal private(set) var lastSignpostTally = SignpostTally()
+    /// os_signpost log for step/phase/commandBuffer intervals. Instruments'
+    /// os_signpost instrument groups them under subsystem "Swiftlet".
+    private static let signpostLog = OSLog(subsystem: "Swiftlet", category: "MetalStep")
+    /// Sample slots per command buffer: the fast path encodes at most three
+    /// phase scopes per buffer (2 samples each); headroom is harmless.
+    private static let maxPhaseSamplesPerBuffer = 16
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -227,6 +292,7 @@ public final class QwenMetalModel {
         ckpt = try Checkpoint(dir: modelDir)
         engine = try MetalEngine()
         store = MetalShardStore(device: engine.device)
+        phaseGpuSplitSupport = Self.probePhaseGpuSplit(engine: engine)
 
         let cfg = config
         let ckpt = self.ckpt
@@ -458,8 +524,30 @@ public final class QwenMetalModel {
         }
     }
 
+    /// Decides whether a per-phase GPU split is measurable here. The frozen
+    /// schedule shares one encoder across phases, so the split needs
+    /// dispatch-boundary sampling; anything less gets an explicit reason.
+    private static func probePhaseGpuSplit(engine: MetalEngine) -> PhaseGpuSplitSupport {
+        let probe = engine.probeCounterSampling()
+        if probe.atDispatchBoundary && probe.hasTimestampCounterSet {
+            return .dispatchBoundaryCounters
+        }
+        if !probe.hasTimestampCounterSet {
+            return .unsupported(reason:
+                "device \(probe.deviceName) exposes no timestamp counter set")
+        }
+        return .unsupported(reason:
+            "device \(probe.deviceName) samples timestamps only at encoder boundaries"
+            + " (stage=\(probe.atStageBoundary)), and the fast-path schedule encodes"
+            + " several phases into one encoder per command buffer; an in-buffer"
+            + " per-phase GPU split cannot be measured without changing the schedule")
+    }
+
     /// Starts a step command buffer and opens its S3b timeline accumulator so
-    /// encode time and dispatches attribute to this buffer until commit.
+    /// encode time and dispatches attribute to this buffer until commit. When
+    /// the device supports dispatch-boundary sampling, a fresh counter sample
+    /// buffer and a CPU/GPU correlation point are attached for the per-phase
+    /// GPU split; on other devices this adds nothing to the hot path.
     private func beginStepCommandBuffer() -> (MTLCommandBuffer, MTLComputeCommandEncoder) {
         let cb = engine.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
@@ -468,17 +556,53 @@ public final class QwenMetalModel {
             counters.bufferEncodeStart = ProcessInfo.processInfo.systemUptime
             counters.bufferPhaseDispatches = [:]
             counters.bufferPhaseEncodeSeconds = [:]
+            counters.currentEncoder = enc
+            counters.bufferSampleBuffer = nil
+            counters.bufferSampleIndex = 0
+            counters.bufferPhaseSampleRanges = []
+            counters.bufferSamplingBroken = false
+            counters.bufferCorrelationStart = nil
+            if case .dispatchBoundaryCounters = phaseGpuSplitSupport,
+               let tsSet = engine.timestampCounterSet {
+                let desc = MTLCounterSampleBufferDescriptor()
+                desc.counterSet = tsSet
+                desc.storageMode = .shared
+                desc.sampleCount = Self.maxPhaseSamplesPerBuffer
+                counters.bufferSampleBuffer =
+                    try? engine.device.makeCounterSampleBuffer(descriptor: desc)
+                counters.bufferSamplingBroken = counters.bufferSampleBuffer == nil
+                counters.bufferCorrelationStart = engine.device.sampleTimestamps()
+            }
         }
         return (cb, enc)
     }
 
     /// Attributes encode-side work (CPU encode wall time and dispatch counts)
-    /// to a phase label. Scopes never nest in the current schedule; if one
+    /// to a phase label, emits one os_signpost interval per scope, and — on
+    /// devices with dispatch-boundary sampling — brackets the scope with GPU
+    /// timestamp samples. Scopes never nest in the current schedule; if one
     /// ever did, its elapsed time would double-count, so keep call sites flat.
     private func phase<T>(_ p: StepPhase, _ body: () throws -> T) rethrows -> T {
         guard let counters = activeStepCounters else { return try body() }
         let previous = counters.currentPhase
         counters.currentPhase = p
+        let signpostID = OSSignpostID(log: Self.signpostLog)
+        os_signpost(.begin, log: Self.signpostLog, name: "phase",
+                    signpostID: signpostID, "%{public}@", p.rawValue)
+        counters.signpostTally.phaseIntervals += 1
+        var sampleStart = -1
+        if let sb = counters.bufferSampleBuffer, counters.bufferOpen,
+           let enc = counters.currentEncoder, !counters.bufferSamplingBroken {
+            if counters.bufferSampleIndex + 1 < Self.maxPhaseSamplesPerBuffer {
+                sampleStart = counters.bufferSampleIndex
+                counters.bufferSampleIndex += 2
+                enc.sampleCounters(sampleBuffer: sb, sampleIndex: sampleStart, barrier: true)
+            } else {
+                // Out of slots: drop the whole buffer's split rather than
+                // publish a partial one.
+                counters.bufferSamplingBroken = true
+            }
+        }
         let start = ProcessInfo.processInfo.systemUptime
         defer {
             let elapsed = max(0, ProcessInfo.processInfo.systemUptime - start)
@@ -486,6 +610,14 @@ public final class QwenMetalModel {
             if counters.bufferOpen {
                 counters.bufferPhaseEncodeSeconds[p, default: 0] += elapsed
             }
+            if sampleStart >= 0, let sb = counters.bufferSampleBuffer,
+               let enc = counters.currentEncoder, !counters.bufferSamplingBroken {
+                enc.sampleCounters(sampleBuffer: sb, sampleIndex: sampleStart + 1, barrier: true)
+                counters.bufferPhaseSampleRanges.append(
+                    (phase: p, start: sampleStart, end: sampleStart + 1))
+            }
+            os_signpost(.end, log: Self.signpostLog, name: "phase",
+                        signpostID: signpostID, "%{public}@", p.rawValue)
             counters.currentPhase = previous
         }
         return try body()
@@ -498,6 +630,11 @@ public final class QwenMetalModel {
             encodeSeconds = max(
                 0, ProcessInfo.processInfo.systemUptime - counters.bufferEncodeStart
             )
+        }
+        let signpostID = OSSignpostID(log: Self.signpostLog)
+        if counters != nil {
+            os_signpost(.begin, log: Self.signpostLog, name: "commandBuffer", signpostID: signpostID)
+            counters?.signpostTally.commandBufferIntervals += 1
         }
         cb.commit()
         counters?.commandBuffersCommitted += 1
@@ -523,17 +660,86 @@ public final class QwenMetalModel {
             }
         }
         guard let counters else { return }
+
+        var phaseGpu: [StepPhase: Double]?
+        if completed, let sb = counters.bufferSampleBuffer,
+           !counters.bufferSamplingBroken, !counters.bufferPhaseSampleRanges.isEmpty,
+           let correlationStart = counters.bufferCorrelationStart {
+            phaseGpu = resolvePhaseGpuSeconds(
+                sampleBuffer: sb, sampleCount: counters.bufferSampleIndex,
+                ranges: counters.bufferPhaseSampleRanges,
+                correlationStart: correlationStart
+            )
+            if let resolved = phaseGpu, counters.phaseGpuSeconds != nil {
+                for (p, s) in resolved {
+                    counters.phaseGpuSeconds![p, default: 0] += s
+                }
+            }
+        }
+
+        let label = StepPhase.allCases.filter {
+            counters.bufferPhaseDispatches[$0] != nil
+                || counters.bufferPhaseEncodeSeconds[$0] != nil
+        }.map(\.rawValue).joined(separator: "+")
+        os_signpost(.end, log: Self.signpostLog, name: "commandBuffer",
+                    signpostID: signpostID, "%{public}@ wait=%.6f gpu=%.6f",
+                    label, waitSeconds, gpuSeconds ?? -1)
+
         counters.timeline.append(CommandBufferSample(
             phaseDispatches: counters.bufferPhaseDispatches,
             phaseEncodeSeconds: counters.bufferPhaseEncodeSeconds,
             encodeSeconds: encodeSeconds,
             waitSeconds: waitSeconds,
             gpuSeconds: gpuSeconds,
+            phaseGpuSeconds: phaseGpu,
             completed: completed
         ))
         counters.bufferOpen = false
         counters.bufferPhaseDispatches = [:]
         counters.bufferPhaseEncodeSeconds = [:]
+        counters.currentEncoder = nil
+        counters.bufferSampleBuffer = nil
+        counters.bufferSampleIndex = 0
+        counters.bufferPhaseSampleRanges = []
+        counters.bufferSamplingBroken = false
+        counters.bufferCorrelationStart = nil
+    }
+
+    /// Converts resolved dispatch-boundary timestamp samples into per-phase
+    /// GPU seconds using a linear CPU/GPU correlation across the buffer's
+    /// lifetime (device.sampleTimestamps at encode start and now; CPU
+    /// timestamps are nanoseconds). Any unresolved or non-monotone sample
+    /// voids the whole buffer's split — partial splits under-report silently.
+    /// Only reachable on devices whose probe reports dispatch-boundary
+    /// sampling; Apple GPUs never enter here.
+    private func resolvePhaseGpuSeconds(
+        sampleBuffer: MTLCounterSampleBuffer,
+        sampleCount: Int,
+        ranges: [(phase: StepPhase, start: Int, end: Int)],
+        correlationStart: (cpu: MTLTimestamp, gpu: MTLTimestamp)
+    ) -> [StepPhase: Double]? {
+        let correlationEnd = engine.device.sampleTimestamps()
+        guard correlationEnd.cpu > correlationStart.cpu,
+              correlationEnd.gpu > correlationStart.gpu else { return nil }
+        let cpuSeconds = Double(correlationEnd.cpu - correlationStart.cpu) / 1e9
+        let ticksPerSecond = Double(correlationEnd.gpu - correlationStart.gpu) / cpuSeconds
+        guard ticksPerSecond > 0,
+              let data = try? sampleBuffer.resolveCounterRange(0..<sampleCount),
+              data.count >= sampleCount * MemoryLayout<MTLCounterResultTimestamp>.stride
+        else { return nil }
+        return data.withUnsafeBytes { raw -> [StepPhase: Double]? in
+            let stamps = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+            var result: [StepPhase: Double] = [:]
+            for range in ranges {
+                let t0 = stamps[range.start].timestamp
+                let t1 = stamps[range.end].timestamp
+                guard t0 != 0, t1 != 0, t0 != .max, t1 != .max, t1 >= t0 else {
+                    return nil
+                }
+                result[range.phase, default: 0] += Double(t1 - t0) / ticksPerSecond
+            }
+            return result
+        }
     }
 
     private func runPhase(
@@ -557,8 +763,15 @@ public final class QwenMetalModel {
     /// Incremental step matching QwenCPUModel.step semantics.
     public func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
         let counters = StepCounters()
+        if case .dispatchBoundaryCounters = phaseGpuSplitSupport {
+            counters.phaseGpuSeconds = [:]
+        }
         let wallStart = ProcessInfo.processInfo.systemUptime
         activeStepCounters = counters
+        let stepSignpostID = OSSignpostID(log: Self.signpostLog)
+        os_signpost(.begin, log: Self.signpostLog, name: "step",
+                    signpostID: stepSignpostID, "tokens=%d", tokens.count)
+        counters.signpostTally.stepIntervals += 1
         engine.computeDispatchObserver = {
             counters.computeDispatchesEncoded += 1
             let bucket = counters.currentPhase ?? .other
@@ -570,6 +783,9 @@ public final class QwenMetalModel {
         defer {
             engine.computeDispatchObserver = nil
             activeStepCounters = nil
+            os_signpost(.end, log: Self.signpostLog, name: "step",
+                        signpostID: stepSignpostID)
+            lastSignpostTally = counters.signpostTally
             lastStepMetrics = StepMetrics(
                 tokensProcessed: counters.tokensProcessed,
                 logitProjections: counters.logitProjections,
@@ -585,7 +801,8 @@ public final class QwenMetalModel {
                 completedWithoutThrow: counters.completedWithoutThrow,
                 commandBufferTimeline: counters.timeline,
                 phaseDispatchesEncoded: counters.phaseDispatches,
-                phaseEncodeSeconds: counters.phaseEncodeSeconds
+                phaseEncodeSeconds: counters.phaseEncodeSeconds,
+                phaseGpuSeconds: counters.phaseGpuSeconds
             )
         }
 
