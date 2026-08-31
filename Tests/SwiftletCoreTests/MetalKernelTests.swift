@@ -780,6 +780,54 @@ import Testing
                 "T-step scan state diverges bitwise from chained T=1 steps")
     }
 
+    /// conv_scan is the same kind of sequential in-dispatch scan for the
+    /// depthwise conv: one T=3 dispatch must reproduce three chained
+    /// conv_step dispatches bitwise (every token's conv+silu row and the
+    /// final shifted history), because each iteration performs the
+    /// single-step kernel's arithmetic verbatim with the history carried
+    /// across tokens in registers instead of a barrier-fenced device round
+    /// trip per token.
+    @Test func convScanMatchesChainedStepsBitwise() throws {
+        let engine = try MetalEngine()
+        let convDim = 48, K = 4, tokens = 3
+        let inOff = 5
+        let outOff = inOff + convDim + 3
+        let stride = outOff + convDim + 7
+        var rng = Rand(151)
+        let src = (0..<tokens * stride).map { _ in rng.float() }
+        let hist0 = (0..<(K - 1) * convDim).map { _ in rng.float() }
+        let wgt = engine.makeBuffer((0..<convDim * K).map { _ in rng.float() })
+
+        let dataA = engine.makeBuffer(src)
+        let histA = engine.makeBuffer(hist0)
+        let perToken = try Self.runEncoded(engine) { enc in
+            for t in 0..<tokens {
+                enc.setComputePipelineState(try engine.pipeline("conv_step"))
+                var p = SIMD4<UInt32>(UInt32(convDim), UInt32(K),
+                                      UInt32(inOff + t * stride), UInt32(outOff + t * stride))
+                enc.setBuffer(dataA, offset: 0, index: 0)
+                enc.setBuffer(histA, offset: 0, index: 1)
+                enc.setBuffer(wgt, offset: 0, index: 2)
+                enc.setBytes(&p, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 3)
+                engine.dispatchThreads(
+                    enc, threads: MTLSize(width: convDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(64, convDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers) // token t+1 reads the advanced history
+            }
+        }
+        let dataB = engine.makeBuffer(src)
+        let histB = engine.makeBuffer(hist0)
+        let scanned = try Self.runEncoded(engine) { enc in
+            try engine.encodeConvScan(
+                enc, data: dataB, hist: histB, weight: wgt, convDim: convDim, K: K,
+                inOff: inOff, outOff: outOff, slotStride: stride, tokens: tokens)
+        }
+        #expect(perToken == tokens, "conv_step: per-token dispatch count")
+        #expect(scanned == 1, "conv_scan: scan dispatch count")
+        Self.expectBitwise(dataA, dataB, tokens * stride, "conv_scan data")
+        Self.expectBitwise(histA, histB, (K - 1) * convDim, "conv_scan history")
+    }
+
     /// delta_gather packs slot-strided q/k/v/g/beta into the contiguous
     /// [T, row] staging blocks as pure copies — bitwise against a CPU
     /// reference, one dispatch, sources untouched.

@@ -801,6 +801,42 @@ public final class MetalEngine {
         )
     }
 
+    struct ConvScanParams {
+        var convDim: UInt32
+        var K: UInt32
+        var inOff: UInt32
+        var outOff: UInt32
+        var stride: UInt32
+        var T: UInt32
+    }
+
+    /// conv_scan over `tokens` slots: T sequential conv_step iterations in
+    /// one dispatch, one thread per channel — token t's qkv row read at
+    /// inOff + t*slotStride, its conv+silu row written at
+    /// outOff + t*slotStride, and the layer's K-1 history rows carried
+    /// across tokens in registers, written back once at the end. Bitwise
+    /// the chained per-token conv_step dispatches. K <= 8.
+    func encodeConvScan(
+        _ enc: MTLComputeCommandEncoder, data: MTLBuffer, hist: MTLBuffer,
+        weight: MTLBuffer, convDim: Int, K: Int,
+        inOff: Int, outOff: Int, slotStride: Int, tokens: Int
+    ) throws {
+        precondition((2...8).contains(K), "conv_scan history registers cover 2 <= K <= 8")
+        enc.setComputePipelineState(try pipeline("conv_scan"))
+        var p = ConvScanParams(
+            convDim: UInt32(convDim), K: UInt32(K), inOff: UInt32(inOff),
+            outOff: UInt32(outOff), stride: UInt32(slotStride), T: UInt32(tokens)
+        )
+        enc.setBuffer(data, offset: 0, index: 0)
+        enc.setBuffer(hist, offset: 0, index: 1)
+        enc.setBuffer(weight, offset: 0, index: 2)
+        enc.setBytes(&p, length: MemoryLayout<ConvScanParams>.stride, index: 3)
+        dispatchThreads(
+            enc, threads: MTLSize(width: convDim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(64, convDim), height: 1, depth: 1)
+        )
+    }
+
     func encodeSiluMul(
         _ enc: MTLComputeCommandEncoder,
         buf: MTLBuffer, count: Int, gOff: Int, uOff: Int, dstOff: Int

@@ -688,6 +688,49 @@ kernel void conv_step(
     data[p.outOff + c] = acc / (1.0f + metal::exp(-acc));
 }
 
+// Cross-token conv scan (S1b): T conv_step iterations in one dispatch, one
+// thread per channel — token t's row read at inOff + t*stride and written
+// at outOff + t*stride. Each iteration is the single-step kernel's
+// arithmetic verbatim, with the K-1 history rows carried across tokens in
+// registers instead of a barrier-fenced device round trip per token, so
+// every output row and the final history are bitwise the chained steps'.
+// History registers cover 2 <= K <= 8 (target checkpoints use K = 4).
+struct ConvScanParams {
+    uint convDim;
+    uint K;
+    uint inOff;
+    uint outOff;
+    uint stride;
+    uint T;
+};
+
+kernel void conv_scan(
+    device float       *data [[buffer(0)]],
+    device float       *hist [[buffer(1)]],
+    device const float *wgt  [[buffer(2)]],   // (convDim, K)
+    constant ConvScanParams &p [[buffer(3)]],
+    uint c [[thread_position_in_grid]])
+{
+    if (c >= p.convDim) return;
+    float h[7];
+    for (uint j = 0; j + 1 < p.K; ++j) h[j] = hist[j * p.convDim + c];
+    uint inOff = p.inOff;
+    uint outOff = p.outOff;
+    for (uint t = 0; t < p.T; ++t) {
+        float xNew = data[inOff + c];
+        float acc = wgt[c * p.K + (p.K - 1)] * xNew;
+        for (uint j = 0; j + 1 < p.K; ++j) {
+            acc += wgt[c * p.K + j] * h[j];
+        }
+        for (uint j = 0; j + 2 < p.K; ++j) h[j] = h[j + 1];
+        h[p.K - 2] = xNew;
+        data[outOff + c] = acc / (1.0f + metal::exp(-acc));
+        inOff += p.stride;
+        outOff += p.stride;
+    }
+    for (uint j = 0; j + 1 < p.K; ++j) hist[j * p.convDim + c] = h[j];
+}
+
 // g = exp(-exp(A_log) * softplus(a + dt_bias)); beta = sigmoid(b).
 struct DeltaPreParams {
     uint nv;
