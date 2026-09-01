@@ -85,7 +85,8 @@ import SwiftletCore
 
     @Test func nonterminalStreamingPayloadCarriesNullFinishReason() throws {
         let payload = completionPayload(
-            id: "chatcmpl-test", text: nil, delta: "piece", finish: nil
+            id: "chatcmpl-test", text: nil, delta: "piece", finish: nil,
+            model: "swiftlet-test"
         )
         let choices = try #require(payload["choices"] as? [[String: Any]])
         let choice = try #require(choices.first)

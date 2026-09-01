@@ -298,8 +298,11 @@ import Testing
         let resetSeconds = Date().timeIntervalSince(resetStarted)
         #expect(resetSeconds < 1.0, "reset waited \(resetSeconds)s for the interrupted reply")
 
+        // A cooperative cancellation ends the stream cleanly; the session reports
+        // it through metrics rather than by throwing to the consumer.
         let failure = await consumer.value
-        #expect(failure is GenerationInterruption)
+        #expect(failure == nil)
+        #expect(session.lastMetrics.finishReason == .cancelled)
         #expect(model.calls.map(\.tokens) == [[10]])
 
         // The reset landed: the same first message renders as a fresh prompt.

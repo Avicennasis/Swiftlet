@@ -165,9 +165,14 @@ final class ConnectionGenerationOwner: @unchecked Sendable {
     (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
 }
 
+/// `model` defaults to the served model's name. Tests pass it explicitly:
+/// top-level `main.swift` globals are not initialised when the executable
+/// module is imported by a test target, so reading `modelName` there yields a
+/// null object that `JSONSerialization` rejects.
 @Sendable func completionPayload(
     id: String, text: String?, delta: String?, finish: String?,
-    usage: (prompt: Int, completion: Int)? = nil
+    usage: (prompt: Int, completion: Int)? = nil,
+    model: String = modelName
 ) -> [String: Any] {
     var choice: [String: Any] = ["index": 0]
     if let text { choice["message"] = ["role": "assistant", "content": text] }
@@ -187,7 +192,7 @@ final class ConnectionGenerationOwner: @unchecked Sendable {
         "id": id,
         "object": delta != nil ? "chat.completion.chunk" : "chat.completion",
         "created": Int(Date().timeIntervalSince1970),
-        "model": modelName,
+        "model": model,
         "choices": [choice],
     ]
     if let usage {
