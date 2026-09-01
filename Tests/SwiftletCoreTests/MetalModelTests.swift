@@ -12,32 +12,78 @@ import Testing
         .deletingLastPathComponent()
         .appendingPathComponent("fixtures")
 
+    static func maxAbsDiff(_ lhs: [Float], _ rhs: [Float]) -> Float {
+        guard lhs.count == rhs.count else { return .infinity }
+        var result: Float = 0
+        for i in lhs.indices { result = max(result, abs(lhs[i] - rhs[i])) }
+        return result
+    }
+
+    static func expectMatchingKV(
+        _ lhs: QwenCPUModel.DecodeState, _ rhs: QwenCPUModel.DecodeState,
+        label: String
+    ) {
+        #expect(lhs.position == rhs.position, "\(label): positions diverged")
+        #expect(Set(lhs.kv.keys) == Set(rhs.kv.keys), "\(label): KV layers diverged")
+        for layer in lhs.kv.keys {
+            guard let l = lhs.kv[layer], let r = rhs.kv[layer] else { continue }
+            #expect(l.k.count == r.k.count, "\(label): layer \(layer) K size diverged")
+            #expect(l.v.count == r.v.count, "\(label): layer \(layer) V size diverged")
+            #expect(Self.maxAbsDiff(l.k, r.k) < 1e-6, "\(label): layer \(layer) K diverged")
+            #expect(Self.maxAbsDiff(l.v, r.v) < 1e-6, "\(label): layer \(layer) V diverged")
+        }
+    }
+
     static func compare(_ modelName: String) throws {
         let dir = fixturesDir.appendingPathComponent(modelName)
         let cpu = try QwenCPUModel(modelDir: dir)
         cpu.retainAllLayers = true
-        let gpu = try QwenMetalModel(modelDir: dir)
+        let sequentialGPU = try QwenMetalModel(modelDir: dir)
+        let elidingGPU = try QwenMetalModel(modelDir: dir)
         let tokens = [1, 5, 9, 42, 7]
 
         let cpuState = QwenCPUModel.DecodeState()
-        let gpuState = QwenCPUModel.DecodeState()
+        let sequentialState = QwenCPUModel.DecodeState()
         var cpuLogits: [Float] = []
-        var gpuLogits: [Float] = []
+        var sequentialLogits: [Float] = []
         for t in tokens {
             cpuLogits = try cpu.step([t], state: cpuState)
-            gpuLogits = try gpu.step([t], state: gpuState)
+            sequentialLogits = try sequentialGPU.step([t], state: sequentialState)
+            #expect(sequentialGPU.lastStepMetrics.tokensProcessed == 1)
+            #expect(sequentialGPU.lastStepMetrics.logitProjections == 1)
+            #expect(sequentialGPU.lastStepMetrics.avoidedLogitProjections == 0)
         }
 
-        var maxDiff: Float = 0
-        for i in 0..<cpuLogits.count { maxDiff = max(maxDiff, abs(cpuLogits[i] - gpuLogits[i])) }
+        let maxDiff = Self.maxAbsDiff(cpuLogits, sequentialLogits)
         #expect(maxDiff < 2e-3, "\(modelName): GPU vs CPU logits maxAbsDiff \(maxDiff)")
+
+        // S1a intermediate LM-head elision must retain token-at-a-time output
+        // and state. Separate instances isolate GPU-resident recurrence.
+        let elidingState = QwenCPUModel.DecodeState()
+        let elidingLogits = try elidingGPU.step(tokens, state: elidingState)
+        let elisionDiff = Self.maxAbsDiff(sequentialLogits, elidingLogits)
+        #expect(elisionDiff < 2e-3, "\(modelName): LM-head elision logits maxAbsDiff \(elisionDiff)")
+        #expect(elidingGPU.lastStepMetrics.tokensProcessed == tokens.count)
+        #expect(elidingGPU.lastStepMetrics.logitProjections == 1)
+        #expect(elidingGPU.lastStepMetrics.avoidedLogitProjections == tokens.count - 1)
+        Self.expectMatchingKV(sequentialState, elidingState, label: "\(modelName) elision input")
+
+        let continuation = 11
+        let sequentialContinuation = try sequentialGPU.step([continuation], state: sequentialState)
+        let elidingContinuation = try elidingGPU.step([continuation], state: elidingState)
+        let continuationDiff = Self.maxAbsDiff(sequentialContinuation, elidingContinuation)
+        #expect(continuationDiff < 2e-3, "\(modelName): continuation maxAbsDiff \(continuationDiff)")
+        #expect(elidingGPU.lastStepMetrics.tokensProcessed == 1)
+        #expect(elidingGPU.lastStepMetrics.logitProjections == 1)
+        #expect(elidingGPU.lastStepMetrics.avoidedLogitProjections == 0)
+        Self.expectMatchingKV(sequentialState, elidingState, label: "\(modelName) continuation")
 
         func argmax(_ v: [Float]) -> Int {
             var b = 0
             for i in 1..<v.count where v[i] > v[b] { b = i }
             return b
         }
-        #expect(argmax(cpuLogits) == argmax(gpuLogits), "\(modelName): greedy diverged")
+        #expect(argmax(cpuLogits) == argmax(sequentialLogits), "\(modelName): greedy diverged")
     }
 
     @Test func gpuMatchesCPUOnQuantizedTiny() throws {
@@ -57,23 +103,46 @@ import Testing
 
         let cpu = try QwenCPUModel(modelDir: src)
         cpu.retainAllLayers = true
-        let gpu = try QwenMetalModel(modelDir: out, cacheBudgetGB: 0.05)
-        #expect(gpu.expertCache != nil, "qpack mode not engaged")
+        let sequentialGPU = try QwenMetalModel(modelDir: out, cacheBudgetGB: 0.05)
+        let elidingGPU = try QwenMetalModel(modelDir: out, cacheBudgetGB: 0.05)
+        #expect(sequentialGPU.expertCache != nil, "qpack mode not engaged")
+        #expect(elidingGPU.expertCache != nil, "qpack mode not engaged")
 
         let tokens = [1, 5, 9, 42, 7, 99]
         let cpuState = QwenCPUModel.DecodeState()
-        let gpuState = QwenCPUModel.DecodeState()
+        let sequentialState = QwenCPUModel.DecodeState()
         var cpuLogits: [Float] = []
-        var gpuLogits: [Float] = []
+        var sequentialLogits: [Float] = []
         for t in tokens {
             cpuLogits = try cpu.step([t], state: cpuState)
-            gpuLogits = try gpu.step([t], state: gpuState)
+            sequentialLogits = try sequentialGPU.step([t], state: sequentialState)
+            #expect(sequentialGPU.lastStepMetrics.tokensProcessed == 1)
+            #expect(sequentialGPU.lastStepMetrics.logitProjections == 1)
+            #expect(sequentialGPU.lastStepMetrics.avoidedLogitProjections == 0)
         }
-        var maxDiff: Float = 0
-        for i in 0..<cpuLogits.count { maxDiff = max(maxDiff, abs(cpuLogits[i] - gpuLogits[i])) }
+        let maxDiff = Self.maxAbsDiff(cpuLogits, sequentialLogits)
         #expect(maxDiff < 2e-3, "qpack GPU vs CPU logits maxAbsDiff \(maxDiff)")
-        let cache = gpu.expertCache!
-        #expect(cache.hits + cache.misses > 0)
+
+        let elidingState = QwenCPUModel.DecodeState()
+        let elidingLogits = try elidingGPU.step(tokens, state: elidingState)
+        let elisionDiff = Self.maxAbsDiff(sequentialLogits, elidingLogits)
+        #expect(elisionDiff < 2e-3, "qpack LM-head elision maxAbsDiff \(elisionDiff)")
+        #expect(elidingGPU.lastStepMetrics.tokensProcessed == tokens.count)
+        #expect(elidingGPU.lastStepMetrics.logitProjections == 1)
+        #expect(elidingGPU.lastStepMetrics.avoidedLogitProjections == tokens.count - 1)
+        Self.expectMatchingKV(sequentialState, elidingState, label: "qpack elision input")
+
+        let continuation = 11
+        let sequentialContinuation = try sequentialGPU.step([continuation], state: sequentialState)
+        let elidingContinuation = try elidingGPU.step([continuation], state: elidingState)
+        let continuationDiff = Self.maxAbsDiff(sequentialContinuation, elidingContinuation)
+        #expect(continuationDiff < 2e-3, "qpack continuation maxAbsDiff \(continuationDiff)")
+        #expect(elidingGPU.lastStepMetrics.logitProjections == 1)
+        Self.expectMatchingKV(sequentialState, elidingState, label: "qpack continuation")
+
+        for cache in [sequentialGPU.expertCache!, elidingGPU.expertCache!] {
+            #expect(cache.hits + cache.misses > 0)
+        }
     }
 
     @Test func gpuMatchesCPUOnQwen35Tiny() throws {
