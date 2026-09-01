@@ -24,13 +24,21 @@ demand. The result:
 | [Qwen3.6-35B-A3B, 8-bit](https://huggingface.co/Leonickson/Qwen3.6-35B-A3B-8bit-qpack) | 34 GB | 7.6 GB | 3.5 to 4 tok/s |
 | [Qwen3-Next-80B-A3B, 4-bit](https://huggingface.co/Leonickson/Qwen3-Next-80B-A3B-qpack) | 42 GB | 4.3 GB | 4.5 to 5 tok/s |
 
-Those figures are on an M5. For a low end reference, on a base M1 (8-core GPU,
-16 GB) the 4-bit 35B decodes at about 2.5 tok/s and the 8-bit at about 1.7
-tok/s, with prefill running at that same speed. On so few GPU cores the decode
-loop is fully compute bound, so the expert cache is a memory knob rather than a
-speed one there: `--cache-gb 2` matches `--cache-gb 8` while saving several GB
-of RAM, which is the better setting on a 16 GB machine. Thanks to @Avicennasis
-for the measurements (#18).
+Those figures are on an M5. For a low end anchor, a base M1 (8-core GPU, 16 GB)
+decodes the 4-bit 35B at about 2.45 tok/s and the 8-bit at about 1.74 tok/s, and
+prefill runs at roughly decode speed, so a long system prompt is expensive on
+this class of machine. On so few GPU cores the decode loop is fully compute
+bound, so the expert cache is a memory knob rather than a speed one there:
+`--cache-gb 2` matches `--cache-gb 8` while saving several GB of RAM, which is
+the better setting on a 16 GB machine.
+
+At the other end, an M4 Max (40-core GPU, 64 GB) decodes the 4-bit 35B at about
+19.5 tok/s. The configuration that shows why streaming matters is the 8-bit 80B:
+its 78.8 GiB of weights cannot be resident on a 64 GB machine at all, yet
+Swiftlet serves it in 6.9 GiB at about 4.8 tok/s, and the 4-bit 397B (207.6 GiB)
+runs in 12.6 GiB at about 1.4 tok/s. Decode speed tracks active parameters
+(about 3B for both the 35B and 80B, about 17B for the 397B) far more than
+container size. Datapoints measured by @Avicennasis (#18).
 
 The 8-bit 35B is the quality tier for Macs: tested head to head on identical
 prompts, it removes the repetition artifacts the 4-bit build can show on
@@ -168,11 +176,23 @@ swift test
 ```
 
 The test suite uses [Swift Testing](https://developer.apple.com/documentation/testing),
-which ships with the full Xcode toolchain (Xcode 16+) and with Swift.org
-toolchains. If `swift build` succeeds but `swift test` fails with
-`no such module 'Testing'`, the bare Command Line Tools are selected rather than
-a full toolchain; point at Xcode with `sudo xcode-select -s /Applications/Xcode.app`
-(or run through `xcrun`).
+which ships with the full Xcode toolchain (Xcode 16+), with Swift.org
+toolchains, and with Command Line Tools 26 and later. On CLT 26.x the framework
+is present but not on a default search path, and its interop dylib sits in a
+separate directory, so `swift test` reports `no such module 'Testing'` until you
+point the compiler and linker at both locations:
+
+```bash
+swift test \
+  -Xswiftc -F -Xswiftc /Library/Developer/CommandLineTools/Library/Developer/Frameworks \
+  -Xlinker -rpath -Xlinker /Library/Developer/CommandLineTools/Library/Developer/Frameworks \
+  -Xlinker -rpath -Xlinker /Library/Developer/CommandLineTools/Library/Developer/usr/lib
+```
+
+Older Command Line Tools do not ship Swift Testing at all; there, install Xcode
+or a Swift.org toolchain, or select an installed Xcode with
+`sudo xcode-select -s /Applications/Xcode.app`. Thanks to @Avicennasis for
+pinning down the CLT 26.x path on multiple machines (#12).
 
 ## Roadmap
 
