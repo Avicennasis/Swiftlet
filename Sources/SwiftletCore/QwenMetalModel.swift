@@ -475,9 +475,9 @@ public final class QwenMetalModel {
             logits = try stepOne(
                 t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
             )
-            try checkGenerationCancellation(shouldCancel)
             state.position += 1
             counters.tokensProcessed += 1
+            try checkGenerationCancellation(shouldCancel)
         }
         counters.completedWithoutThrow = true
         return logits

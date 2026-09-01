@@ -176,9 +176,16 @@ public final class SwiftletSession: @unchecked Sendable {
     private var statePrimed = false
 
     /// Drops the cached conversation (e.g. when the user starts a new chat).
-    /// A reset requested during generation is ordered after that request so
-    /// it cannot replace DecodeState while the model is using it.
+    /// A generation in flight is cancelled first, then the reset is ordered
+    /// behind it on the generation queue so it cannot replace DecodeState while
+    /// the model is using it. The caller therefore waits for at most one
+    /// model-safe boundary (a CPU step or Metal command buffer), not for the
+    /// remainder of the interrupted reply.
     public func resetConversation() {
+        genLock.lock()
+        let active = activeControl
+        genLock.unlock()
+        active?.cancel()
         generationQueue.sync {
             resetConversationState()
         }
@@ -198,6 +205,17 @@ public final class SwiftletSession: @unchecked Sendable {
     // replies whenever a memory warning landed mid-generation). The warning
     // handler only sets a flag; the decode thread applies it between tokens.
     private let genLock = NSLock()
+
+    /// Cancellation owner of the request currently executing on
+    /// `generationQueue`, so `resetConversation()` can interrupt it instead of
+    /// waiting for it to run to completion. Guarded by `genLock`.
+    private var activeControl: GenerationCancellation?
+
+    private func setActiveControl(_ control: GenerationCancellation?) {
+        genLock.lock()
+        activeControl = control
+        genLock.unlock()
+    }
     private var generationActive = false
     private var pendingShrinkGB: Double?
     /// Conversation state and the underlying model are both mutable. This is
@@ -415,8 +433,10 @@ public final class SwiftletSession: @unchecked Sendable {
             }
             self.generationQueue.async {
                 self.beginGeneration()
+                self.setActiveControl(control)
                 var terminalError: Swift.Error?
                 defer {
+                    self.setActiveControl(nil)
                     self.endGeneration()
                     if let terminalError {
                         continuation.finish(throwing: terminalError)

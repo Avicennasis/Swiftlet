@@ -119,9 +119,16 @@ import Testing
             if ordinal == 2, let cleanupGate, !cleanupGate.completed {
                 locked { _secondStartedBeforeCleanup = true }
             }
-            if blockFirstCall, ordinal == 1,
-               releaseFirstCall.wait(timeout: .now() + .seconds(2)) == .timedOut {
-                throw ProbeError.timedOutWaitingForRelease
+            if blockFirstCall, ordinal == 1 {
+                // Block like a long Metal/CPU step would, but observe
+                // cancellation at the same cadence a real step does.
+                let deadline = DispatchTime.now() + .seconds(2)
+                while releaseFirstCall.wait(timeout: .now() + .milliseconds(5)) == .timedOut {
+                    if shouldCancel() { throw GenerationInterruption.cancelled }
+                    if DispatchTime.now() >= deadline {
+                        throw ProbeError.timedOutWaitingForRelease
+                    }
+                }
             }
             if shouldCancel() { throw GenerationInterruption.cancelled }
             state.position += tokens.count
@@ -246,6 +253,65 @@ import Testing
         let calls = model.calls
         #expect(calls.map(\.tokens) == [[10], [65], [30]])
         #expect(Set(calls.map(\.stateID)).count == 1)
+        #expect(model.maxActiveCalls == 1)
+    }
+
+    /// A "new chat" issued mid-reply must interrupt the reply, not wait for it.
+    /// The probe blocks its first step for 2 s unless cancelled; the reset must
+    /// return well inside that window, and the following request must be a
+    /// fresh prompt rather than a continuation of the interrupted one.
+    @Test func resetConversationCancelsActiveGenerationInsteadOfWaiting() async throws {
+        let model = try SessionProbeModel(
+            modelDir: Self.fixturesDir.appendingPathComponent("tiny-model"),
+            blockFirstCall: true
+        )
+        let session = makeSession(model: model)
+        var options = SwiftletSession.GenerationOptions.greedy
+        options.minNew = 0
+
+        let stream = session.streamChat(
+            messages: [["role": "user", "content": "one"]],
+            maxNew: 4,
+            options: options
+        )
+        let consumer = Task { () -> Swift.Error? in
+            do {
+                for try await _ in stream {}
+                return nil
+            } catch {
+                return error
+            }
+        }
+        let deadline = Date().addingTimeInterval(1)
+        while !model.firstCallEntered, Date() < deadline {
+            try await Task<Never, Never>.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(model.firstCallEntered)
+
+        let resetStarted = Date()
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                session.resetConversation()
+                done.resume()
+            }
+        }
+        let resetSeconds = Date().timeIntervalSince(resetStarted)
+        #expect(resetSeconds < 1.0, "reset waited \(resetSeconds)s for the interrupted reply")
+
+        let failure = await consumer.value
+        #expect(failure is GenerationInterruption)
+        #expect(model.calls.map(\.tokens) == [[10]])
+
+        // The reset landed: the same first message renders as a fresh prompt.
+        let next = session.streamChat(
+            messages: [["role": "user", "content": "one"]],
+            maxNew: 1,
+            options: options
+        )
+        var nextOutput = ""
+        for try await delta in next { nextOutput += delta }
+        #expect(nextOutput == "A")
+        #expect(model.calls.map(\.tokens) == [[10], [10], [65]])
         #expect(model.maxActiveCalls == 1)
     }
 

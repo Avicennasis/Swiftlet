@@ -31,9 +31,10 @@ public enum GenerationFinishReason: String, Sendable {
     case cancelled
 }
 
-/// Internal control-flow error used to unwind a partially processed prompt or
-/// token. Callers must discard the associated DecodeState when this is thrown.
-enum GenerationInterruption: Swift.Error {
+/// Control-flow error used to unwind a partially processed prompt or token.
+/// Public so API callers can tell a cooperative cancellation from a failure.
+/// Callers must discard the associated DecodeState when this is thrown.
+public enum GenerationInterruption: Swift.Error {
     case cancelled
     case invalidTextStream
 }
