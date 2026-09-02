@@ -130,22 +130,22 @@ import Testing
 
         let cpu = try QwenCPUModel(modelDir: dir)
         cpu.retainAllLayers = true
-        let cpuState = QwenCPUModel.DecodeState()
+        let cpuState = cpu.makeQwenContext()
         var cpuLogits: [Float] = []
-        for t in tokens { cpuLogits = try cpu.step([t], state: cpuState) }
+        for t in tokens { cpuLogits = try cpu.step([t], context: cpuState) }
 
         // Reference: the decode loop, token at a time (never layer-major).
         let sequentialGPU = try QwenMetalModel(modelDir: dir)
-        let sequentialState = QwenCPUModel.DecodeState()
+        let sequentialState = sequentialGPU.makeQwenContext()
         var sequentialLogits: [Float] = []
-        for t in tokens { sequentialLogits = try sequentialGPU.step([t], state: sequentialState) }
+        for t in tokens { sequentialLogits = try sequentialGPU.step([t], context: sequentialState) }
 
         let layerMajorGPU = try QwenMetalModel(modelDir: dir)
         layerMajorGPU.prefillMode = .layerMajor(chunkTokens: chunkTokens)
-        let layerMajorState = QwenCPUModel.DecodeState()
+        let layerMajorState = layerMajorGPU.makeQwenContext()
         var unionSizes: [Int] = []
         layerMajorGPU.prefillExpertUnionObserver = { unionSizes.append($1.count) }
-        let layerMajorLogits = try layerMajorGPU.step(tokens, state: layerMajorState)
+        let layerMajorLogits = try layerMajorGPU.step(tokens, context: layerMajorState)
         layerMajorGPU.prefillExpertUnionObserver = nil
         let metrics = layerMajorGPU.lastStepMetrics
 
@@ -194,8 +194,8 @@ import Testing
         // Continuation decode after the layer-major prompt: same next logits
         // as the sequential state, and the decode baselines untouched.
         let continuation = 11
-        let seqCont = try sequentialGPU.step([continuation], state: sequentialState)
-        let lmCont = try layerMajorGPU.step([continuation], state: layerMajorState)
+        let seqCont = try sequentialGPU.step([continuation], context: sequentialState)
+        let lmCont = try layerMajorGPU.step([continuation], context: layerMajorState)
         let contDiff = MetalModelTests.maxAbsDiff(seqCont, lmCont)
         #expect(contDiff < 2e-3, "\(label): continuation maxAbsDiff \(contDiff)")
         #expect(argmax(seqCont) == argmax(lmCont), "\(label): continuation greedy diverged")
@@ -250,8 +250,8 @@ import Testing
         for chunk in [1, 2, 5] {
             let model = try QwenMetalModel(modelDir: dir)
             model.prefillMode = .layerMajor(chunkTokens: chunk)
-            let state = QwenCPUModel.DecodeState()
-            let logits = try model.step(tokens, state: state)
+            let state = model.makeQwenContext()
+            let logits = try model.step(tokens, context: state)
             if reference.isEmpty {
                 reference = logits
             } else {
@@ -276,8 +276,8 @@ import Testing
         let layerCount = loopModel.config.numHiddenLayers
         var loopFlat: [(layer: Int, experts: [Int])] = []
         loopModel.routedExpertObserver = { loopFlat.append(($0, $1)) }
-        let loopState = QwenCPUModel.DecodeState()
-        for t in tokens { _ = try loopModel.step([t], state: loopState) }
+        let loopState = loopModel.makeQwenContext()
+        for t in tokens { _ = try loopModel.step([t], context: loopState) }
         loopModel.routedExpertObserver = nil
         #expect(loopFlat.count == tokens.count * layerCount, "\(label): observation shape")
         var loopRoutes: [[[Int]]] = []
@@ -298,8 +298,8 @@ import Testing
         var unions: [(layer: Int, experts: [Int])] = []
         model.routedExpertObserver = { routed.append(($0, $1)) }
         model.prefillExpertUnionObserver = { unions.append(($0, $1)) }
-        let state = QwenCPUModel.DecodeState()
-        _ = try model.step(tokens, state: state)
+        let state = model.makeQwenContext()
+        _ = try model.step(tokens, context: state)
         model.routedExpertObserver = nil
         model.prefillExpertUnionObserver = nil
 
@@ -376,16 +376,16 @@ import Testing
         #expect(sequentialGPU.expertCache != nil, "qpack mode not engaged")
         #expect(layerMajorGPU.expertCache != nil, "qpack mode not engaged")
 
-        let sequentialState = QwenCPUModel.DecodeState()
+        let sequentialState = sequentialGPU.makeQwenContext()
         var sequentialLogits: [Float] = []
-        for t in tokens { sequentialLogits = try sequentialGPU.step([t], state: sequentialState) }
+        for t in tokens { sequentialLogits = try sequentialGPU.step([t], context: sequentialState) }
 
         var unionSizes: [Int] = []
         layerMajorGPU.prefillExpertUnionObserver = { unionSizes.append($1.count) }
         let cache = layerMajorGPU.expertCache!
         let requestsBefore = cache.hits + cache.misses
-        let layerMajorState = QwenCPUModel.DecodeState()
-        let layerMajorLogits = try layerMajorGPU.step(tokens, state: layerMajorState)
+        let layerMajorState = layerMajorGPU.makeQwenContext()
+        let layerMajorLogits = try layerMajorGPU.step(tokens, context: layerMajorState)
         layerMajorGPU.prefillExpertUnionObserver = nil
         let requests = cache.hits + cache.misses - requestsBefore
 
@@ -413,8 +413,8 @@ import Testing
                 "union fetches exceed token-major traffic")
 
         let continuation = 11
-        let seqCont = try sequentialGPU.step([continuation], state: sequentialState)
-        let lmCont = try layerMajorGPU.step([continuation], state: layerMajorState)
+        let seqCont = try sequentialGPU.step([continuation], context: sequentialState)
+        let lmCont = try layerMajorGPU.step([continuation], context: layerMajorState)
         let contDiff = MetalModelTests.maxAbsDiff(seqCont, lmCont)
         #expect(contDiff < 2e-3, "qpack layer-major continuation maxAbsDiff \(contDiff)")
         MetalModelTests.expectMatchingKV(

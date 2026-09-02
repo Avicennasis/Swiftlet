@@ -56,8 +56,8 @@ import Testing
     @Test func phaseGpuSecondsDiscriminateBySupport() throws {
         let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
         let model = try QwenMetalModel(modelDir: dir)
-        let state = QwenCPUModel.DecodeState()
-        _ = try model.step([1, 5, 9], state: state)
+        let state = model.makeQwenContext()
+        _ = try model.step([1, 5, 9], context: state)
         let metrics = model.lastStepMetrics
         #expect(metrics.completedWithoutThrow)
 
@@ -106,8 +106,8 @@ import Testing
     @Test func signpostIntervalsMirrorTheTimeline() throws {
         let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
         let model = try QwenMetalModel(modelDir: dir)
-        let state = QwenCPUModel.DecodeState()
-        _ = try model.step([1, 5, 9], state: state)
+        let state = model.makeQwenContext()
+        _ = try model.step([1, 5, 9], context: state)
         let metrics = model.lastStepMetrics
         let tally = model.lastSignpostTally
         #expect(tally.stepIntervals == 1, "step interval count")
@@ -117,7 +117,7 @@ import Testing
         #expect(tally.phaseIntervals == phaseScopes,
                 "phase intervals diverge from the timeline's phase scopes")
 
-        _ = try model.step([11], state: state)
+        _ = try model.step([11], context: state)
         let single = model.lastSignpostTally
         #expect(single.stepIntervals == 1, "tally accumulated across steps")
         #expect(single.commandBufferIntervals

@@ -56,7 +56,7 @@ import Testing
     }
 
     static func expectMatchingKV(
-        _ lhs: QwenCPUModel.DecodeState, _ rhs: QwenCPUModel.DecodeState,
+        _ lhs: QwenInferenceContext, _ rhs: QwenInferenceContext,
         label: String
     ) {
         #expect(lhs.position == rhs.position, "\(label): positions diverged")
@@ -194,13 +194,13 @@ import Testing
         elidingGPU.prefillMode = .tokenMajor
         let tokens = [1, 5, 9, 42, 7]
 
-        let cpuState = QwenCPUModel.DecodeState()
-        let sequentialState = QwenCPUModel.DecodeState()
+        let cpuState = cpu.makeQwenContext()
+        let sequentialState = sequentialGPU.makeQwenContext()
         var cpuLogits: [Float] = []
         var sequentialLogits: [Float] = []
         for t in tokens {
-            cpuLogits = try cpu.step([t], state: cpuState)
-            sequentialLogits = try sequentialGPU.step([t], state: sequentialState)
+            cpuLogits = try cpu.step([t], context: cpuState)
+            sequentialLogits = try sequentialGPU.step([t], context: sequentialState)
             #expect(sequentialGPU.lastStepMetrics.tokensProcessed == 1)
             #expect(sequentialGPU.lastStepMetrics.logitProjections == 1)
             #expect(sequentialGPU.lastStepMetrics.avoidedLogitProjections == 0)
@@ -221,8 +221,8 @@ import Testing
 
         // S1a intermediate LM-head elision must retain token-at-a-time output
         // and state. Separate instances isolate GPU-resident recurrence.
-        let elidingState = QwenCPUModel.DecodeState()
-        let elidingLogits = try elidingGPU.step(tokens, state: elidingState)
+        let elidingState = elidingGPU.makeQwenContext()
+        let elidingLogits = try elidingGPU.step(tokens, context: elidingState)
         let multiMetrics = elidingGPU.lastStepMetrics
         let elisionDiff = Self.maxAbsDiff(sequentialLogits, elidingLogits)
         #expect(elisionDiff < 2e-3, "\(modelName): LM-head elision logits maxAbsDiff \(elisionDiff)")
@@ -241,8 +241,8 @@ import Testing
         Self.expectMatchingKV(sequentialState, elidingState, label: "\(modelName) elision input")
 
         let continuation = 11
-        let sequentialContinuation = try sequentialGPU.step([continuation], state: sequentialState)
-        let elidingContinuation = try elidingGPU.step([continuation], state: elidingState)
+        let sequentialContinuation = try sequentialGPU.step([continuation], context: sequentialState)
+        let elidingContinuation = try elidingGPU.step([continuation], context: elidingState)
         let continuationDiff = Self.maxAbsDiff(sequentialContinuation, elidingContinuation)
         #expect(continuationDiff < 2e-3, "\(modelName): continuation maxAbsDiff \(continuationDiff)")
         #expect(elidingGPU.lastStepMetrics.tokensProcessed == 1)
@@ -282,8 +282,8 @@ import Testing
         let model = try QwenMetalModel(modelDir: dir)
         // Pins the legacy token-major prompt schedule (S1a).
         model.prefillMode = .tokenMajor
-        let state = QwenCPUModel.DecodeState()
-        _ = try model.step([1, 5, 9], state: state)
+        let state = model.makeQwenContext()
+        _ = try model.step([1, 5, 9], context: state)
         let multi = model.lastStepMetrics
         Self.expectInstrumentation(multi, tokens: 3, label: "timeline multi")
         Self.expectFastPathBaseline(
@@ -298,7 +298,7 @@ import Testing
         #expect(encodeSum + multi.blockingWaitSeconds <= multi.stepWallSeconds + 1e-3,
                 "timeline multi: encode+wait exceeds the step wall clock")
 
-        _ = try model.step([11], state: state)
+        _ = try model.step([11], context: state)
         let single = model.lastStepMetrics
         Self.expectPhaseTimeline(
             single,
@@ -332,13 +332,13 @@ import Testing
         #expect(elidingGPU.expertCache != nil, "qpack mode not engaged")
 
         let tokens = [1, 5, 9, 42, 7, 99]
-        let cpuState = QwenCPUModel.DecodeState()
-        let sequentialState = QwenCPUModel.DecodeState()
+        let cpuState = cpu.makeQwenContext()
+        let sequentialState = sequentialGPU.makeQwenContext()
         var cpuLogits: [Float] = []
         var sequentialLogits: [Float] = []
         for t in tokens {
-            cpuLogits = try cpu.step([t], state: cpuState)
-            sequentialLogits = try sequentialGPU.step([t], state: sequentialState)
+            cpuLogits = try cpu.step([t], context: cpuState)
+            sequentialLogits = try sequentialGPU.step([t], context: sequentialState)
             #expect(sequentialGPU.lastStepMetrics.tokensProcessed == 1)
             #expect(sequentialGPU.lastStepMetrics.logitProjections == 1)
             #expect(sequentialGPU.lastStepMetrics.avoidedLogitProjections == 0)
@@ -356,8 +356,8 @@ import Testing
         let maxDiff = Self.maxAbsDiff(cpuLogits, sequentialLogits)
         #expect(maxDiff < 2e-3, "qpack GPU vs CPU logits maxAbsDiff \(maxDiff)")
 
-        let elidingState = QwenCPUModel.DecodeState()
-        let elidingLogits = try elidingGPU.step(tokens, state: elidingState)
+        let elidingState = elidingGPU.makeQwenContext()
+        let elidingLogits = try elidingGPU.step(tokens, context: elidingState)
         let multiMetrics = elidingGPU.lastStepMetrics
         let elisionDiff = Self.maxAbsDiff(sequentialLogits, elidingLogits)
         #expect(elisionDiff < 2e-3, "qpack LM-head elision maxAbsDiff \(elisionDiff)")
@@ -377,8 +377,8 @@ import Testing
         Self.expectMatchingKV(sequentialState, elidingState, label: "qpack elision input")
 
         let continuation = 11
-        let sequentialContinuation = try sequentialGPU.step([continuation], state: sequentialState)
-        let elidingContinuation = try elidingGPU.step([continuation], state: elidingState)
+        let sequentialContinuation = try sequentialGPU.step([continuation], context: sequentialState)
+        let elidingContinuation = try elidingGPU.step([continuation], context: elidingState)
         let continuationDiff = Self.maxAbsDiff(sequentialContinuation, elidingContinuation)
         #expect(continuationDiff < 2e-3, "qpack continuation maxAbsDiff \(continuationDiff)")
         #expect(elidingGPU.lastStepMetrics.logitProjections == 1)

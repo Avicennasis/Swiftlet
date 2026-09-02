@@ -129,8 +129,8 @@ import Testing
         let layerCount = loopModel.config.numHiddenLayers
         var loopFlat: [(layer: Int, experts: [Int])] = []
         loopModel.routedExpertObserver = { loopFlat.append(($0, $1)) }
-        let loopState = QwenCPUModel.DecodeState()
-        for t in tokens { _ = try loopModel.step([t], state: loopState) }
+        let loopState = loopModel.makeQwenContext()
+        for t in tokens { _ = try loopModel.step([t], context: loopState) }
         loopModel.routedExpertObserver = nil
 
         // S1a prefill-style path: one multi-token prompt call, pinned to the
@@ -141,8 +141,8 @@ import Testing
         promptModel.prefillMode = .tokenMajor
         var promptFlat: [(layer: Int, experts: [Int])] = []
         promptModel.routedExpertObserver = { promptFlat.append(($0, $1)) }
-        let promptState = QwenCPUModel.DecodeState()
-        _ = try promptModel.step(tokens, state: promptState)
+        let promptState = promptModel.makeQwenContext()
+        _ = try promptModel.step(tokens, context: promptState)
         promptModel.routedExpertObserver = nil
 
         let loopRoutes = tokenMajor(loopFlat, tokens: tokens.count, layerCount: layerCount)

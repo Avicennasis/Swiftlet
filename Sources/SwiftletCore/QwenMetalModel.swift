@@ -821,8 +821,10 @@ public final class QwenMetalModel {
 
     // MARK: - Step
 
-    /// Incremental step matching QwenCPUModel.step semantics.
-    public func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
+    /// Incremental step matching QwenCPUModel.step semantics. The context
+    /// must come from this instance (see QwenInferenceContext).
+    public func step(_ tokens: [Int], context state: QwenInferenceContext) throws -> [Float] {
+        try state.checkOwner(self)
         let counters = StepCounters()
         if case .dispatchBoundaryCounters = phaseGpuSplitSupport {
             counters.phaseGpuSeconds = [:]

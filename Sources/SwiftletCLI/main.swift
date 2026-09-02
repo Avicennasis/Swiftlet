@@ -242,9 +242,9 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         if let vs = obj["eos_token_id"] as? [Int] { eos.formUnion(vs) }
     }
 
-    let state = QwenCPUModel.DecodeState()
+    let context = model.makeContext()
     let prefillStart = Date()
-    var logits = try model.step(ids, state: state)
+    var logits = try model.step(ids, context: context)
     let prefillSecs = -prefillStart.timeIntervalSinceNow
     if let metal = model as? QwenMetalModel {
         let m = metal.lastStepMetrics
@@ -277,7 +277,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     let decodeStart = Date()
     for _ in 0..<maxNew {
         var best = 0
-        for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }
+        for v in 1..<model.vocabSize where logits[v] > logits[best] { best = v }
         if eos.contains(best) { break }
         generated.append(best)
         if let tokenizer {
@@ -293,7 +293,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             print(best, terminator: " ")
             fflush(stdout)
         }
-        logits = try model.step([best], state: state)
+        logits = try model.step([best], context: context)
         if let metal = model as? QwenMetalModel {
             decodeMetal.add(metal.lastStepMetrics)
         }

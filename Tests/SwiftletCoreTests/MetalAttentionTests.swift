@@ -26,11 +26,11 @@ import Testing
         cpu.retainAllLayers = true
         let gpu = try QwenMetalModel(modelDir: dir)
         let tokens = [1, 5, 9, 42, 7]
-        let cpuState = QwenCPUModel.DecodeState()
-        let gpuState = QwenCPUModel.DecodeState()
+        let cpuState = cpu.makeQwenContext()
+        let gpuState = gpu.makeQwenContext()
         for t in tokens {
-            _ = try cpu.step([t], state: cpuState)
-            _ = try gpu.step([t], state: gpuState)
+            _ = try cpu.step([t], context: cpuState)
+            _ = try gpu.step([t], context: gpuState)
         }
 
         var attentionLayers = 0
@@ -67,13 +67,13 @@ import Testing
         let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
         let tokens = [1, 5, 9, 42, 7]
         let sequential = try QwenMetalModel(modelDir: dir)
-        let seqState = QwenCPUModel.DecodeState()
-        for t in tokens { _ = try sequential.step([t], state: seqState) }
+        let seqState = sequential.makeQwenContext()
+        for t in tokens { _ = try sequential.step([t], context: seqState) }
 
         let chunked = try QwenMetalModel(modelDir: dir)
         chunked.prefillMode = .layerMajor(chunkTokens: 2) // crosses chunk boundaries
-        let chunkState = QwenCPUModel.DecodeState()
-        _ = try chunked.step(tokens, state: chunkState)
+        let chunkState = chunked.makeQwenContext()
+        _ = try chunked.step(tokens, context: chunkState)
 
         for li in 0..<chunked.config.numHiddenLayers where !chunked.config.isLinearLayer(li) {
             let seqRows = try #require(
@@ -96,8 +96,8 @@ import Testing
     @Test func attentionDecodeEncodesOneBufferPerLayer() throws {
         let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
         let model = try QwenMetalModel(modelDir: dir)
-        let state = QwenCPUModel.DecodeState()
-        _ = try model.step([1], state: state)
+        let state = model.makeQwenContext()
+        _ = try model.step([1], context: state)
         let timeline = model.lastStepMetrics.commandBufferTimeline
         #expect(timeline.count == model.config.numHiddenLayers + 1,
                 "decode is not one buffer per layer plus the tail")
