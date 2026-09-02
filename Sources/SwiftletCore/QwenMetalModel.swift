@@ -325,7 +325,9 @@ public final class QwenMetalModel {
     var sBuf: MTLBuffer?
     var hBuf: MTLBuffer?
     var reg = Regions()
-    var boundStateID: ObjectIdentifier?
+    /// The context whose conv history and delta recurrence currently sit in
+    /// the fast path's per-layer GPU buffers (see bindContext).
+    weak var boundContext: QwenInferenceContext?
     struct PendingMoE {
         var bufs: [MTLBuffer]
         var weights: [Float]
@@ -1344,7 +1346,7 @@ extension QwenMetalModel {
             count: n))
     }
 
-    private func resetGPUState() {
+    func resetGPUState() {
         for fl in fastLayers {
             if let h = fl.hist { memset(h.contents(), 0, h.length) }
             if let st = fl.state { memset(st.contents(), 0, st.length) }
@@ -1519,10 +1521,7 @@ extension QwenMetalModel {
     ) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
-        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
-            boundStateID = ObjectIdentifier(state)
-            if state.position == 0 { resetGPUState() }
-        }
+        try bindContext(state)
 
         let h0 = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
         h0.withUnsafeBufferPointer {
@@ -1813,7 +1812,7 @@ extension QwenMetalModel {
         case kvCacheAllocationFailed(layer: Int, rows: Int)
     }
 
-    private var kvRowFloats: Int { config.numKeyValueHeads * config.headDim }
+    var kvRowFloats: Int { config.numKeyValueHeads * config.headDim }
 
     /// Grows layer `li`'s GPU KV cache to hold at least `rows` positions
     /// (doubling; written rows copied across). Only called between command
@@ -2128,10 +2127,7 @@ extension QwenMetalModel {
         let cfg = config
         let D = cfg.hiddenSize
         let S = chunk.count
-        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
-            boundStateID = ObjectIdentifier(state)
-            if state.position == 0 { resetGPUState() }
-        }
+        try bindContext(state)
         let basePosition = state.position
 
         for (t, token) in chunk.enumerated() {

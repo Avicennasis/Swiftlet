@@ -134,4 +134,60 @@ import Testing
         let gpuRuns = try run(gpu)
         #expect(gpuRuns.fresh == gpuRuns.reused, "Metal: reset context diverges from fresh")
     }
+
+    /// One model, two live contexts, stepped alternately, must produce the
+    /// same logits and KV rows as each sequence run alone on that model.
+    /// On the Metal fast path the bound context's conv history and delta
+    /// recurrence live in GPU buffers, so a switch has to capture them into
+    /// the outgoing context and restore the incoming one's (plus its KV
+    /// rows, which the other context overwrote at the same positions).
+    @Test func interleavedContextsMatchIsolatedRuns() throws {
+        let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
+        let a = [1, 5, 9, 42, 7, 99]
+        let b = [3, 17, 64, 2, 11, 5]
+
+        func isolated(_ model: any InferenceModel, _ seq: [Int]) throws
+            -> (logits: [[Float]], context: QwenInferenceContext) {
+            let ctx = model.makeContext()
+            // Multi-token prefill then single-token decode: both step shapes.
+            var out = [try model.step(Array(seq[0..<3]), context: ctx)]
+            for t in seq[3...] { out.append(try model.step([t], context: ctx)) }
+            return (out, ctx as! QwenInferenceContext)
+        }
+
+        func interleaved(_ model: any InferenceModel) throws
+            -> (a: [[Float]], b: [[Float]], ctxA: QwenInferenceContext, ctxB: QwenInferenceContext) {
+            let ctxA = model.makeContext()
+            let ctxB = model.makeContext()
+            var outA = [try model.step(Array(a[0..<3]), context: ctxA)]
+            var outB = [try model.step(Array(b[0..<3]), context: ctxB)]
+            for i in 3..<a.count {
+                outA.append(try model.step([a[i]], context: ctxA))
+                outB.append(try model.step([b[i]], context: ctxB))
+            }
+            return (outA, outB, ctxA as! QwenInferenceContext, ctxB as! QwenInferenceContext)
+        }
+
+        func check(_ model: any InferenceModel, label: String) throws {
+            let refA = try isolated(model, a)
+            let refB = try isolated(model, b)
+            let mixed = try interleaved(model)
+            #expect(mixed.a == refA.logits, "\(label): sequence A diverges when interleaved")
+            #expect(mixed.b == refB.logits, "\(label): sequence B diverges when interleaved")
+            #expect(mixed.ctxA.position == a.count && mixed.ctxB.position == b.count)
+            for (layer, ref) in refA.context.kv {
+                let got = try #require(mixed.ctxA.kv[layer], "\(label): A lost KV layer \(layer)")
+                #expect(got.k == ref.k && got.v == ref.v, "\(label): A KV layer \(layer) diverged")
+            }
+            for (layer, ref) in refB.context.kv {
+                let got = try #require(mixed.ctxB.kv[layer], "\(label): B lost KV layer \(layer)")
+                #expect(got.k == ref.k && got.v == ref.v, "\(label): B KV layer \(layer) diverged")
+            }
+        }
+
+        let cpu = try QwenCPUModel(modelDir: dir)
+        cpu.retainAllLayers = true
+        try check(cpu, label: "CPU")
+        try check(try QwenMetalModel(modelDir: dir), label: "Metal")
+    }
 }
