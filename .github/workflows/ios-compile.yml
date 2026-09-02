@@ -1,0 +1,40 @@
+name: iOS compile check (fork-only)
+
+# One-off, fork-only: compiles SwiftletCore for iOS on a hosted macOS runner
+# for the two open PR heads, because no fleet Mac has Xcode. Not part of any
+# upstream PR. Triggered by pushing this branch or by workflow_dispatch.
+on:
+  push:
+    branches: [ci/ios-compile-check]
+  workflow_dispatch:
+
+jobs:
+  ios-compile:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: physical-expert-cache-budget
+            ref: feat/physical-expert-cache-budget
+          - name: context-capacity-admission
+            ref: feat/context-capacity-admission
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          git rev-parse HEAD
+      - name: Resolve packages
+        run: swift package resolve
+      - name: Build SwiftletCore for iOS
+        run: |
+          xcodebuild -scheme SwiftletCore \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath .derived \
+            CODE_SIGNING_ALLOWED=NO \
+            build | tail -40
+          test "${PIPESTATUS[0]}" -eq 0
