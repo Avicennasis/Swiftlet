@@ -242,7 +242,22 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         if let vs = obj["eos_token_id"] as? [Int] { eos.formUnion(vs) }
     }
 
-    let context = model.makeContext()
+    // S6: --load-state resumes a saved context; the prompt/ids are then the
+    // continuation of that sequence (raw tokens, no template). The snapshot
+    // holds state, not the pending logits, so at least one token is needed.
+    let context: any InferenceContext
+    if let loadPath = flagValue(CommandLine.arguments, "--load-state") {
+        guard let persistable = model as? any PersistableInferenceModel else {
+            throw CLIError.statePersistenceUnavailable
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: loadPath))
+        context = try persistable.restoreContext(from: data)
+        FileHandle.standardError.write(Data(
+            "loaded state: \(loadPath) (\(data.count) bytes, position \(context.position))\n".utf8))
+    } else {
+        context = model.makeContext()
+    }
+    guard !ids.isEmpty else { throw CLIError.emptyPrompt }
     let prefillStart = Date()
     var logits = try model.step(ids, context: context)
     let prefillSecs = -prefillStart.timeIntervalSinceNow
@@ -308,6 +323,10 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         format: "decode: %d tokens in %.1fs (%.2f tok/s)\n",
         generated.count, decodeSecs, Double(generated.count) / max(decodeSecs, 0.001)
     ).utf8))
+    // Raw ids, so a resumed run (--load-state --ids ...) can be compared
+    // token for token against an uninterrupted one.
+    FileHandle.standardError.write(Data(
+        "generated ids: \(generated.map(String.init).joined(separator: ","))\n".utf8))
     if model is QwenMetalModel {
         let gpu = gpuTimingSummary(
             seconds: decodeMetal.gpuExecutionSeconds,
@@ -332,6 +351,29 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             cache.slotCount, Double(cache.slotCount * cache.stride) / 1_073_741_824,
             cache.hits, cache.misses, total > 0 ? 100 * Double(cache.hits) / Double(total) : 0
         ).utf8))
+    }
+    // S6: --save-state writes the context as it stands after the last
+    // generated token was fed (prompt + every generated token).
+    if let savePath = flagValue(CommandLine.arguments, "--save-state") {
+        guard let persistable = model as? any PersistableInferenceModel else {
+            throw CLIError.statePersistenceUnavailable
+        }
+        let data = try persistable.snapshot(of: context)
+        try data.write(to: URL(fileURLWithPath: savePath), options: .atomic)
+        FileHandle.standardError.write(Data(
+            "saved state: \(savePath) (\(data.count) bytes, position \(context.position))\n".utf8))
+    }
+}
+
+enum CLIError: Swift.Error, CustomStringConvertible {
+    case statePersistenceUnavailable
+    case emptyPrompt
+
+    var description: String {
+        switch self {
+        case .statePersistenceUnavailable: return "this model cannot save or load state"
+        case .emptyPrompt: return "nothing to feed: give --prompt or --ids (a loaded state needs at least one new token)"
+        }
     }
 }
 
@@ -443,9 +485,12 @@ default:
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
     print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
     print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy]")
+    print("                                [--save-state <file>] [--load-state <file>]")
     print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
     print("")
     print("  --gpu       Metal runtime; on a .qpack container experts stream through a bounded cache")
     print("  --cache-gb  expert cache budget, default 8 (note: swiftlet-server defaults to 2)")
     print("  --lazy      CPU path only: ~3 GB peak instead of ~10-14 GB, slower per step")
+    print("  --save-state  after generating, write the context (KV, DeltaNet state, position) to <file>")
+    print("  --load-state  resume from <file>; --prompt/--ids are then fed as the continuation (docs/STATE_FORMAT.md)")
 }
