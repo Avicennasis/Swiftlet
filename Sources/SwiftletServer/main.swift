@@ -460,6 +460,7 @@ final class HTTPHandler: ChannelInboundHandler {
                             let status: HTTPResponseStatus = badRequest
                                 ? .badRequest : .internalServerError
                             var head = HTTPResponseHead(version: .http1_1, status: status)
+                            head.headers.add(name: "Content-Type", value: "application/json")
                             head.headers.add(name: "Content-Length", value: String(data.count))
                             var buf = channel.allocator.buffer(capacity: data.count)
                             buf.writeBytes(data)
