@@ -465,6 +465,10 @@ public final class QwenMetalModel {
             )
         }
 
+        try ContextWindow(maximumTokens: config.maxPositionEmbeddings).validateStep(
+            processedTokens: state.position, incomingTokens: tokens.count
+        )
+
         var logits: [Float] = []
         for (index, t) in tokens.enumerated() {
             try checkGenerationCancellation(shouldCancel)

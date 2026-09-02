@@ -462,6 +462,13 @@ public final class SwiftletSession: @unchecked Sendable {
                         self.resetConversationState()
                         suffix = try self.freshPromptIds(messages)
                     }
+                    let admittedMaxNew = try ContextWindow(
+                        maximumTokens: self.model.contextCapacity
+                    ).admittedMaxNew(
+                        processedTokens: self.convState.position,
+                        incomingTokens: suffix.count,
+                        requestedMaxNew: maxNew
+                    )
 
                     let start = Date()
                     var firstTokenAt: Date?
@@ -480,7 +487,7 @@ public final class SwiftletSession: @unchecked Sendable {
                         )
                         prefillDone = Date()
 
-                        for _ in 0..<max(0, maxNew) {
+                        for _ in 0..<admittedMaxNew {
                             try checkGenerationCancellation { control.isCancelled }
                             self.applyPendingShrink()
                             try checkGenerationCancellation { control.isCancelled }
