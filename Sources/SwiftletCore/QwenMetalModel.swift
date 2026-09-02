@@ -1914,22 +1914,23 @@ extension QwenMetalModel {
     /// Appends rows [position, position + count) of layer `li`'s GPU KV
     /// cache to the CPU-side mirror in state.kv. The GPU rows are the
     /// source of truth for the attention math; the mirror keeps state.kv the
-    /// observable KV state (parity assertions and future persistence read
-    /// it) at the cost of one memcpy out of shared memory per layer.
+    /// observable KV state (parity assertions and persistence read it) at
+    /// the cost of one memcpy of the new rows per layer. Appended in place
+    /// through the dictionary's modify accessor: copying the entry out,
+    /// appending, and storing it back duplicates the whole history every
+    /// step (S3c measured that at 1.5 ms/step by 567 rows, growing linearly).
     func appendKVMirror(
         _ state: QwenCPUModel.DecodeState, layer li: Int, position: Int, count: Int
     ) {
         guard let k = fastLayers[li].kCache, let v = fastLayers[li].vCache else { return }
         let n = count * kvRowFloats
         let byteOff = position * kvRowFloats * 4
-        var cache = state.kv[li] ?? (k: [], v: [])
-        cache.k.append(contentsOf: UnsafeBufferPointer(
+        state.kv[li, default: (k: [], v: [])].k.append(contentsOf: UnsafeBufferPointer(
             start: k.contents().advanced(by: byteOff).bindMemory(to: Float.self, capacity: n),
             count: n))
-        cache.v.append(contentsOf: UnsafeBufferPointer(
+        state.kv[li, default: (k: [], v: [])].v.append(contentsOf: UnsafeBufferPointer(
             start: v.contents().advanced(by: byteOff).bindMemory(to: Float.self, capacity: n),
             count: n))
-        state.kv[li] = cache
     }
 
     /// Test/introspection hook: layer `li`'s GPU-resident KV rows for
