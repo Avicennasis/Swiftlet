@@ -23,6 +23,11 @@ S4 verdict: **NO-GO (defer async expert loading)** — traces attribute the
 warm-path cost to command-buffer waits and GPU execution, not storage. Details
 in "S4 go/no-go" below.
 
+Low-end sibling: the same protocol on a base M1 Mac mini (8-core GPU, 16 GB),
+upstream `aaa910a` vs PR #24 `5d8b2ab` with a `--cache-gb` 2/4/6 sweep, is in
+[`BENCH_QWEN36_35B_M1_MINI.md`](BENCH_QWEN36_35B_M1_MINI.md) — the
+RAM-constrained trace the S4 note below asks for.
+
 ## Environment
 
 Per the Benchmark contract in the port roadmap (`ROADMAP.md`, origin/main of
