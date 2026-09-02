@@ -453,6 +453,10 @@ public final class QwenMetalModel {
             )
         }
 
+        try ContextWindow(maximumTokens: config.maxPositionEmbeddings).validateStep(
+            processedTokens: state.position, incomingTokens: tokens.count
+        )
+
         var logits: [Float] = []
         for (index, t) in tokens.enumerated() {
             // S1a LM-head elision: a multi-token call consumes only the final

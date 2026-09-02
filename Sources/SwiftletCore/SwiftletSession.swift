@@ -346,6 +346,13 @@ public final class SwiftletSession: @unchecked Sendable {
                         self.resetConversation()
                         suffix = try self.freshPromptIds(messages)
                     }
+                    let admittedMaxNew = try ContextWindow(
+                        maximumTokens: self.model.contextCapacity
+                    ).admittedMaxNew(
+                        processedTokens: self.convState.position,
+                        incomingTokens: suffix.count,
+                        requestedMaxNew: maxNew
+                    )
 
                     let start = Date()
                     var firstTokenAt: Date?
@@ -358,8 +365,8 @@ public final class SwiftletSession: @unchecked Sendable {
                     let prefillDone = Date()
 
                     var decodeSeconds = 0.0
-                    var stopReason = "maxNew"
-                    for _ in 0..<maxNew {
+                    var stopReason = admittedMaxNew < maxNew ? "context-limit" : "maxNew"
+                    for _ in 0..<admittedMaxNew {
                         self.applyPendingShrink()
                         // EOS is legal when the reply reads finished (ends at
                         // a sentence or line break; a stop after "are:"
