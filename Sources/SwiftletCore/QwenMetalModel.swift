@@ -373,9 +373,12 @@ public final class QwenMetalModel {
     /// immediately; the new cache refills lazily). Memory-pressure valve.
     public func shrinkCache(toGB gb: Double) {
         guard expertCache != nil else { return }
+        // Int(Double) traps on NaN, infinity, and out-of-range values; a
+        // pressure valve must refuse such a request, not crash on it.
+        let bytes = gb * 1_073_741_824
+        guard bytes >= 0, let budget = Int(exactly: bytes.rounded(.down)) else { return }
         guard let replacement = try? ExpertCache(
-            containerDir: ckpt.dir, device: engine.device,
-            budgetBytes: Int(gb * 1_073_741_824)
+            containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
         ) else { return }
         expertCache = replacement
     }

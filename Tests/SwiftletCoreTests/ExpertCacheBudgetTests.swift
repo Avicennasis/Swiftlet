@@ -16,6 +16,28 @@ import Testing
         ) == 8)
     }
 
+    @Test func rejectsInvalidCapacityInputs() {
+        #expect(ExpertCacheBudget.slotCapacity(
+            limitBytes: -1, stride: 1_000, totalSlots: 100
+        ) == nil)
+        #expect(ExpertCacheBudget.slotCapacity(
+            limitBytes: 16_000, stride: 0, totalSlots: 100
+        ) == nil)
+        #expect(ExpertCacheBudget.slotCapacity(
+            limitBytes: 16_000, stride: 1_000, totalSlots: 0
+        ) == nil)
+        #expect(ExpertCacheBudget.slotCapacity(
+            limitBytes: 16_000, stride: 1_000, totalSlots: 100, minimumSlots: -1
+        ) == nil)
+        // Zero budget is well-formed input; it is the minimum that rejects it.
+        #expect(ExpertCacheBudget.slotCapacity(
+            limitBytes: 0, stride: 1_000, totalSlots: 100
+        ) == nil)
+        #expect(ExpertCacheBudget.slotCapacity(
+            limitBytes: 0, stride: 1_000, totalSlots: 100, minimumSlots: 0
+        ) == 0)
+    }
+
     @Test func chargesPhysicalAllocationWithoutCrossingLimit() {
         var budget = ExpertCacheBudget(limitBytes: 100)
 
