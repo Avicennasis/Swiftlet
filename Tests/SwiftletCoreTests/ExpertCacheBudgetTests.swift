@@ -19,22 +19,30 @@ import Testing
     @Test func chargesPhysicalAllocationWithoutCrossingLimit() {
         var budget = ExpertCacheBudget(limitBytes: 100)
 
-        #expect(budget.reserve(64))
+        let first = budget.reserve(64)
+        #expect(first)
         #expect(budget.allocatedBytes == 64)
-        #expect(!budget.reserve(37))
+        let over = budget.reserve(37)
+        #expect(!over)
         #expect(budget.allocatedBytes == 64)
-        #expect(budget.reserve(36))
+        let exact = budget.reserve(36)
+        #expect(exact)
         #expect(budget.allocatedBytes == 100)
-        #expect(!budget.reserve(1))
+        let full = budget.reserve(1)
+        #expect(!full)
     }
 
     @Test func reservationIsOverflowSafe() {
         var budget = ExpertCacheBudget(limitBytes: .max)
 
-        #expect(!budget.reserve(0))
-        #expect(!budget.reserve(-1))
-        #expect(budget.reserve(Int.max - 1))
-        #expect(!budget.reserve(2))
+        let zero = budget.reserve(0)
+        let negative = budget.reserve(-1)
+        let nearlyFull = budget.reserve(Int.max - 1)
+        let overflow = budget.reserve(2)
+        #expect(!zero)
+        #expect(!negative)
+        #expect(nearlyFull)
+        #expect(!overflow)
         #expect(budget.allocatedBytes == Int.max - 1)
     }
 }
