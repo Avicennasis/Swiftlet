@@ -237,8 +237,11 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     if let metal = model as? QwenMetalModel, let cache = metal.expertCache {
         let total = cache.hits + cache.misses
         FileHandle.standardError.write(Data(String(
-            format: "expert cache: %d slots (%.1f GB), %d hits / %d misses (%.0f%% hit rate)\n",
-            cache.slotCount, Double(cache.slotCount * cache.stride) / 1_073_741_824,
+            format: "expert cache: %d/%d slots (%.1f GB logical, %.1f GB allocated / %.1f GB budget), %d hits / %d misses (%.0f%% hit rate)\n",
+            cache.allocatedSlots, cache.slotCount,
+            Double(cache.logicalBytes) / 1_073_741_824,
+            Double(cache.allocatedBytes) / 1_073_741_824,
+            Double(cache.budgetBytes) / 1_073_741_824,
             cache.hits, cache.misses, total > 0 ? 100 * Double(cache.hits) / Double(total) : 0
         ).utf8))
     }

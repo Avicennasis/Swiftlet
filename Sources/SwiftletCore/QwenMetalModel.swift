@@ -373,10 +373,11 @@ public final class QwenMetalModel {
     /// immediately; the new cache refills lazily). Memory-pressure valve.
     public func shrinkCache(toGB gb: Double) {
         guard expertCache != nil else { return }
-        expertCache = try? ExpertCache(
+        guard let replacement = try? ExpertCache(
             containerDir: ckpt.dir, device: engine.device,
             budgetBytes: Int(gb * 1_073_741_824)
-        )
+        ) else { return }
+        expertCache = replacement
     }
 
     // MARK: - GPU phase helper
