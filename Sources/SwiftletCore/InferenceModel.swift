@@ -37,3 +37,16 @@ public protocol InferenceModel: AnyObject {
     /// position's logits. Used for prefill (many tokens) and decode (one).
     func step(_ tokens: [Int], context: any InferenceContext) throws -> [Float]
 }
+
+/// A model whose contexts can be written out and reopened later (S6). The
+/// bytes are a versioned snapshot that names the model they came from; a
+/// restore into a different model, format version, geometry, or dtype is
+/// refused rather than continued from foreign state.
+public protocol PersistableInferenceModel: InferenceModel {
+    /// Serializes `context`, which must belong to this model instance. The
+    /// context stays live and unchanged.
+    func snapshot(of context: any InferenceContext) throws -> Data
+    /// A new context of this model holding the snapshot's state, ready to
+    /// continue from its position.
+    func restoreContext(from data: Data) throws -> any InferenceContext
+}

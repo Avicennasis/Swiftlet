@@ -87,3 +87,117 @@ extension QwenMetalModel: InferenceModel {
         return try step(tokens, context: ctx)
     }
 }
+
+// MARK: - Persistence (S6)
+
+extension QwenInferenceContext {
+    /// The context's fields as snapshot sections, one per (layer, kind),
+    /// in layer order. Callers on the Metal fast path capture the bound
+    /// context's GPU recurrence first (the CPU fields are otherwise stale).
+    func snapshotSections() -> [ConversationState.Section] {
+        var sections: [ConversationState.Section] = []
+        for layer in Set(kv.keys).union(convTail.keys).union(deltaState.keys).sorted() {
+            if let rows = kv[layer] {
+                sections.append(.init(layer: layer, kind: .k, values: rows.k))
+                sections.append(.init(layer: layer, kind: .v, values: rows.v))
+            }
+            if let tail = convTail[layer] {
+                sections.append(.init(layer: layer, kind: .convTail, values: tail))
+            }
+            if let state = deltaState[layer] {
+                sections.append(.init(layer: layer, kind: .deltaState, values: state))
+            }
+        }
+        return sections
+    }
+
+    /// Fills a fresh context from a decoded, verified snapshot.
+    func apply(_ snapshot: ConversationState.Snapshot) {
+        reset()
+        for section in snapshot.sections {
+            switch section.kind {
+            case .k: kv[section.layer, default: (k: [], v: [])].k = section.values
+            case .v: kv[section.layer, default: (k: [], v: [])].v = section.values
+            case .convTail: convTail[section.layer] = section.values
+            case .deltaState: deltaState[section.layer] = section.values
+            }
+        }
+        position = snapshot.position
+    }
+}
+
+extension QwenCPUModel: PersistableInferenceModel {
+    /// Model identity for snapshots: config plus hashes.json or the shard
+    /// headers, never weight bytes, so it is cheap enough to recompute.
+    var stateIdentity: ModelIdentity {
+        get throws { try ModelIdentity.compute(modelDir: ckpt.dir, shards: ckpt.shardURLs) }
+    }
+
+    public func snapshot(of context: any InferenceContext) throws -> Data {
+        guard let ctx = context as? QwenInferenceContext else {
+            throw InferenceContextError.foreignContext
+        }
+        try ctx.checkOwner(self)
+        let identity = try stateIdentity
+        return ConversationState.encode(.init(
+            identityScheme: identity.scheme, identity: identity.digest,
+            geometry: .init(config: config), position: ctx.position,
+            sections: ctx.snapshotSections()))
+    }
+
+    public func restoreContext(from data: Data) throws -> any InferenceContext {
+        try restoreQwenContext(from: data)
+    }
+
+    /// Typed restore for callers that hold the concrete model.
+    public func restoreQwenContext(from data: Data) throws -> QwenInferenceContext {
+        let snapshot = try ConversationState.decode(data)
+        try ConversationState.verify(snapshot, identity: try stateIdentity, geometry: .init(config: config))
+        let ctx = makeQwenContext()
+        ctx.apply(snapshot)
+        return ctx
+    }
+}
+
+extension QwenMetalModel: PersistableInferenceModel {
+    /// Model identity for snapshots: config plus hashes.json or the shard
+    /// headers, never weight bytes, so it is cheap enough to recompute.
+    var stateIdentity: ModelIdentity {
+        get throws { try ModelIdentity.compute(modelDir: ckpt.dir, shards: ckpt.shardURLs) }
+    }
+
+    /// Serializes `context`. If it is the bound context its conv history
+    /// and delta recurrence are read back from the GPU buffers first; the
+    /// KV sections come from the context's mirror, which appendKVMirror
+    /// copies from the GPU rows after every attention layer (see
+    /// ConversationStateTests.metalSnapshotMatchesDirectGPUReadback for
+    /// the bitwise proof of both). The context stays bound and live.
+    public func snapshot(of context: any InferenceContext) throws -> Data {
+        guard let ctx = context as? QwenInferenceContext else {
+            throw InferenceContextError.foreignContext
+        }
+        try ctx.checkOwner(self)
+        if let bound = boundContext, bound === ctx, ctx.position > 0 {
+            captureRecurrentState(into: ctx)
+        }
+        let identity = try stateIdentity
+        return ConversationState.encode(.init(
+            identityScheme: identity.scheme, identity: identity.digest,
+            geometry: .init(config: config), position: ctx.position,
+            sections: ctx.snapshotSections()))
+    }
+
+    public func restoreContext(from data: Data) throws -> any InferenceContext {
+        try restoreQwenContext(from: data)
+    }
+
+    /// Typed restore for callers that hold the concrete model. The restored
+    /// context is unbound; its first step loads it into the GPU buffers.
+    public func restoreQwenContext(from data: Data) throws -> QwenInferenceContext {
+        let snapshot = try ConversationState.decode(data)
+        try ConversationState.verify(snapshot, identity: try stateIdentity, geometry: .init(config: config))
+        let ctx = makeQwenContext()
+        ctx.apply(snapshot)
+        return ctx
+    }
+}
