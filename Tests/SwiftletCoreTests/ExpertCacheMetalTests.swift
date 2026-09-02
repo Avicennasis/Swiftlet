@@ -43,6 +43,43 @@ import Testing
         return root
     }
 
+    /// A stride the device cannot allocate at all: `makeBuffer` returns nil
+    /// on the very first miss, before any blob is read. The cache must turn
+    /// that into an error naming the zero-slot pool, remember the cap so no
+    /// further allocation is attempted, and leave the accounting at zero.
+    @Test func allocatorRefusalWithNoSlotsIsAnError() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let stride = Qpack.align(device.maxBufferLength + 1, to: Qpack.pageAlignment)
+        #expect(device.makeBuffer(length: stride, options: .storageModeShared) == nil)
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("expert-cache-refusal-\(UUID().uuidString)")
+        let dir = root.appendingPathComponent("packed_experts")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = Qpack.Layout(
+            expertCount: 1, layerCount: 1, expertStride: stride,
+            sections: [Qpack.Section(
+                name: "gate_proj.weight", dtype: "uint8", shape: [stride], offset: 0, size: stride
+            )],
+            linearLayers: [true]
+        )
+        try JSONEncoder().encode(layout).write(to: dir.appendingPathComponent("layout.json"))
+
+        let cache = try ExpertCache(containerDir: root, device: device, budgetBytes: 16 * stride)
+        #expect(cache.slotCount == 1)
+        for _ in 0..<2 {
+            #expect(throws: Checkpoint.Error.self) {
+                _ = try cache.buffers(layer: 0, experts: [0])
+            }
+        }
+        #expect(cache.allocatedSlots == 0)
+        #expect(cache.slotCount == 0)
+        #expect(cache.allocatedBytes == 0)
+        #expect(cache.logicalBytes == 0)
+        #expect(cache.misses == 2)
+    }
+
     @Test func physicalCapFollowsAllocatorRounding() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let container = try Self.makeContainer()
