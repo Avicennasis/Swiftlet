@@ -159,6 +159,12 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         if let vs = obj["eos_token_id"] as? [Int] { eos.formUnion(vs) }
     }
 
+    // Same admission as TextGenerator/SwiftletSession: the model rejects an
+    // oversized prompt itself, but the output request must be clamped here or
+    // the loop below runs into the context limit mid-reply and throws.
+    let admittedMaxNew = try ContextWindow(maximumTokens: model.contextCapacity)
+        .admittedMaxNew(processedTokens: 0, incomingTokens: ids.count, requestedMaxNew: maxNew)
+
     let state = QwenCPUModel.DecodeState()
     let prefillStart = Date()
     var logits = try model.step(ids, state: state)
@@ -187,7 +193,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     var printed = ""
     var decodeMetal = MetalStepAggregate()
     let decodeStart = Date()
-    for _ in 0..<maxNew {
+    for _ in 0..<admittedMaxNew {
         var best = 0
         for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }
         if eos.contains(best) { break }
