@@ -124,6 +124,9 @@ public final class QwenMetalModel {
         /// device cannot sample inside an encoder (phaseGpuSplitSupport is
         /// .unsupported) — absent, never zeros that look like measurements.
         public let phaseGpuSeconds: [StepPhase: Double]?
+        /// S3c: sub-attribution of the CPU gap (wall − wait − encode) to the
+        /// CPU work the step performs between buffers; see CPUGapBreakdown.
+        public let cpuGap: CPUGapBreakdown
 
         public var avoidedLogitProjections: Int {
             max(0, tokensProcessed - logitProjections)
@@ -156,6 +159,17 @@ public final class QwenMetalModel {
         /// Step totals of resolved per-phase GPU seconds; nil unless the
         /// device supports dispatch-boundary sampling.
         var phaseGpuSeconds: [StepPhase: Double]?
+        /// S3c gap scopes (see CPUGapBreakdown); flat, disjoint, throw-safe.
+        var gapEmbeddingSeconds = 0.0
+        var gapEmbeddingLookups = 0
+        var gapRouterSeconds = 0.0
+        var gapExpertFetchSeconds = 0.0
+        var gapExpertFetchHits = 0
+        var gapExpertFetchMisses = 0
+        var gapKVMirrorSeconds = 0.0
+        var gapCommandBufferSetupSeconds = 0.0
+        var gapCommitSeconds = 0.0
+        var gapLogitsReadbackSeconds = 0.0
         var currentPhase: StepPhase?
         var bufferOpen = false
         var bufferEncodeStart = 0.0
@@ -245,7 +259,7 @@ public final class QwenMetalModel {
         gpuExecutionSeconds: 0, gpuTimedCommandBuffers: 0, gpuUntimedCommandBuffers: 0,
         completedWithoutThrow: false,
         commandBufferTimeline: [], phaseDispatchesEncoded: [:], phaseEncodeSeconds: [:],
-        phaseGpuSeconds: nil
+        phaseGpuSeconds: nil, cpuGap: .zero
     )
     private var activeStepCounters: StepCounters?
     /// Whether a per-phase GPU split is real on this device, decided by the
@@ -610,9 +624,12 @@ public final class QwenMetalModel {
     /// buffer and a CPU/GPU correlation point are attached for the per-phase
     /// GPU split; on other devices this adds nothing to the hot path.
     private func beginStepCommandBuffer() -> (MTLCommandBuffer, MTLComputeCommandEncoder) {
+        let setupStart = ProcessInfo.processInfo.systemUptime
         let cb = engine.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
         if let counters = activeStepCounters {
+            counters.gapCommandBufferSetupSeconds +=
+                max(0, ProcessInfo.processInfo.systemUptime - setupStart)
             counters.bufferOpen = true
             counters.bufferEncodeStart = ProcessInfo.processInfo.systemUptime
             counters.bufferPhaseDispatches = [:]
@@ -684,6 +701,51 @@ public final class QwenMetalModel {
         return try body()
     }
 
+    /// S3c: attributes `body`'s wall time to one CPU-gap scope. Scopes are
+    /// flat by construction (none of the call sites nest); a nested call
+    /// would double-count, so keep them that way.
+    private func gapScope<T>(
+        _ field: ReferenceWritableKeyPath<StepCounters, Double>, _ body: () throws -> T
+    ) rethrows -> T {
+        guard let counters = activeStepCounters else { return try body() }
+        let start = ProcessInfo.processInfo.systemUptime
+        defer {
+            counters[keyPath: field] += max(0, ProcessInfo.processInfo.systemUptime - start)
+        }
+        return try body()
+    }
+
+    /// Embedding row for one token, timed as the embedding gap scope.
+    private func embeddingRow(_ token: Int) throws -> [Float] {
+        try gapScope(\.gapEmbeddingSeconds) {
+            activeStepCounters?.gapEmbeddingLookups += 1
+            return try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
+        }
+    }
+
+    /// Expert-cache fetch timed as the fetch gap scope, with the cache's own
+    /// hit/miss counters differenced across the call.
+    private func fetchExperts(_ cache: ExpertCache, layer: Int, experts: [Int]) throws -> [MTLBuffer] {
+        try gapScope(\.gapExpertFetchSeconds) {
+            let hits0 = cache.hits, misses0 = cache.misses
+            defer {
+                activeStepCounters?.gapExpertFetchHits += cache.hits - hits0
+                activeStepCounters?.gapExpertFetchMisses += cache.misses - misses0
+            }
+            return try cache.buffers(layer: layer, experts: experts)
+        }
+    }
+
+    /// Vocabulary logits copied out of the shared buffer, timed as the
+    /// logits-readback gap scope.
+    private func readLogits() -> [Float] {
+        gapScope(\.gapLogitsReadbackSeconds) {
+            Array(UnsafeBufferPointer(
+                start: logitsBuf.contents().bindMemory(to: Float.self, capacity: config.vocabSize),
+                count: config.vocabSize))
+        }
+    }
+
     private func commitAndWait(_ cb: MTLCommandBuffer) {
         let counters = activeStepCounters
         var encodeSeconds = 0.0
@@ -697,9 +759,11 @@ public final class QwenMetalModel {
             os_signpost(.begin, log: Self.signpostLog, name: "commandBuffer", signpostID: signpostID)
             counters?.signpostTally.commandBufferIntervals += 1
         }
+        let commitStart = ProcessInfo.processInfo.systemUptime
         cb.commit()
         counters?.commandBuffersCommitted += 1
         let waitStart = ProcessInfo.processInfo.systemUptime
+        counters?.gapCommitSeconds += max(0, waitStart - commitStart)
         cb.waitUntilCompleted()
         counters?.blockingWaits += 1
         let waitSeconds = max(0, ProcessInfo.processInfo.systemUptime - waitStart)
@@ -863,7 +927,19 @@ public final class QwenMetalModel {
                 commandBufferTimeline: counters.timeline,
                 phaseDispatchesEncoded: counters.phaseDispatches,
                 phaseEncodeSeconds: counters.phaseEncodeSeconds,
-                phaseGpuSeconds: counters.phaseGpuSeconds
+                phaseGpuSeconds: counters.phaseGpuSeconds,
+                cpuGap: CPUGapBreakdown(
+                    embeddingSeconds: counters.gapEmbeddingSeconds,
+                    embeddingLookups: counters.gapEmbeddingLookups,
+                    routerSeconds: counters.gapRouterSeconds,
+                    expertFetchSeconds: counters.gapExpertFetchSeconds,
+                    expertFetchHits: counters.gapExpertFetchHits,
+                    expertFetchMisses: counters.gapExpertFetchMisses,
+                    kvMirrorSeconds: counters.gapKVMirrorSeconds,
+                    commandBufferSetupSeconds: counters.gapCommandBufferSetupSeconds,
+                    commitSeconds: counters.gapCommitSeconds,
+                    logitsReadbackSeconds: counters.gapLogitsReadbackSeconds
+                )
             )
         }
 
@@ -903,7 +979,7 @@ public final class QwenMetalModel {
         }
         let cfg = config
         let D = cfg.hiddenSize
-        var h = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
+        var h = try embeddingRow(token)
         precondition(h.count == D)
 
         for li in 0..<cfg.numHiddenLayers {
@@ -932,10 +1008,7 @@ public final class QwenMetalModel {
             try engine.encodeGemv(enc, lmHead, x: xBuf, y: logitsBuf, yOff: 0)
         }
         activeStepCounters?.logitProjections += 1
-        return Array(UnsafeBufferPointer(
-            start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
-            count: cfg.vocabSize
-        ))
+        return readLogits()
     }
 
     // MARK: - Attention (GQA decode, KV on CPU)
@@ -972,9 +1045,11 @@ public final class QwenMetalModel {
         applyRope(&k, heads: KVH, position: past)
 
         var cache = state.kv[layerIndex] ?? (k: [], v: [])
-        cache.k.append(contentsOf: k)
-        cache.v.append(contentsOf: v)
-        state.kv[layerIndex] = cache
+        gapScope(\.gapKVMirrorSeconds) {
+            cache.k.append(contentsOf: k)
+            cache.v.append(contentsOf: v)
+            state.kv[layerIndex] = cache
+        }
         let kAll = cache.k, vAll = cache.v
         let kvLen = past + 1
 
@@ -1152,17 +1227,19 @@ public final class QwenMetalModel {
         try runPhase(.router) { enc in
             try engine.encodeGemv(enc, w.gate, x: xBuf, y: yBuf, yOff: 0)
         }
-        var router = readY(0, E)
-        QwenCPUModel.softmaxRow(&router, base: 0, count: E)
         var picks: [(Int, Float)] = []
-        for e in 0..<E {
-            let p = router[e]
-            if picks.count < topK {
-                picks.append((e, p))
-                picks.sort { $0.1 > $1.1 }
-            } else if p > picks[topK - 1].1 {
-                picks[topK - 1] = (e, p)
-                picks.sort { $0.1 > $1.1 }
+        gapScope(\.gapRouterSeconds) {
+            var router = readY(0, E)
+            QwenCPUModel.softmaxRow(&router, base: 0, count: E)
+            for e in 0..<E {
+                let p = router[e]
+                if picks.count < topK {
+                    picks.append((e, p))
+                    picks.sort { $0.1 > $1.1 }
+                } else if p > picks[topK - 1].1 {
+                    picks[topK - 1] = (e, p)
+                    picks.sort { $0.1 > $1.1 }
+                }
             }
         }
         routedExpertObserver?(layerIndex, picks.map { $0.0 })
@@ -1182,7 +1259,7 @@ public final class QwenMetalModel {
         // Fetch expert buffers up front (qpack path: preads on cache misses).
         var expertBufs: [MTLBuffer] = []
         if let cache = expertCache {
-            expertBufs = try cache.buffers(layer: layerIndex, experts: picks.map { $0.0 })
+            expertBufs = try fetchExperts(cache, layer: layerIndex, experts: picks.map { $0.0 })
         }
 
         try runPhase(.moe) { enc in
@@ -1522,7 +1599,7 @@ extension QwenMetalModel {
             if state.position == 0 { resetGPUState() }
         }
 
-        let h0 = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
+        let h0 = try embeddingRow(token)
         h0.withUnsafeBufferPointer {
             hBuf!.contents().copyMemory(from: $0.baseAddress!, byteCount: D * 4)
         }
@@ -1574,14 +1651,16 @@ extension QwenMetalModel {
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
-                appendKVMirror(state, layer: li, position: state.position, count: 1)
+                gapScope(\.gapKVMirrorSeconds) {
+                    appendKVMirror(state, layer: li, position: state.position, count: 1)
+                }
             }
 
-            let (picks, weights) = routerPicks(slot: slot)
+            let (picks, weights) = gapScope(\.gapRouterSeconds) { routerPicks(slot: slot) }
             routedExpertObserver?(li, picks.map { $0.0 })
             var bufs: [MTLBuffer] = []
             if let cache = expertCache {
-                bufs = try cache.buffers(layer: li, experts: picks.map { $0.0 })
+                bufs = try fetchExperts(cache, layer: li, experts: picks.map { $0.0 })
             }
             pending = PendingMoE(bufs: bufs, weights: weights, stacksLayer: li, picks: picks)
         }
@@ -1600,9 +1679,7 @@ extension QwenMetalModel {
         commitAndWait(cb)
 
         guard projectLogits else { return [] }
-        return Array(UnsafeBufferPointer(
-            start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
-            count: cfg.vocabSize))
+        return readLogits()
     }
 
     /// DeltaNet mixer for one token, entirely on GPU: projections, conv step,
@@ -2133,7 +2210,7 @@ extension QwenMetalModel {
         let basePosition = state.position
 
         for (t, token) in chunk.enumerated() {
-            let h0 = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
+            let h0 = try embeddingRow(token)
             h0.withUnsafeBufferPointer {
                 prefillHiddenBuf!.contents().advanced(by: t * D * 4)
                     .copyMemory(from: $0.baseAddress!, byteCount: D * 4)
@@ -2210,7 +2287,9 @@ extension QwenMetalModel {
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
-                appendKVMirror(state, layer: li, position: basePosition, count: S)
+                gapScope(\.gapKVMirrorSeconds) {
+                    appendKVMirror(state, layer: li, position: basePosition, count: S)
+                }
             }
 
             // Routing on CPU for every chunk token, then one union fetch for
@@ -2219,7 +2298,9 @@ extension QwenMetalModel {
             var perToken: [(picks: [(Int, Float)], weights: [Float])] = []
             var unionSet = Set<Int>()
             for t in 0..<S {
-                let (picks, weights) = routerPicks(slot: prefillSlot(t))
+                let (picks, weights) = gapScope(\.gapRouterSeconds) {
+                    routerPicks(slot: prefillSlot(t))
+                }
                 routedExpertObserver?(li, picks.map { $0.0 })
                 unionSet.formUnion(picks.map { $0.0 })
                 perToken.append((picks, weights))
@@ -2228,7 +2309,7 @@ extension QwenMetalModel {
             prefillExpertUnionObserver?(li, union)
             var buffers: [Int: MTLBuffer] = [:]
             if let cache = expertCache {
-                let bufs = try cache.buffers(layer: li, experts: union)
+                let bufs = try fetchExperts(cache, layer: li, experts: union)
                 for (i, e) in union.enumerated() { buffers[e] = bufs[i] }
             }
             pending = PendingChunkMoE(
@@ -2252,9 +2333,7 @@ extension QwenMetalModel {
         activeStepCounters?.tokensProcessed += S
 
         guard projectLogits else { return [] }
-        return Array(UnsafeBufferPointer(
-            start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
-            count: cfg.vocabSize))
+        return readLogits()
     }
 
     /// One DeltaNet layer over the whole chunk (S1b token batching): one

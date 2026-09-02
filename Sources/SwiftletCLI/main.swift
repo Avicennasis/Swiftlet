@@ -27,9 +27,38 @@ private struct MetalStepAggregate {
     var bufferWaitSeconds: [String: Double] = [:]
     var bufferGpuSeconds: [String: Double] = [:]
     var bufferGpuTimed: [String: Int] = [:]
+    /// S3c: wall/encode/gap totals plus the gap sub-attribution.
+    var stepWallSeconds = 0.0
+    var encodeSeconds = 0.0
+    var cpuGapSeconds = 0.0
+    var gapEmbedding = 0.0
+    var gapEmbeddingLookups = 0
+    var gapRouter = 0.0
+    var gapExpertFetch = 0.0
+    var gapExpertHits = 0
+    var gapExpertMisses = 0
+    var gapKVMirror = 0.0
+    var gapCommandBufferSetup = 0.0
+    var gapCommit = 0.0
+    var gapLogitsReadback = 0.0
+    var gapOther = 0.0
 
     mutating func add(_ metrics: QwenMetalModel.StepMetrics) {
         steps += 1
+        stepWallSeconds += metrics.stepWallSeconds
+        encodeSeconds += metrics.encodeSeconds
+        cpuGapSeconds += metrics.cpuGapSeconds
+        gapEmbedding += metrics.cpuGap.embeddingSeconds
+        gapEmbeddingLookups += metrics.cpuGap.embeddingLookups
+        gapRouter += metrics.cpuGap.routerSeconds
+        gapExpertFetch += metrics.cpuGap.expertFetchSeconds
+        gapExpertHits += metrics.cpuGap.expertFetchHits
+        gapExpertMisses += metrics.cpuGap.expertFetchMisses
+        gapKVMirror += metrics.cpuGap.kvMirrorSeconds
+        gapCommandBufferSetup += metrics.cpuGap.commandBufferSetupSeconds
+        gapCommit += metrics.cpuGap.commitSeconds
+        gapLogitsReadback += metrics.cpuGap.logitsReadbackSeconds
+        gapOther += metrics.cpuGapOtherSeconds
         commandBuffersCommitted += metrics.commandBuffersCommitted
         blockingWaits += metrics.blockingWaits
         blockingWaitSeconds += metrics.blockingWaitSeconds
@@ -91,6 +120,16 @@ private func phaseSummaryLines(_ prefix: String, _ agg: MetalStepAggregate) -> [
                 + " gpu=\(gpu)"
         }
         lines.append("\(prefix) S3b buffers: " + cells.joined(separator: " | "))
+    }
+    if agg.steps > 0 {
+        lines.append(String(format:
+            "%@ S3c cpu-gap: wall=%.3fs wait=%.3fs encode=%.3fs gap=%.3fs | "
+            + "embedding=%.3fs/%d | router=%.3fs | fetch=%.3fs/%d hit/%d miss | "
+            + "kvMirror=%.3fs | cbSetup=%.3fs | commit=%.3fs | logits=%.3fs | other=%.3fs",
+            prefix, agg.stepWallSeconds, agg.blockingWaitSeconds, agg.encodeSeconds,
+            agg.cpuGapSeconds, agg.gapEmbedding, agg.gapEmbeddingLookups, agg.gapRouter,
+            agg.gapExpertFetch, agg.gapExpertHits, agg.gapExpertMisses, agg.gapKVMirror,
+            agg.gapCommandBufferSetup, agg.gapCommit, agg.gapLogitsReadback, agg.gapOther))
     }
     return lines
 }
@@ -274,12 +313,19 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     var generated: [Int] = []
     var printed = ""
     var decodeMetal = MetalStepAggregate()
+    // S3c: the CLI's own per-token work sits in the bench's "wall" too;
+    // report it beside the model's gap so the two are never confused.
+    var cliArgmaxSeconds = 0.0
+    var cliDetokenizeSeconds = 0.0
     let decodeStart = Date()
     for _ in 0..<maxNew {
+        let argmaxStart = ProcessInfo.processInfo.systemUptime
         var best = 0
         for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }
+        cliArgmaxSeconds += ProcessInfo.processInfo.systemUptime - argmaxStart
         if eos.contains(best) { break }
         generated.append(best)
+        let detokStart = ProcessInfo.processInfo.systemUptime
         if let tokenizer {
             // Reprint only the stable delta so multi-byte tokens render
             // correctly; StreamingText holds back incomplete characters.
@@ -293,6 +339,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             print(best, terminator: " ")
             fflush(stdout)
         }
+        cliDetokenizeSeconds += ProcessInfo.processInfo.systemUptime - detokStart
         logits = try model.step([best], state: state)
         if let metal = model as? QwenMetalModel {
             decodeMetal.add(metal.lastStepMetrics)
@@ -324,6 +371,9 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         for extra in phaseSummaryLines("decode", decodeMetal) {
             FileHandle.standardError.write(Data((extra + "\n").utf8))
         }
+        FileHandle.standardError.write(Data(String(format:
+            "decode S3c cli: argmax=%.3fs detokenize+print=%.3fs\n",
+            cliArgmaxSeconds, cliDetokenizeSeconds).utf8))
     }
     if let metal = model as? QwenMetalModel, let cache = metal.expertCache {
         let total = cache.hits + cache.misses
