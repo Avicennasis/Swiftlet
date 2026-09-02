@@ -234,7 +234,16 @@ import Testing
 
         for cache in [sequentialGPU.expertCache!, elidingGPU.expertCache!] {
             #expect(cache.hits + cache.misses > 0)
+            #expect(cache.allocatedSlots > 0)
+            #expect(cache.allocatedBytes >= cache.logicalBytes)
+            #expect(cache.allocatedBytes <= cache.budgetBytes)
         }
+
+        // A pressure request below the minimum working set must not replace a
+        // functioning qpack cache with nil.
+        let cacheBeforeImpossibleShrink = sequentialGPU.expertCache!
+        sequentialGPU.shrinkCache(toGB: 0)
+        #expect(sequentialGPU.expertCache === cacheBeforeImpossibleShrink)
     }
 
     @Test func gpuMatchesCPUOnQwen35Tiny() throws {
