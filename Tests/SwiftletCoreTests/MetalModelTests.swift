@@ -91,6 +91,90 @@ import Testing
                 "\(label): fast-path dispatch baseline changed")
     }
 
+    /// S3b: the committed command-buffer timeline must label every buffer,
+    /// follow the fast-path schedule exactly, and account for the S3a
+    /// aggregates without inventing timing the buffers never reported.
+    /// Only meaningful for a step that completed without throwing.
+    static func expectPhaseTimeline(
+        _ metrics: QwenMetalModel.StepMetrics,
+        config: QwenConfig,
+        tokens: Int,
+        label: String
+    ) {
+        let timeline = metrics.commandBufferTimeline
+        #expect(timeline.count == metrics.commandBuffersCommitted,
+                "\(label): timeline misses committed buffers")
+        #expect(timeline.map(\.phases) == Self.expectedTimelinePhases(config: config, tokens: tokens),
+                "\(label): phase labels diverged from the fast-path schedule")
+
+        let phaseDispatchTotal = metrics.phaseDispatchesEncoded.values.reduce(0, +)
+        #expect(phaseDispatchTotal == metrics.computeDispatchesEncoded,
+                "\(label): phase dispatch totals leak dispatches")
+        #expect(metrics.phaseDispatchesEncoded[.other, default: 0] == 0,
+                "\(label): dispatches encoded outside every labeled phase")
+
+        var waitSum = 0.0
+        var gpuSum = 0.0
+        var timed = 0
+        var untimed = 0
+        var failed = 0
+        var timelineDispatches = 0
+        for sample in timeline {
+            #expect(!sample.phases.isEmpty, "\(label): unlabeled command buffer")
+            #expect(sample.completed, "\(label): failed buffer in timeline")
+            #expect(sample.encodeSeconds >= 0 && sample.waitSeconds >= 0,
+                    "\(label): negative buffer timing")
+            let phaseEncode = sample.phaseEncodeSeconds.values.reduce(0, +)
+            #expect(phaseEncode <= sample.encodeSeconds + 1e-6,
+                    "\(label): phase encode time exceeds the buffer's encode span")
+            waitSum += sample.waitSeconds
+            if !sample.completed {
+                failed += 1
+            } else if let gpu = sample.gpuSeconds {
+                #expect(gpu >= 0, "\(label): negative GPU duration")
+                gpuSum += gpu
+                timed += 1
+            } else {
+                untimed += 1
+            }
+            timelineDispatches += sample.dispatchesEncoded
+        }
+        #expect(abs(waitSum - metrics.blockingWaitSeconds) < 1e-6,
+                "\(label): timeline wait diverged from the S3a aggregate")
+        #expect(abs(gpuSum - metrics.gpuExecutionSeconds) < 1e-6,
+                "\(label): timeline GPU time diverged from the S3a aggregate")
+        #expect(timed == metrics.gpuTimedCommandBuffers, "\(label): timed buffer count")
+        #expect(untimed == metrics.gpuUntimedCommandBuffers, "\(label): untimed buffer count")
+        #expect(failed == metrics.commandBufferErrors, "\(label): failed buffer count")
+        #expect(timelineDispatches == metrics.computeDispatchesEncoded,
+                "\(label): timeline dispatches diverged from the S3a aggregate")
+        #expect(timeline.filter { $0.phases.contains(.lmHead) }.count == metrics.logitProjections,
+                "\(label): LM-head buffer count")
+    }
+
+    /// The label sequence the current fast-path schedule must produce: per
+    /// token, one buffer per DeltaNet layer, two per attention layer, and a
+    /// tail buffer that flushes the last layer's experts (adding the LM head
+    /// only on the final token). Labels are in canonical declaration order.
+    static func expectedTimelinePhases(
+        config: QwenConfig, tokens: Int
+    ) -> [[QwenMetalModel.StepPhase]] {
+        var expected: [[QwenMetalModel.StepPhase]] = []
+        for token in 0..<tokens {
+            for layer in 0..<config.numHiddenLayers {
+                let flushesMoE = layer > 0
+                if config.isLinearLayer(layer) {
+                    expected.append(flushesMoE ? [.delta, .moe, .router] : [.delta, .router])
+                } else {
+                    expected.append(flushesMoE ? [.attention, .moe] : [.attention])
+                    expected.append([.attention, .router])
+                }
+            }
+            expected.append(token == tokens - 1 ? [.moe, .lmHead] : [.moe])
+        }
+        return expected
+    }
+
     static func compare(_ modelName: String, baseline: FastPathBaseline) throws {
         let dir = fixturesDir.appendingPathComponent(modelName)
         let cpu = try QwenCPUModel(modelDir: dir)
@@ -115,6 +199,10 @@ import Testing
         Self.expectFastPathBaseline(
             singleMetrics, tokens: 1, baseline: baseline, label: "\(modelName) one token"
         )
+        Self.expectPhaseTimeline(
+            singleMetrics, config: sequentialGPU.config, tokens: 1,
+            label: "\(modelName) one token"
+        )
 
         let maxDiff = Self.maxAbsDiff(cpuLogits, sequentialLogits)
         #expect(maxDiff < 2e-3, "\(modelName): GPU vs CPU logits maxAbsDiff \(maxDiff)")
@@ -133,6 +221,10 @@ import Testing
         Self.expectFastPathBaseline(
             multiMetrics, tokens: tokens.count, baseline: baseline, label: "\(modelName) multi token"
         )
+        Self.expectPhaseTimeline(
+            multiMetrics, config: elidingGPU.config, tokens: tokens.count,
+            label: "\(modelName) multi token"
+        )
         Self.expectMatchingKV(sequentialState, elidingState, label: "\(modelName) elision input")
 
         let continuation = 11
@@ -150,6 +242,10 @@ import Testing
             elidingGPU.lastStepMetrics, tokens: 1,
             baseline: baseline, label: "\(modelName) continuation"
         )
+        Self.expectPhaseTimeline(
+            elidingGPU.lastStepMetrics, config: elidingGPU.config, tokens: 1,
+            label: "\(modelName) continuation"
+        )
         Self.expectMatchingKV(sequentialState, elidingState, label: "\(modelName) continuation")
 
         func argmax(_ v: [Float]) -> Int {
@@ -162,6 +258,35 @@ import Testing
 
     @Test func gpuMatchesCPUOnQuantizedTiny() throws {
         try Self.compare("tiny-model-q4", baseline: Self.q4Baseline)
+    }
+
+    /// S3b: the phase/timeline instrumentation must label the whole step,
+    /// stay within the step wall clock, and rebuild per step call rather than
+    /// accumulate across calls.
+    @Test func phaseTimelineAccountsForWholeStep() throws {
+        let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
+        let model = try QwenMetalModel(modelDir: dir)
+        let state = QwenCPUModel.DecodeState()
+        _ = try model.step([1, 5, 9], state: state)
+        let multi = model.lastStepMetrics
+        Self.expectInstrumentation(multi, tokens: 3, label: "timeline multi")
+        Self.expectFastPathBaseline(
+            multi, tokens: 3, baseline: Self.q4Baseline, label: "timeline multi"
+        )
+        Self.expectPhaseTimeline(
+            multi, config: model.config, tokens: 3, label: "timeline multi"
+        )
+        let encodeSum = multi.commandBufferTimeline.reduce(0.0) { $0 + $1.encodeSeconds }
+        #expect(encodeSum + multi.blockingWaitSeconds <= multi.stepWallSeconds + 1e-3,
+                "timeline multi: encode+wait exceeds the step wall clock")
+
+        _ = try model.step([11], state: state)
+        let single = model.lastStepMetrics
+        Self.expectPhaseTimeline(
+            single, config: model.config, tokens: 1, label: "timeline continuation"
+        )
+        #expect(single.commandBufferTimeline.count == Self.commandBuffersPerToken,
+                "timeline continuation: timeline accumulated across steps")
     }
 
     /// Full streaming path: repack tiny model to .qpack, run the GPU model in
@@ -199,6 +324,9 @@ import Testing
         Self.expectFastPathBaseline(
             singleMetrics, tokens: 1, baseline: Self.q4Baseline, label: "qpack one token"
         )
+        Self.expectPhaseTimeline(
+            singleMetrics, config: sequentialGPU.config, tokens: 1, label: "qpack one token"
+        )
         let maxDiff = Self.maxAbsDiff(cpuLogits, sequentialLogits)
         #expect(maxDiff < 2e-3, "qpack GPU vs CPU logits maxAbsDiff \(maxDiff)")
 
@@ -215,6 +343,10 @@ import Testing
             multiMetrics, tokens: tokens.count,
             baseline: Self.q4Baseline, label: "qpack multi token"
         )
+        Self.expectPhaseTimeline(
+            multiMetrics, config: elidingGPU.config, tokens: tokens.count,
+            label: "qpack multi token"
+        )
         Self.expectMatchingKV(sequentialState, elidingState, label: "qpack elision input")
 
         let continuation = 11
@@ -229,6 +361,10 @@ import Testing
         Self.expectFastPathBaseline(
             elidingGPU.lastStepMetrics, tokens: 1,
             baseline: Self.q4Baseline, label: "qpack continuation"
+        )
+        Self.expectPhaseTimeline(
+            elidingGPU.lastStepMetrics, config: elidingGPU.config, tokens: 1,
+            label: "qpack continuation"
         )
         Self.expectMatchingKV(sequentialState, elidingState, label: "qpack continuation")
 

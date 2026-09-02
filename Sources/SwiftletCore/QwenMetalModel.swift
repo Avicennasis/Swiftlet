@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import os.signpost
 
 /// GPU runtime: every linear (dense projections, router, experts, lm_head)
 /// runs as a quantized GEMV directly on mmapped checkpoint bytes — weights are
@@ -7,8 +8,83 @@ import Metal
 /// delta recurrence, attention softmax over cached KV, top-k routing), all of
 /// it microseconds per token. Numerics mirror QwenCPUModel exactly.
 public final class QwenMetalModel {
-    /// S3a whole-step aggregate baseline. These totals do not identify phases,
-    /// layer costs, overlap, or command-buffer timeline gaps.
+    /// S3b command-buffer phase labels. A label names the work a phase scope
+    /// encoded; it claims nothing about when the GPU actually ran that work.
+    public enum StepPhase: String, CaseIterable, Sendable {
+        /// Attention norm + q/k/v projections, output projection, residual add.
+        case attention
+        /// DeltaNet mixer: projections, conv step, recurrence, gated norm,
+        /// output projection, residual add.
+        case delta
+        /// Routed expert GEMVs plus the shared-expert chain and accumulation.
+        case moe
+        /// Pre-MoE norm and the router logits projection.
+        case router
+        /// Final norm and vocabulary projection.
+        case lmHead
+        /// Dispatches encoded outside every labeled scope (must stay empty).
+        case other
+    }
+
+    /// How real a per-phase GPU/wait split can be on this device without
+    /// changing the schedule. The fast path deliberately encodes several
+    /// phases into one encoder per command buffer, so splitting a shared
+    /// buffer's GPU time by phase requires timestamp samples *inside* the
+    /// encoder — dispatch-boundary counter sampling. Devices that sample only
+    /// at encoder/stage boundaries (Apple GPUs) cannot provide that split for
+    /// this schedule, and the API says so instead of inventing numbers.
+    public enum PhaseGpuSplitSupport: Equatable, Sendable {
+        /// The device samples GPU timestamps at compute dispatch boundaries;
+        /// per-phase GPU time is measured inside shared buffers.
+        case dispatchBoundaryCounters
+        /// No in-encoder sampling on this device; per-phase GPU time is
+        /// absent (nil), never zeros. The reason names the device and the
+        /// missing capability.
+        case unsupported(reason: String)
+    }
+
+    /// One committed command buffer, in commit order. Encode time and
+    /// dispatch counts are attributed to phases exactly (encoding is CPU work
+    /// under our control); blocking-wait time exists only at command-buffer
+    /// granularity, and GPU time splits per phase only when the device
+    /// supports dispatch-boundary counter sampling (see PhaseGpuSplitSupport)
+    /// — otherwise a buffer spanning several phases cannot split it.
+    public struct CommandBufferSample: Equatable, Sendable {
+        /// Compute dispatches encoded into this buffer, per phase.
+        public let phaseDispatches: [StepPhase: Int]
+        /// CPU wall time inside each phase's encode scope for this buffer.
+        public let phaseEncodeSeconds: [StepPhase: Double]
+        /// CPU wall time from encoder creation to commit (>= the phase sum).
+        public let encodeSeconds: Double
+        /// Wall time inside this buffer's waitUntilCompleted call.
+        public let waitSeconds: Double
+        /// GPU start-to-end duration; nil when the buffer failed or reported
+        /// invalid timestamps. Not proof of exclusive GPU occupancy.
+        public let gpuSeconds: Double?
+        /// GPU seconds per phase from dispatch-boundary counter samples
+        /// resolved for this buffer. nil when the device cannot sample inside
+        /// an encoder, or when any of this buffer's samples failed to resolve
+        /// — a partial split would silently under-report a phase.
+        public let phaseGpuSeconds: [StepPhase: Double]?
+        /// Whether status was .completed after the blocking wait.
+        public let completed: Bool
+
+        /// Phases encoded into this buffer, in declaration order (a canonical
+        /// label, not the encode order within the buffer).
+        public var phases: [StepPhase] {
+            StepPhase.allCases.filter {
+                phaseDispatches[$0] != nil || phaseEncodeSeconds[$0] != nil
+            }
+        }
+
+        public var dispatchesEncoded: Int { phaseDispatches.values.reduce(0, +) }
+    }
+
+    /// S3a whole-step aggregates plus the S3b committed-buffer timeline.
+    /// The aggregates still cannot identify overlap; the timeline labels each
+    /// buffer's encoded phases and reports per-buffer encode/wait/GPU cost,
+    /// but it is not an Instruments trace: it cannot see gaps between buffers
+    /// or split a multi-phase buffer's wait/GPU time by phase.
     public struct StepMetrics: Equatable, Sendable {
         public let tokensProcessed: Int
         public let logitProjections: Int
@@ -28,10 +104,33 @@ public final class QwenMetalModel {
         public let gpuUntimedCommandBuffers: Int
         /// False when step exited by throwing after publishing partial counters.
         public let completedWithoutThrow: Bool
+        /// S3b: committed command buffers in commit order. A throwing step's
+        /// never-committed encodes are absent here but still counted in
+        /// computeDispatchesEncoded and the phase totals below.
+        public let commandBufferTimeline: [CommandBufferSample]
+        /// Encode-side dispatch totals per phase, including partial work from
+        /// a buffer the step never committed before throwing.
+        public let phaseDispatchesEncoded: [StepPhase: Int]
+        /// CPU wall time inside per-phase encode scopes; same partial-work
+        /// semantics as phaseDispatchesEncoded.
+        public let phaseEncodeSeconds: [StepPhase: Double]
+        /// GPU seconds per phase, summed over the buffers whose
+        /// dispatch-boundary counter samples resolved. nil whenever the
+        /// device cannot sample inside an encoder (phaseGpuSplitSupport is
+        /// .unsupported) — absent, never zeros that look like measurements.
+        public let phaseGpuSeconds: [StepPhase: Double]?
 
         public var avoidedLogitProjections: Int {
             max(0, tokensProcessed - logitProjections)
         }
+    }
+
+    /// Count of os_signpost intervals one step emitted, per interval name.
+    /// Rebuilt per step; exists so tests can pin emission to the timeline.
+    struct SignpostTally: Equatable {
+        var stepIntervals = 0
+        var phaseIntervals = 0
+        var commandBufferIntervals = 0
     }
 
     private final class StepCounters {
@@ -46,6 +145,26 @@ public final class QwenMetalModel {
         var gpuTimedCommandBuffers = 0
         var gpuUntimedCommandBuffers = 0
         var completedWithoutThrow = false
+        var timeline: [CommandBufferSample] = []
+        var phaseDispatches: [StepPhase: Int] = [:]
+        var phaseEncodeSeconds: [StepPhase: Double] = [:]
+        /// Step totals of resolved per-phase GPU seconds; nil unless the
+        /// device supports dispatch-boundary sampling.
+        var phaseGpuSeconds: [StepPhase: Double]?
+        var currentPhase: StepPhase?
+        var bufferOpen = false
+        var bufferEncodeStart = 0.0
+        var bufferPhaseDispatches: [StepPhase: Int] = [:]
+        var bufferPhaseEncodeSeconds: [StepPhase: Double] = [:]
+        /// Encoder of the open buffer, for in-encoder counter samples only.
+        var currentEncoder: MTLComputeCommandEncoder?
+        var bufferSampleBuffer: MTLCounterSampleBuffer?
+        var bufferSampleIndex = 0
+        var bufferPhaseSampleRanges: [(phase: StepPhase, start: Int, end: Int)] = []
+        var bufferSamplingBroken = false
+        /// CPU/GPU correlation captured when the open buffer began encoding.
+        var bufferCorrelationStart: (cpu: MTLTimestamp, gpu: MTLTimestamp)?
+        var signpostTally = SignpostTally()
     }
 
     public let config: QwenConfig
@@ -119,9 +238,26 @@ public final class QwenMetalModel {
         commandBuffersCommitted: 0, blockingWaits: 0, blockingWaitSeconds: 0,
         computeDispatchesEncoded: 0, stepWallSeconds: 0, commandBufferErrors: 0,
         gpuExecutionSeconds: 0, gpuTimedCommandBuffers: 0, gpuUntimedCommandBuffers: 0,
-        completedWithoutThrow: false
+        completedWithoutThrow: false,
+        commandBufferTimeline: [], phaseDispatchesEncoded: [:], phaseEncodeSeconds: [:],
+        phaseGpuSeconds: nil
     )
     private var activeStepCounters: StepCounters?
+    /// Whether a per-phase GPU split is real on this device, decided by the
+    /// runtime counter probe at init — never assumed from the OS or GPU name.
+    public let phaseGpuSplitSupport: PhaseGpuSplitSupport
+    /// The raw probe behind phaseGpuSplitSupport, for reporting.
+    public var counterSamplingSupport: MetalEngine.CounterSamplingSupport {
+        engine.probeCounterSampling()
+    }
+    /// Signpost intervals emitted by the latest step; mirrors the timeline.
+    internal private(set) var lastSignpostTally = SignpostTally()
+    /// os_signpost log for step/phase/commandBuffer intervals. Instruments'
+    /// os_signpost instrument groups them under subsystem "Swiftlet".
+    private static let signpostLog = OSLog(subsystem: "Swiftlet", category: "MetalStep")
+    /// Sample slots per command buffer: the fast path encodes at most three
+    /// phase scopes per buffer (2 samples each); headroom is harmless.
+    private static let maxPhaseSamplesPerBuffer = 16
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -156,6 +292,7 @@ public final class QwenMetalModel {
         ckpt = try Checkpoint(dir: modelDir)
         engine = try MetalEngine()
         store = MetalShardStore(device: engine.device)
+        phaseGpuSplitSupport = Self.probePhaseGpuSplit(engine: engine)
 
         let cfg = config
         let ckpt = self.ckpt
@@ -387,34 +524,229 @@ public final class QwenMetalModel {
         }
     }
 
-    private func commitAndWait(_ cb: MTLCommandBuffer) {
-        cb.commit()
-        activeStepCounters?.commandBuffersCommitted += 1
-        let waitStart = ProcessInfo.processInfo.systemUptime
-        cb.waitUntilCompleted()
-        activeStepCounters?.blockingWaits += 1
-        activeStepCounters?.blockingWaitSeconds += max(
-            0, ProcessInfo.processInfo.systemUptime - waitStart
-        )
-
-        guard cb.status == .completed else {
-            activeStepCounters?.commandBufferErrors += 1
-            return
+    /// Decides whether a per-phase GPU split is measurable here. The frozen
+    /// schedule shares one encoder across phases, so the split needs
+    /// dispatch-boundary sampling; anything less gets an explicit reason.
+    private static func probePhaseGpuSplit(engine: MetalEngine) -> PhaseGpuSplitSupport {
+        let probe = engine.probeCounterSampling()
+        if probe.atDispatchBoundary && probe.hasTimestampCounterSet {
+            return .dispatchBoundaryCounters
         }
-        let start = cb.gpuStartTime
-        let end = cb.gpuEndTime
-        guard start.isFinite, end.isFinite, start > 0, end > 0, end >= start else {
-            activeStepCounters?.gpuUntimedCommandBuffers += 1
-            return
+        if !probe.hasTimestampCounterSet {
+            return .unsupported(reason:
+                "device \(probe.deviceName) exposes no timestamp counter set")
         }
-        activeStepCounters?.gpuExecutionSeconds += end - start
-        activeStepCounters?.gpuTimedCommandBuffers += 1
+        return .unsupported(reason:
+            "device \(probe.deviceName) samples timestamps only at encoder boundaries"
+            + " (stage=\(probe.atStageBoundary)), and the fast-path schedule encodes"
+            + " several phases into one encoder per command buffer; an in-buffer"
+            + " per-phase GPU split cannot be measured without changing the schedule")
     }
 
-    private func runPhase(_ body: (MTLComputeCommandEncoder) throws -> Void) throws {
+    /// Starts a step command buffer and opens its S3b timeline accumulator so
+    /// encode time and dispatches attribute to this buffer until commit. When
+    /// the device supports dispatch-boundary sampling, a fresh counter sample
+    /// buffer and a CPU/GPU correlation point are attached for the per-phase
+    /// GPU split; on other devices this adds nothing to the hot path.
+    private func beginStepCommandBuffer() -> (MTLCommandBuffer, MTLComputeCommandEncoder) {
         let cb = engine.queue.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
-        try body(enc)
+        if let counters = activeStepCounters {
+            counters.bufferOpen = true
+            counters.bufferEncodeStart = ProcessInfo.processInfo.systemUptime
+            counters.bufferPhaseDispatches = [:]
+            counters.bufferPhaseEncodeSeconds = [:]
+            counters.currentEncoder = enc
+            counters.bufferSampleBuffer = nil
+            counters.bufferSampleIndex = 0
+            counters.bufferPhaseSampleRanges = []
+            counters.bufferSamplingBroken = false
+            counters.bufferCorrelationStart = nil
+            if case .dispatchBoundaryCounters = phaseGpuSplitSupport,
+               let tsSet = engine.timestampCounterSet {
+                let desc = MTLCounterSampleBufferDescriptor()
+                desc.counterSet = tsSet
+                desc.storageMode = .shared
+                desc.sampleCount = Self.maxPhaseSamplesPerBuffer
+                counters.bufferSampleBuffer =
+                    try? engine.device.makeCounterSampleBuffer(descriptor: desc)
+                counters.bufferSamplingBroken = counters.bufferSampleBuffer == nil
+                counters.bufferCorrelationStart = engine.device.sampleTimestamps()
+            }
+        }
+        return (cb, enc)
+    }
+
+    /// Attributes encode-side work (CPU encode wall time and dispatch counts)
+    /// to a phase label, emits one os_signpost interval per scope, and — on
+    /// devices with dispatch-boundary sampling — brackets the scope with GPU
+    /// timestamp samples. Scopes never nest in the current schedule; if one
+    /// ever did, its elapsed time would double-count, so keep call sites flat.
+    private func phase<T>(_ p: StepPhase, _ body: () throws -> T) rethrows -> T {
+        guard let counters = activeStepCounters else { return try body() }
+        let previous = counters.currentPhase
+        counters.currentPhase = p
+        let signpostID = OSSignpostID(log: Self.signpostLog)
+        os_signpost(.begin, log: Self.signpostLog, name: "phase",
+                    signpostID: signpostID, "%{public}@", p.rawValue)
+        counters.signpostTally.phaseIntervals += 1
+        var sampleStart = -1
+        if let sb = counters.bufferSampleBuffer, counters.bufferOpen,
+           let enc = counters.currentEncoder, !counters.bufferSamplingBroken {
+            if counters.bufferSampleIndex + 1 < Self.maxPhaseSamplesPerBuffer {
+                sampleStart = counters.bufferSampleIndex
+                counters.bufferSampleIndex += 2
+                enc.sampleCounters(sampleBuffer: sb, sampleIndex: sampleStart, barrier: true)
+            } else {
+                // Out of slots: drop the whole buffer's split rather than
+                // publish a partial one.
+                counters.bufferSamplingBroken = true
+            }
+        }
+        let start = ProcessInfo.processInfo.systemUptime
+        defer {
+            let elapsed = max(0, ProcessInfo.processInfo.systemUptime - start)
+            counters.phaseEncodeSeconds[p, default: 0] += elapsed
+            if counters.bufferOpen {
+                counters.bufferPhaseEncodeSeconds[p, default: 0] += elapsed
+            }
+            if sampleStart >= 0, let sb = counters.bufferSampleBuffer,
+               let enc = counters.currentEncoder, !counters.bufferSamplingBroken {
+                enc.sampleCounters(sampleBuffer: sb, sampleIndex: sampleStart + 1, barrier: true)
+                counters.bufferPhaseSampleRanges.append(
+                    (phase: p, start: sampleStart, end: sampleStart + 1))
+            }
+            os_signpost(.end, log: Self.signpostLog, name: "phase",
+                        signpostID: signpostID, "%{public}@", p.rawValue)
+            counters.currentPhase = previous
+        }
+        return try body()
+    }
+
+    private func commitAndWait(_ cb: MTLCommandBuffer) {
+        let counters = activeStepCounters
+        var encodeSeconds = 0.0
+        if let counters, counters.bufferOpen {
+            encodeSeconds = max(
+                0, ProcessInfo.processInfo.systemUptime - counters.bufferEncodeStart
+            )
+        }
+        let signpostID = OSSignpostID(log: Self.signpostLog)
+        if counters != nil {
+            os_signpost(.begin, log: Self.signpostLog, name: "commandBuffer", signpostID: signpostID)
+            counters?.signpostTally.commandBufferIntervals += 1
+        }
+        cb.commit()
+        counters?.commandBuffersCommitted += 1
+        let waitStart = ProcessInfo.processInfo.systemUptime
+        cb.waitUntilCompleted()
+        counters?.blockingWaits += 1
+        let waitSeconds = max(0, ProcessInfo.processInfo.systemUptime - waitStart)
+        counters?.blockingWaitSeconds += waitSeconds
+
+        let completed = cb.status == .completed
+        var gpuSeconds: Double?
+        if !completed {
+            counters?.commandBufferErrors += 1
+        } else {
+            let start = cb.gpuStartTime
+            let end = cb.gpuEndTime
+            if start.isFinite, end.isFinite, start > 0, end > 0, end >= start {
+                gpuSeconds = end - start
+                counters?.gpuExecutionSeconds += end - start
+                counters?.gpuTimedCommandBuffers += 1
+            } else {
+                counters?.gpuUntimedCommandBuffers += 1
+            }
+        }
+        guard let counters else { return }
+
+        var phaseGpu: [StepPhase: Double]?
+        if completed, let sb = counters.bufferSampleBuffer,
+           !counters.bufferSamplingBroken, !counters.bufferPhaseSampleRanges.isEmpty,
+           let correlationStart = counters.bufferCorrelationStart {
+            phaseGpu = resolvePhaseGpuSeconds(
+                sampleBuffer: sb, sampleCount: counters.bufferSampleIndex,
+                ranges: counters.bufferPhaseSampleRanges,
+                correlationStart: correlationStart
+            )
+            if let resolved = phaseGpu, counters.phaseGpuSeconds != nil {
+                for (p, s) in resolved {
+                    counters.phaseGpuSeconds![p, default: 0] += s
+                }
+            }
+        }
+
+        let label = StepPhase.allCases.filter {
+            counters.bufferPhaseDispatches[$0] != nil
+                || counters.bufferPhaseEncodeSeconds[$0] != nil
+        }.map(\.rawValue).joined(separator: "+")
+        os_signpost(.end, log: Self.signpostLog, name: "commandBuffer",
+                    signpostID: signpostID, "%{public}@ wait=%.6f gpu=%.6f",
+                    label, waitSeconds, gpuSeconds ?? -1)
+
+        counters.timeline.append(CommandBufferSample(
+            phaseDispatches: counters.bufferPhaseDispatches,
+            phaseEncodeSeconds: counters.bufferPhaseEncodeSeconds,
+            encodeSeconds: encodeSeconds,
+            waitSeconds: waitSeconds,
+            gpuSeconds: gpuSeconds,
+            phaseGpuSeconds: phaseGpu,
+            completed: completed
+        ))
+        counters.bufferOpen = false
+        counters.bufferPhaseDispatches = [:]
+        counters.bufferPhaseEncodeSeconds = [:]
+        counters.currentEncoder = nil
+        counters.bufferSampleBuffer = nil
+        counters.bufferSampleIndex = 0
+        counters.bufferPhaseSampleRanges = []
+        counters.bufferSamplingBroken = false
+        counters.bufferCorrelationStart = nil
+    }
+
+    /// Converts resolved dispatch-boundary timestamp samples into per-phase
+    /// GPU seconds using a linear CPU/GPU correlation across the buffer's
+    /// lifetime (device.sampleTimestamps at encode start and now; CPU
+    /// timestamps are nanoseconds). Any unresolved or non-monotone sample
+    /// voids the whole buffer's split — partial splits under-report silently.
+    /// Only reachable on devices whose probe reports dispatch-boundary
+    /// sampling; Apple GPUs never enter here.
+    private func resolvePhaseGpuSeconds(
+        sampleBuffer: MTLCounterSampleBuffer,
+        sampleCount: Int,
+        ranges: [(phase: StepPhase, start: Int, end: Int)],
+        correlationStart: (cpu: MTLTimestamp, gpu: MTLTimestamp)
+    ) -> [StepPhase: Double]? {
+        let correlationEnd = engine.device.sampleTimestamps()
+        guard correlationEnd.cpu > correlationStart.cpu,
+              correlationEnd.gpu > correlationStart.gpu else { return nil }
+        let cpuSeconds = Double(correlationEnd.cpu - correlationStart.cpu) / 1e9
+        let ticksPerSecond = Double(correlationEnd.gpu - correlationStart.gpu) / cpuSeconds
+        guard ticksPerSecond > 0,
+              let data = try? sampleBuffer.resolveCounterRange(0..<sampleCount),
+              data.count >= sampleCount * MemoryLayout<MTLCounterResultTimestamp>.stride
+        else { return nil }
+        return data.withUnsafeBytes { raw -> [StepPhase: Double]? in
+            let stamps = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+            var result: [StepPhase: Double] = [:]
+            for range in ranges {
+                let t0 = stamps[range.start].timestamp
+                let t1 = stamps[range.end].timestamp
+                guard t0 != 0, t1 != 0, t0 != .max, t1 != .max, t1 >= t0 else {
+                    return nil
+                }
+                result[range.phase, default: 0] += Double(t1 - t0) / ticksPerSecond
+            }
+            return result
+        }
+    }
+
+    private func runPhase(
+        _ label: StepPhase, _ body: (MTLComputeCommandEncoder) throws -> Void
+    ) throws {
+        let (cb, enc) = beginStepCommandBuffer()
+        try phase(label) { try body(enc) }
         enc.endEncoding()
         commitAndWait(cb)
     }
@@ -431,12 +763,29 @@ public final class QwenMetalModel {
     /// Incremental step matching QwenCPUModel.step semantics.
     public func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
         let counters = StepCounters()
+        if case .dispatchBoundaryCounters = phaseGpuSplitSupport {
+            counters.phaseGpuSeconds = [:]
+        }
         let wallStart = ProcessInfo.processInfo.systemUptime
         activeStepCounters = counters
-        engine.computeDispatchObserver = { counters.computeDispatchesEncoded += 1 }
+        let stepSignpostID = OSSignpostID(log: Self.signpostLog)
+        os_signpost(.begin, log: Self.signpostLog, name: "step",
+                    signpostID: stepSignpostID, "tokens=%d", tokens.count)
+        counters.signpostTally.stepIntervals += 1
+        engine.computeDispatchObserver = {
+            counters.computeDispatchesEncoded += 1
+            let bucket = counters.currentPhase ?? .other
+            counters.phaseDispatches[bucket, default: 0] += 1
+            if counters.bufferOpen {
+                counters.bufferPhaseDispatches[bucket, default: 0] += 1
+            }
+        }
         defer {
             engine.computeDispatchObserver = nil
             activeStepCounters = nil
+            os_signpost(.end, log: Self.signpostLog, name: "step",
+                        signpostID: stepSignpostID)
+            lastSignpostTally = counters.signpostTally
             lastStepMetrics = StepMetrics(
                 tokensProcessed: counters.tokensProcessed,
                 logitProjections: counters.logitProjections,
@@ -449,7 +798,11 @@ public final class QwenMetalModel {
                 gpuExecutionSeconds: counters.gpuExecutionSeconds,
                 gpuTimedCommandBuffers: counters.gpuTimedCommandBuffers,
                 gpuUntimedCommandBuffers: counters.gpuUntimedCommandBuffers,
-                completedWithoutThrow: counters.completedWithoutThrow
+                completedWithoutThrow: counters.completedWithoutThrow,
+                commandBufferTimeline: counters.timeline,
+                phaseDispatchesEncoded: counters.phaseDispatches,
+                phaseEncodeSeconds: counters.phaseEncodeSeconds,
+                phaseGpuSeconds: counters.phaseGpuSeconds
             )
         }
 
@@ -500,7 +853,7 @@ public final class QwenMetalModel {
         guard projectLogits else { return [] }
         QwenCPUModel.rmsNorm(&h, rows: 1, dim: D, weight: finalNorm, eps: Float(cfg.rmsNormEps))
         loadX(h)
-        try runPhase { enc in
+        try runPhase(.lmHead) { enc in
             try engine.encodeGemv(enc, lmHead, x: xBuf, y: logitsBuf, yOff: 0)
         }
         activeStepCounters?.logitProjections += 1
@@ -521,7 +874,7 @@ public final class QwenMetalModel {
         let kvDim = KVH * hd
 
         loadX(x)
-        try runPhase { enc in
+        try runPhase(.attention) { enc in
             try engine.encodeGemv(enc, w.qProj, x: xBuf, y: yBuf, yOff: 0)
             try engine.encodeGemv(enc, w.kProj, x: xBuf, y: yBuf, yOff: qOutDim)
             try engine.encodeGemv(enc, w.vProj, x: xBuf, y: yBuf, yOff: qOutDim + kvDim)
@@ -571,7 +924,7 @@ public final class QwenMetalModel {
         for i in 0..<attnOut.count { attnOut[i] *= QwenCPUModel.sigmoid(gate[i]) }
 
         loadX(attnOut)
-        try runPhase { enc in
+        try runPhase(.attention) { enc in
             try engine.encodeGemv(enc, w.oProj, x: xBuf, y: yBuf, yOff: 0)
         }
         return readY(0, cfg.hiddenSize)
@@ -614,7 +967,7 @@ public final class QwenMetalModel {
         switch cfg.deltaLayout {
         case .fusedInterleaved:
             let qkvzDim = 2 * keyDim + 2 * valueDim
-            try runPhase { enc in
+            try runPhase(.delta) { enc in
                 try engine.encodeGemv(enc, w.qkvz!, x: xBuf, y: yBuf, yOff: 0)
                 try engine.encodeGemv(enc, w.ba!, x: xBuf, y: yBuf, yOff: qkvzDim)
             }
@@ -644,7 +997,7 @@ public final class QwenMetalModel {
                 }
             }
         case .split:
-            try runPhase { enc in
+            try runPhase(.delta) { enc in
                 try engine.encodeGemv(enc, w.qkv!, x: xBuf, y: yBuf, yOff: 0)
                 try engine.encodeGemv(enc, w.zProj!, x: xBuf, y: yBuf, yOff: convDim)
                 try engine.encodeGemv(enc, w.bProj!, x: xBuf, y: yBuf, yOff: convDim + valueDim)
@@ -706,7 +1059,7 @@ public final class QwenMetalModel {
         for i in 0..<normed.count { normed[i] *= QwenCPUModel.silu(z[i]) }
 
         loadX(normed)
-        try runPhase { enc in
+        try runPhase(.delta) { enc in
             try engine.encodeGemv(enc, w.outProj, x: xBuf, y: yBuf, yOff: 0)
         }
         return readY(0, cfg.hiddenSize)
@@ -721,7 +1074,7 @@ public final class QwenMetalModel {
         let topK = cfg.numExpertsPerTok
 
         loadX(x)
-        try runPhase { enc in
+        try runPhase(.router) { enc in
             try engine.encodeGemv(enc, w.gate, x: xBuf, y: yBuf, yOff: 0)
         }
         var router = readY(0, E)
@@ -756,7 +1109,7 @@ public final class QwenMetalModel {
             expertBufs = try cache.buffers(layer: layerIndex, experts: picks.map { $0.0 })
         }
 
-        try runPhase { enc in
+        try runPhase(.moe) { enc in
             for (ki, pick) in picks.enumerated() {
                 let e = pick.0
                 if let projs = expertProjs {
@@ -1021,43 +1374,52 @@ extension QwenMetalModel {
             let fl = fastLayers[li]
 
             if let delta = L.delta {
-                let cb = engine.queue.makeCommandBuffer()!
-                let enc = cb.makeComputeCommandEncoder()!
-                if let p = pending { try encodePendingMoE(enc, p); pending = nil }
+                let (cb, enc) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodePendingMoE(enc, p) }
+                    pending = nil
+                }
                 try encDeltaLayer(enc, delta: delta, fl: fl, moeGate: L.moe.gate)
                 enc.endEncoding()
                 commitAndWait(cb)
             } else {
                 // Attention: projections, CPU core, then out-proj + router.
-                let cb1 = engine.queue.makeCommandBuffer()!
-                let e1 = cb1.makeComputeCommandEncoder()!
-                if let p = pending { try encodePendingMoE(e1, p); pending = nil }
-                try encNormCopy(e1, w: fl.inputNorm, dstOff: reg.x0)
-                barrier(e1)
+                let (cb1, e1) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodePendingMoE(e1, p) }
+                    pending = nil
+                }
                 let attn = L.attn!
-                try engine.encodeGemv(e1, attn.qProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qout)
-                try engine.encodeGemv(e1, attn.kProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.knew)
-                try engine.encodeGemv(e1, attn.vProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.vnew)
+                try phase(.attention) {
+                    try encNormCopy(e1, w: fl.inputNorm, dstOff: reg.x0)
+                    barrier(e1)
+                    try engine.encodeGemv(e1, attn.qProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qout)
+                    try engine.encodeGemv(e1, attn.kProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.knew)
+                    try engine.encodeGemv(e1, attn.vProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.vnew)
+                }
                 e1.endEncoding()
                 commitAndWait(cb1)
 
                 let attnOut = attnCoreCPU(layerIndex: li, state: state, attn: attn)
                 writeS(reg.att, attnOut)
 
-                let cb2 = engine.queue.makeCommandBuffer()!
-                let e2 = cb2.makeComputeCommandEncoder()!
-                try engine.encodeGemv(e2, attn.oProj, x: sBuf!, xOff: reg.att, y: sBuf!, yOff: reg.r)
-                barrier(e2)
-                var np = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
-                e2.setComputePipelineState(try engine.pipeline("add_inplace"))
-                e2.setBuffer(hBuf!, offset: 0, index: 0)
-                e2.setBuffer(sBuf!, offset: 0, index: 1)
-                setBytesParams(e2, &np, index: 2)
-                dispatchN(e2, D)
-                barrier(e2)
-                try encNormCopy(e2, w: fl.postNorm, dstOff: reg.xmoe)
-                barrier(e2)
-                try engine.encodeGemv(e2, L.moe.gate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+                let (cb2, e2) = beginStepCommandBuffer()
+                try phase(.attention) {
+                    try engine.encodeGemv(e2, attn.oProj, x: sBuf!, xOff: reg.att, y: sBuf!, yOff: reg.r)
+                    barrier(e2)
+                    var np = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
+                    e2.setComputePipelineState(try engine.pipeline("add_inplace"))
+                    e2.setBuffer(hBuf!, offset: 0, index: 0)
+                    e2.setBuffer(sBuf!, offset: 0, index: 1)
+                    setBytesParams(e2, &np, index: 2)
+                    dispatchN(e2, D)
+                    barrier(e2)
+                }
+                try phase(.router) {
+                    try encNormCopy(e2, w: fl.postNorm, dstOff: reg.xmoe)
+                    barrier(e2)
+                    try engine.encodeGemv(e2, L.moe.gate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+                }
                 e2.endEncoding()
                 commitAndWait(cb2)
             }
@@ -1072,19 +1434,20 @@ extension QwenMetalModel {
 
         // Always apply the last layer's experts. Only the final token in a
         // multi-token call also needs final norm + vocabulary projection.
-        let cb = engine.queue.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
-        if let p = pending { try encodePendingMoE(enc, p) }
+        let (cb, enc) = beginStepCommandBuffer()
+        if let p = pending { try phase(.moe) { try encodePendingMoE(enc, p) } }
         if projectLogits {
-            enc.setComputePipelineState(try engine.pipeline("norm_copy"))
-            var np = NormParams(rows: 1, dim: UInt32(D), eps: Float(cfg.rmsNormEps), hasWeight: 1, scale: 1, off: UInt32(reg.x0))
-            enc.setBuffer(hBuf!, offset: 0, index: 0)
-            enc.setBuffer(sBuf!, offset: 0, index: 1)
-            enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
-            setBytesParams(enc, &np, index: 3)
-            dispatchRows(enc, rows: 1)
-            barrier(enc)
-            try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
+            try phase(.lmHead) {
+                enc.setComputePipelineState(try engine.pipeline("norm_copy"))
+                var np = NormParams(rows: 1, dim: UInt32(D), eps: Float(cfg.rmsNormEps), hasWeight: 1, scale: 1, off: UInt32(reg.x0))
+                enc.setBuffer(hBuf!, offset: 0, index: 0)
+                enc.setBuffer(sBuf!, offset: 0, index: 1)
+                enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
+                setBytesParams(enc, &np, index: 3)
+                dispatchRows(enc, rows: 1)
+                barrier(enc)
+                try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
+            }
             activeStepCounters?.logitProjections += 1
         }
         enc.endEncoding()
@@ -1103,97 +1466,101 @@ extension QwenMetalModel {
         let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
         let keyDim = cfg.keyDim, convDim = cfg.convDim
 
-        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0)
-        barrier(enc)
-        switch config.deltaLayout {
-        case .split:
-            try engine.encodeGemv(enc, delta.qkv!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkv)
-            try engine.encodeGemv(enc, delta.zProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.z)
-            try engine.encodeGemv(enc, delta.bProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.b)
-            try engine.encodeGemv(enc, delta.aProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.a)
+        try phase(.delta) {
+            try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0)
             barrier(enc)
-        case .fusedInterleaved:
-            try engine.encodeGemv(enc, delta.qkvz!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkvzStage)
-            try engine.encodeGemv(enc, delta.ba!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.baStage)
-            barrier(enc)
-            enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
-            struct DeintParams {
-                var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
-                var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
-                var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
+            switch config.deltaLayout {
+            case .split:
+                try engine.encodeGemv(enc, delta.qkv!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkv)
+                try engine.encodeGemv(enc, delta.zProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.z)
+                try engine.encodeGemv(enc, delta.bProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.b)
+                try engine.encodeGemv(enc, delta.aProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.a)
+                barrier(enc)
+            case .fusedInterleaved:
+                try engine.encodeGemv(enc, delta.qkvz!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkvzStage)
+                try engine.encodeGemv(enc, delta.ba!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.baStage)
+                barrier(enc)
+                enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
+                struct DeintParams {
+                    var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
+                    var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
+                    var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
+                }
+                var dip = DeintParams(
+                    nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
+                    keyDim: UInt32(keyDim), srcOff: UInt32(reg.qkvzStage), baOff: UInt32(reg.baStage),
+                    qkvOff: UInt32(reg.qkv), zOff: UInt32(reg.z), bOff: UInt32(reg.b), aOff: UInt32(reg.a)
+                )
+                enc.setBuffer(sBuf!, offset: 0, index: 0)
+                setBytesParams(enc, &dip, index: 1)
+                dispatchN(enc, nk)
+                barrier(enc)
             }
-            var dip = DeintParams(
-                nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
-                keyDim: UInt32(keyDim), srcOff: UInt32(reg.qkvzStage), baOff: UInt32(reg.baStage),
-                qkvOff: UInt32(reg.qkv), zOff: UInt32(reg.z), bOff: UInt32(reg.b), aOff: UInt32(reg.a)
-            )
+
+            enc.setComputePipelineState(try engine.pipeline("conv_step"))
+            var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim), UInt32(reg.qkv), UInt32(reg.conv))
             enc.setBuffer(sBuf!, offset: 0, index: 0)
-            setBytesParams(enc, &dip, index: 1)
-            dispatchN(enc, nk)
+            enc.setBuffer(fl.hist!, offset: 0, index: 1)
+            enc.setBuffer(fl.convW!, offset: 0, index: 2)
+            setBytesParams(enc, &cp, index: 3)
+            dispatchN(enc, convDim)
+
+            enc.setComputePipelineState(try engine.pipeline("delta_pre"))
+            var dp = SIMD4<UInt32>(UInt32(nv), UInt32(reg.a), UInt32(reg.b), UInt32(reg.gb))
+            enc.setBuffer(sBuf!, offset: 0, index: 0)
+            enc.setBuffer(fl.aLog!, offset: 0, index: 1)
+            enc.setBuffer(fl.dtBias!, offset: 0, index: 2)
+            setBytesParams(enc, &dp, index: 3)
+            dispatchN(enc, nv)
+            barrier(enc)
+
+            let invScale = 1 / Float(dk).squareRoot()
+            try encRMSNorm(enc, off: reg.conv, rows: nk, dim: dk, w: nil, scale: invScale * invScale, eps: 1e-6)
+            try encRMSNorm(enc, off: reg.conv + keyDim, rows: nk, dim: dk, w: nil, scale: invScale, eps: 1e-6)
+            barrier(enc)
+
+            enc.setComputePipelineState(try engine.pipeline("gated_delta_step"))
+            var delp = MetalEngine.DeltaParams(T: 1, Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
+            enc.setBuffer(sBuf!, offset: reg.conv * 4, index: 0)                    // q
+            enc.setBuffer(sBuf!, offset: (reg.conv + keyDim) * 4, index: 1)         // k
+            enc.setBuffer(sBuf!, offset: (reg.conv + 2 * keyDim) * 4, index: 2)     // v
+            enc.setBuffer(sBuf!, offset: reg.gb * 4, index: 3)                      // g
+            enc.setBuffer(sBuf!, offset: (reg.gb + nv) * 4, index: 4)               // beta
+            enc.setBuffer(fl.state!, offset: 0, index: 5)
+            enc.setBuffer(sBuf!, offset: reg.dy * 4, index: 6)
+            enc.setBuffer(fl.state!, offset: 0, index: 7)
+            setBytesParams(enc, &delp, index: 8)
+            engine.dispatchThreads(
+                enc, threads: MTLSize(width: 32, height: dv, depth: nv),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
+            )
+            barrier(enc)
+
+            enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
+            struct GNP { var nv: UInt32; var dv: UInt32; var eps: Float; var yOff: UInt32; var zOff: UInt32; var outOff: UInt32 }
+            var gp = GNP(nv: UInt32(nv), dv: UInt32(dv), eps: Float(cfg.rmsNormEps),
+                         yOff: UInt32(reg.dy), zOff: UInt32(reg.z), outOff: UInt32(reg.dn))
+            enc.setBuffer(sBuf!, offset: 0, index: 0)
+            enc.setBuffer(fl.deltaNormW!, offset: 0, index: 1)
+            setBytesParams(enc, &gp, index: 2)
+            dispatchRows(enc, rows: nv)
+            barrier(enc)
+
+            try engine.encodeGemv(enc, delta.outProj, x: sBuf!, xOff: reg.dn, y: sBuf!, yOff: reg.r)
+            barrier(enc)
+            var ap = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
+            enc.setComputePipelineState(try engine.pipeline("add_inplace"))
+            enc.setBuffer(hBuf!, offset: 0, index: 0)
+            enc.setBuffer(sBuf!, offset: 0, index: 1)
+            setBytesParams(enc, &ap, index: 2)
+            dispatchN(enc, D)
             barrier(enc)
         }
-
-        enc.setComputePipelineState(try engine.pipeline("conv_step"))
-        var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim), UInt32(reg.qkv), UInt32(reg.conv))
-        enc.setBuffer(sBuf!, offset: 0, index: 0)
-        enc.setBuffer(fl.hist!, offset: 0, index: 1)
-        enc.setBuffer(fl.convW!, offset: 0, index: 2)
-        setBytesParams(enc, &cp, index: 3)
-        dispatchN(enc, convDim)
-
-        enc.setComputePipelineState(try engine.pipeline("delta_pre"))
-        var dp = SIMD4<UInt32>(UInt32(nv), UInt32(reg.a), UInt32(reg.b), UInt32(reg.gb))
-        enc.setBuffer(sBuf!, offset: 0, index: 0)
-        enc.setBuffer(fl.aLog!, offset: 0, index: 1)
-        enc.setBuffer(fl.dtBias!, offset: 0, index: 2)
-        setBytesParams(enc, &dp, index: 3)
-        dispatchN(enc, nv)
-        barrier(enc)
-
-        let invScale = 1 / Float(dk).squareRoot()
-        try encRMSNorm(enc, off: reg.conv, rows: nk, dim: dk, w: nil, scale: invScale * invScale, eps: 1e-6)
-        try encRMSNorm(enc, off: reg.conv + keyDim, rows: nk, dim: dk, w: nil, scale: invScale, eps: 1e-6)
-        barrier(enc)
-
-        enc.setComputePipelineState(try engine.pipeline("gated_delta_step"))
-        var delp = MetalEngine.DeltaParams(T: 1, Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
-        enc.setBuffer(sBuf!, offset: reg.conv * 4, index: 0)                    // q
-        enc.setBuffer(sBuf!, offset: (reg.conv + keyDim) * 4, index: 1)         // k
-        enc.setBuffer(sBuf!, offset: (reg.conv + 2 * keyDim) * 4, index: 2)     // v
-        enc.setBuffer(sBuf!, offset: reg.gb * 4, index: 3)                      // g
-        enc.setBuffer(sBuf!, offset: (reg.gb + nv) * 4, index: 4)               // beta
-        enc.setBuffer(fl.state!, offset: 0, index: 5)
-        enc.setBuffer(sBuf!, offset: reg.dy * 4, index: 6)
-        enc.setBuffer(fl.state!, offset: 0, index: 7)
-        setBytesParams(enc, &delp, index: 8)
-        engine.dispatchThreads(
-            enc, threads: MTLSize(width: 32, height: dv, depth: nv),
-            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
-        )
-        barrier(enc)
-
-        enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
-        struct GNP { var nv: UInt32; var dv: UInt32; var eps: Float; var yOff: UInt32; var zOff: UInt32; var outOff: UInt32 }
-        var gp = GNP(nv: UInt32(nv), dv: UInt32(dv), eps: Float(cfg.rmsNormEps),
-                     yOff: UInt32(reg.dy), zOff: UInt32(reg.z), outOff: UInt32(reg.dn))
-        enc.setBuffer(sBuf!, offset: 0, index: 0)
-        enc.setBuffer(fl.deltaNormW!, offset: 0, index: 1)
-        setBytesParams(enc, &gp, index: 2)
-        dispatchRows(enc, rows: nv)
-        barrier(enc)
-
-        try engine.encodeGemv(enc, delta.outProj, x: sBuf!, xOff: reg.dn, y: sBuf!, yOff: reg.r)
-        barrier(enc)
-        var ap = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
-        enc.setComputePipelineState(try engine.pipeline("add_inplace"))
-        enc.setBuffer(hBuf!, offset: 0, index: 0)
-        enc.setBuffer(sBuf!, offset: 0, index: 1)
-        setBytesParams(enc, &ap, index: 2)
-        dispatchN(enc, D)
-        barrier(enc)
-        try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe)
-        barrier(enc)
-        try engine.encodeGemv(enc, moeGate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+        try phase(.router) {
+            try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe)
+            barrier(enc)
+            try engine.encodeGemv(enc, moeGate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+        }
     }
 
     private func attnCoreCPU(layerIndex: Int, state: QwenCPUModel.DecodeState, attn: AttnGPU) -> [Float] {

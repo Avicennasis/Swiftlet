@@ -44,6 +44,125 @@ public final class MetalEngine {
         return p
     }
 
+    // MARK: - Counter sampling probe (S3b follow-up)
+
+    /// What this device's Metal counter machinery can actually sample —
+    /// probed at runtime, never assumed. Capabilities come straight from
+    /// `supportsCounterSampling`; `stageBoundarySampleValid` is the result of
+    /// really running a sample pass, so "yes" means counters were exercised
+    /// on this device, not just advertised.
+    public struct CounterSamplingSupport: Equatable, Sendable {
+        public let deviceName: String
+        /// The MTLCommonCounterSet.timestamp counter set exists on the device.
+        public let hasTimestampCounterSet: Bool
+        public let atStageBoundary: Bool
+        public let atDispatchBoundary: Bool
+        public let atDrawBoundary: Bool
+        public let atBlitBoundary: Bool
+        public let atTileDispatchBoundary: Bool
+        /// Functional check: one trivial compute pass ran with stage-boundary
+        /// (encoder start/end) timestamp samples attached and both resolved
+        /// to a monotone, non-error pair. nil when stage-boundary sampling or
+        /// the timestamp set is unavailable, so the pass was never attempted.
+        public let stageBoundarySampleValid: Bool?
+
+        public var summary: String {
+            func yn(_ b: Bool) -> String { b ? "yes" : "no" }
+            let stageProbe: String
+            switch stageBoundarySampleValid {
+            case .some(true): stageProbe = "(sample resolved)"
+            case .some(false): stageProbe = "(sample did NOT resolve)"
+            case .none: stageProbe = "(not probed)"
+            }
+            return "device=\(deviceName) timestampSet=\(yn(hasTimestampCounterSet))"
+                + " stage=\(yn(atStageBoundary))\(stageProbe)"
+                + " dispatch=\(yn(atDispatchBoundary))"
+                + " draw=\(yn(atDrawBoundary))"
+                + " blit=\(yn(atBlitBoundary))"
+                + " tileDispatch=\(yn(atTileDispatchBoundary))"
+        }
+    }
+
+    private var counterSamplingCache: CounterSamplingSupport?
+
+    /// The device's timestamp counter set, if it exposes one.
+    var timestampCounterSet: MTLCounterSet? {
+        device.counterSets?.first {
+            $0.name.caseInsensitiveCompare(MTLCommonCounterSet.timestamp.rawValue) == .orderedSame
+        }
+    }
+
+    /// Probes counter-sampling capabilities once and caches the verdict.
+    /// Runs a real stage-boundary sample pass when the device advertises one,
+    /// so the report is evidence rather than a table of claims.
+    public func probeCounterSampling() -> CounterSamplingSupport {
+        if let cached = counterSamplingCache { return cached }
+        let tsSet = timestampCounterSet
+        let stage = device.supportsCounterSampling(.atStageBoundary)
+        var stageValid: Bool?
+        if stage, let tsSet {
+            stageValid = runStageBoundaryTimestampProbe(counterSet: tsSet)
+        }
+        let support = CounterSamplingSupport(
+            deviceName: device.name,
+            hasTimestampCounterSet: tsSet != nil,
+            atStageBoundary: stage,
+            atDispatchBoundary: device.supportsCounterSampling(.atDispatchBoundary),
+            atDrawBoundary: device.supportsCounterSampling(.atDrawBoundary),
+            atBlitBoundary: device.supportsCounterSampling(.atBlitBoundary),
+            atTileDispatchBoundary: device.supportsCounterSampling(.atTileDispatchBoundary),
+            stageBoundarySampleValid: stageValid
+        )
+        counterSamplingCache = support
+        return support
+    }
+
+    /// One tiny silu_mul dispatch in its own encoder with encoder start/end
+    /// timestamp samples attached — the boundary Apple GPUs support. True
+    /// when both samples resolve to a monotone, non-error pair. Deliberately
+    /// bypasses `dispatchThreads` so the probe never pollutes step counters.
+    private func runStageBoundaryTimestampProbe(counterSet: MTLCounterSet) -> Bool {
+        let desc = MTLCounterSampleBufferDescriptor()
+        desc.counterSet = counterSet
+        desc.storageMode = .shared
+        desc.sampleCount = 2
+        guard let sampleBuffer = try? device.makeCounterSampleBuffer(descriptor: desc),
+              let scratch = device.makeBuffer(length: 64, options: .storageModeShared),
+              let pipe = try? pipeline("silu_mul"),
+              let cb = queue.makeCommandBuffer()
+        else { return false }
+        let pass = MTLComputePassDescriptor()
+        guard let attachment = pass.sampleBufferAttachments[0] else { return false }
+        attachment.sampleBuffer = sampleBuffer
+        attachment.startOfEncoderSampleIndex = 0
+        attachment.endOfEncoderSampleIndex = 1
+        guard let enc = cb.makeComputeCommandEncoder(descriptor: pass) else { return false }
+        enc.setComputePipelineState(pipe)
+        var p = SIMD4<UInt32>(4, 0, 4, 8)
+        enc.setBuffer(scratch, offset: 0, index: 0)
+        enc.setBuffer(scratch, offset: 0, index: 1)
+        enc.setBuffer(scratch, offset: 0, index: 2)
+        enc.setBytes(&p, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 3)
+        enc.dispatchThreads(
+            MTLSize(width: 4, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 4, height: 1, depth: 1)
+        )
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        guard cb.status == .completed,
+              let data = try? sampleBuffer.resolveCounterRange(0..<2),
+              data.count >= 2 * MemoryLayout<MTLCounterResultTimestamp>.stride
+        else { return false }
+        let stamps = data.withUnsafeBytes { raw -> (UInt64, UInt64) in
+            let t = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+            return (t[0].timestamp, t[1].timestamp)
+        }
+        return stamps.0 != 0 && stamps.1 != 0
+            && stamps.0 != .max && stamps.1 != .max
+            && stamps.1 >= stamps.0
+    }
+
     struct GemvParams {
         var wOff: UInt64 = 0   // byte offsets, 64-bit (shards exceed 4 GB)
         var sOff: UInt64 = 0
