@@ -217,26 +217,41 @@ extension SafetensorsFile {
         guard t.dtype == "U32" || t.dtype == "I32" else {
             throw Error.unsupportedDtype(t.dtype, tensor: name)
         }
-        let all = rawBytes(t)
-        return all.withUnsafeBytes { buf in
-            let words = buf.bindMemory(to: UInt32.self)
-            if let r = elementRange { return Array(words[r]) }
-            return Array(words)
+        let r = elementRange ?? 0..<(t.byteRange.count / 4)
+        // In-place view of just the requested words: the per-token embedding
+        // lookup reads one row of a tensor that is hundreds of MB on a real
+        // model, and copying the whole tensor per row was 18% of the M1's
+        // decode CPU gap (S3c). memcpy, because the data section is not
+        // guaranteed to be word-aligned.
+        return withTensorBytes(t, byteRange: (r.lowerBound * 4)..<(r.upperBound * 4)) { raw in
+            [UInt32](unsafeUninitializedCapacity: r.count) { out, count in
+                if r.count > 0 { memcpy(out.baseAddress!, raw.baseAddress!, r.count * 4) }
+                count = r.count
+            }
         }
     }
 
-    /// Float conversion over a sub-range of elements (F32/F16/BF16).
-    func floats(_ name: String, elementRange: Range<Int>) throws -> [Float] {
+    /// Float conversion over a sub-range of elements (F32/F16/BF16), read
+    /// in place (see uint32s).
+    func floats(_ name: String, elementRange r: Range<Int>) throws -> [Float] {
         let t = try info(name)
-        let bytes = rawBytes(t)
         switch t.dtype {
         case "F32":
-            return bytes.withUnsafeBytes { Array($0.bindMemory(to: Float.self)[elementRange]) }
+            return withTensorBytes(t, byteRange: (r.lowerBound * 4)..<(r.upperBound * 4)) { raw in
+                [Float](unsafeUninitializedCapacity: r.count) { out, count in
+                    if r.count > 0 { memcpy(out.baseAddress!, raw.baseAddress!, r.count * 4) }
+                    count = r.count
+                }
+            }
         case "F16":
-            return bytes.withUnsafeBytes { $0.bindMemory(to: Float16.self)[elementRange].map(Float.init) }
+            return withTensorBytes(t, byteRange: (r.lowerBound * 2)..<(r.upperBound * 2)) { raw in
+                (0..<r.count).map { Float(raw.loadUnaligned(fromByteOffset: $0 * 2, as: Float16.self)) }
+            }
         case "BF16":
-            return bytes.withUnsafeBytes {
-                $0.bindMemory(to: UInt16.self)[elementRange].map { Float(bitPattern: UInt32($0) << 16) }
+            return withTensorBytes(t, byteRange: (r.lowerBound * 2)..<(r.upperBound * 2)) { raw in
+                (0..<r.count).map {
+                    Float(bitPattern: UInt32(raw.loadUnaligned(fromByteOffset: $0 * 2, as: UInt16.self)) << 16)
+                }
             }
         default:
             throw Error.unsupportedDtype(t.dtype, tensor: name)
