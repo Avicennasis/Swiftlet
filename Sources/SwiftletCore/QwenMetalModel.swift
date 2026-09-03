@@ -258,6 +258,39 @@ public final class QwenMetalModel {
     /// Sample slots per command buffer: the fast path encodes at most three
     /// phase scopes per buffer (2 samples each); headroom is harmless.
     private static let maxPhaseSamplesPerBuffer = 16
+    /// Test hook (S1b-a): observes the routed expert list for every
+    /// (token, layer) exactly as the current schedule selects it — token
+    /// order in the token-major paths, layer-major order (per layer, tokens
+    /// ascending) in the S1b prefill. The routes themselves are identical
+    /// either way; only the visit order differs. Stays internal.
+    var routedExpertObserver: ((_ layer: Int, _ experts: [Int]) -> Void)?
+    /// Test hook (S1b): the expert union the layer-major prefill actually
+    /// fetched and encoded for one (chunk, layer), ascending expert order —
+    /// what the PrefillExpertUnionPlan oracle predicts. Stays internal.
+    var prefillExpertUnionObserver: ((_ layer: Int, _ experts: [Int]) -> Void)?
+
+    /// Prompt-prefill schedule for multi-token step calls. Single-token
+    /// decode steps never consult this.
+    public enum PrefillMode: Equatable, Sendable {
+        /// Legacy S1a schedule: the decode schedule repeated per token, with
+        /// intermediate LM heads elided.
+        case tokenMajor
+        /// S1b schedule: split the prompt into chunks of at most chunkTokens;
+        /// inside a chunk, sweep layer-by-layer across all tokens and touch
+        /// each layer's expert union once per chunk. chunkTokens bounds
+        /// scratch memory: the chunk keeps chunkTokens x Regions.total
+        /// scratch floats and chunkTokens hidden rows resident.
+        case layerMajor(chunkTokens: Int)
+    }
+
+    /// Default: layer-major with 32-token chunks. One 11-buffer sequence per
+    /// chunk instead of per token, and expert fetches per (layer, union)
+    /// instead of per (token, layer, pick). 32 keeps scratch bounded to a few
+    /// tens of MB on 80B-class configs while letting short prompts run as a
+    /// single chunk; unions saturate toward the full expert set beyond a few
+    /// dozen tokens, so larger chunks add memory faster than they add
+    /// expert-traffic savings. `.tokenMajor` restores the S1a schedule.
+    public var prefillMode: PrefillMode = .layerMajor(chunkTokens: 32)
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -286,6 +319,14 @@ public final class QwenMetalModel {
         var stacksLayer: Int
         var picks: [(Int, Float)]
     }
+
+    // S1b layer-major prefill scratch: one Regions stride and one hidden row
+    // per chunk token. Allocated lazily on the first layer-major prompt call
+    // and kept for the model's lifetime; failure to allocate falls back to
+    // the token-major schedule instead of crashing.
+    var prefillScratchBuf: MTLBuffer?
+    var prefillHiddenBuf: MTLBuffer?
+    var prefillSlotCapacity = 0
 
     public init(modelDir: URL, cacheBudgetGB: Double = 8) throws {
         config = try QwenConfig(url: modelDir.appendingPathComponent("config.json"))
@@ -807,14 +848,28 @@ public final class QwenMetalModel {
         }
 
         var logits: [Float] = []
-        for (index, t) in tokens.enumerated() {
-            // S1a LM-head elision: a multi-token call consumes only the final
-            // position's logits, so intermediate vocabulary projections are
-            // unnecessary.
-            let projectLogits = index == tokens.count - 1
-            logits = try stepOne(t, state: state, projectLogits: projectLogits)
-            state.position += 1
-            counters.tokensProcessed += 1
+        // S1b: multi-token prompt calls take the layer-major chunked schedule
+        // when enabled and the fast path plus chunk scratch are available;
+        // everything else keeps the token-major loop (single-token decode
+        // steps always do).
+        var chunkCapacity = 0
+        if tokens.count > 1, sBuf != nil, hBuf != nil,
+           case .layerMajor(let chunkTokens) = prefillMode {
+            let wanted = min(max(1, chunkTokens), tokens.count)
+            if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
+        }
+        if chunkCapacity > 0 {
+            logits = try prefillLayerMajor(tokens, state: state, chunkCapacity: chunkCapacity)
+        } else {
+            for (index, t) in tokens.enumerated() {
+                // S1a LM-head elision: a multi-token call consumes only the
+                // final position's logits, so intermediate vocabulary
+                // projections are unnecessary.
+                let projectLogits = index == tokens.count - 1
+                logits = try stepOne(t, state: state, projectLogits: projectLogits)
+                state.position += 1
+                counters.tokensProcessed += 1
+            }
         }
         counters.completedWithoutThrow = true
         return logits
@@ -1090,6 +1145,7 @@ public final class QwenMetalModel {
                 picks.sort { $0.1 > $1.1 }
             }
         }
+        routedExpertObserver?(layerIndex, picks.map { $0.0 })
 
         // Scratch layout in yBuf (floats):
         //   [0, K*inter)                        expert gate outputs
@@ -1183,6 +1239,26 @@ public final class QwenMetalModel {
 // dispatches (e.g. all expert GEMVs) actually run in parallel.
 extension QwenMetalModel {
 
+    /// Where one token's fast-path scratch and hidden row live. The decode
+    /// path uses the single legacy slot (sBuf/hBuf at offset zero); a chunked
+    /// prefill can give every token its own stride so tokens never collide
+    /// inside a shared command buffer. Encoding a token through a slot is
+    /// byte-for-byte the legacy schedule when the slot is the legacy one.
+    struct TokenSlot {
+        /// Scratch buffer holding this token's Regions layout.
+        var scratch: MTLBuffer
+        /// Float offset added to every Regions offset inside `scratch`.
+        var base: Int
+        /// Buffer holding this token's hidden-state row.
+        var hidden: MTLBuffer
+        /// Byte offset of the hidden row inside `hidden`.
+        var hiddenByteOffset: Int
+    }
+
+    var legacySlot: TokenSlot {
+        TokenSlot(scratch: sBuf!, base: 0, hidden: hBuf!, hiddenByteOffset: 0)
+    }
+
     private func setBytesParams<T>(_ enc: MTLComputeCommandEncoder, _ v: inout T, index: Int) {
         enc.setBytes(&v, length: MemoryLayout<T>.stride, index: index)
     }
@@ -1210,24 +1286,26 @@ extension QwenMetalModel {
         var off: UInt32
     }
 
-    private func encNormCopy(_ enc: MTLComputeCommandEncoder, w: MTLBuffer, dstOff: Int) throws {
+    private func encNormCopy(
+        _ enc: MTLComputeCommandEncoder, w: MTLBuffer, dstOff: Int, slot: TokenSlot
+    ) throws {
         enc.setComputePipelineState(try engine.pipeline("norm_copy"))
         var p = NormParams(rows: 1, dim: UInt32(config.hiddenSize), eps: Float(config.rmsNormEps),
-                           hasWeight: 1, scale: 1, off: UInt32(dstOff))
-        enc.setBuffer(hBuf!, offset: 0, index: 0)
-        enc.setBuffer(sBuf!, offset: 0, index: 1)
+                           hasWeight: 1, scale: 1, off: UInt32(slot.base + dstOff))
+        enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
+        enc.setBuffer(slot.scratch, offset: 0, index: 1)
         enc.setBuffer(w, offset: 0, index: 2)
         setBytesParams(enc, &p, index: 3)
         dispatchRows(enc, rows: 1)
     }
 
     private func encRMSNorm(_ enc: MTLComputeCommandEncoder, off: Int, rows: Int, dim: Int,
-                            w: MTLBuffer?, scale: Float, eps: Float) throws {
+                            w: MTLBuffer?, scale: Float, eps: Float, slot: TokenSlot) throws {
         enc.setComputePipelineState(try engine.pipeline("rmsnorm_rows"))
         var p = NormParams(rows: UInt32(rows), dim: UInt32(dim), eps: eps,
-                           hasWeight: w != nil ? 1 : 0, scale: scale, off: UInt32(off))
-        enc.setBuffer(sBuf!, offset: 0, index: 0)
-        enc.setBuffer(w ?? sBuf!, offset: 0, index: 1)
+                           hasWeight: w != nil ? 1 : 0, scale: scale, off: UInt32(slot.base + off))
+        enc.setBuffer(slot.scratch, offset: 0, index: 0)
+        enc.setBuffer(w ?? slot.scratch, offset: 0, index: 1)
         setBytesParams(enc, &p, index: 2)
         dispatchRows(enc, rows: rows)
     }
@@ -1236,15 +1314,16 @@ extension QwenMetalModel {
         enc.memoryBarrier(scope: .buffers)
     }
 
-    private func readS(_ off: Int, _ n: Int) -> [Float] {
+    private func readSlot(_ slot: TokenSlot, _ off: Int, _ n: Int) -> [Float] {
         Array(UnsafeBufferPointer(
-            start: sBuf!.contents().advanced(by: off * 4).bindMemory(to: Float.self, capacity: n),
+            start: slot.scratch.contents().advanced(by: (slot.base + off) * 4)
+                .bindMemory(to: Float.self, capacity: n),
             count: n))
     }
 
-    private func writeS(_ off: Int, _ v: [Float]) {
+    private func writeSlot(_ slot: TokenSlot, _ off: Int, _ v: [Float]) {
         v.withUnsafeBufferPointer {
-            sBuf!.contents().advanced(by: off * 4)
+            slot.scratch.contents().advanced(by: (slot.base + off) * 4)
                 .copyMemory(from: $0.baseAddress!, byteCount: v.count * 4)
         }
     }
@@ -1256,7 +1335,9 @@ extension QwenMetalModel {
         }
     }
 
-    private func encodePendingMoE(_ enc: MTLComputeCommandEncoder, _ pend: PendingMoE) throws {
+    private func encodePendingMoE(
+        _ enc: MTLComputeCommandEncoder, _ pend: PendingMoE, slot: TokenSlot
+    ) throws {
         let cfg = config
         let D = cfg.hiddenSize, inter = cfg.moeIntermediateSize
         let shInter = cfg.sharedExpertIntermediateSize
@@ -1267,39 +1348,44 @@ extension QwenMetalModel {
         for (ki, pick) in pend.picks.enumerated() {
             let gLin: GPULinear
             let uLin: GPULinear
-            let dLin: GPULinear
             var wE = 0, sE = 0
             if let projs, ki < pend.bufs.count {
                 let buf = pend.bufs[ki]
                 gLin = projs.gate.linear(on: buf)
                 uLin = projs.up.linear(on: buf)
-                dLin = projs.down.linear(on: buf)
             } else {
                 let st = moe.stacks!
-                gLin = st.gate.lin; uLin = st.up.lin; dLin = st.down.lin
+                gLin = st.gate.lin; uLin = st.up.lin
                 wE = pick.0; sE = pick.0
             }
             try engine.encodeGemv(enc, gLin, rows: inter,
                 wExtra: wE * (moe.stacks?.gate.wStride ?? 0), sExtra: sE * (moe.stacks?.gate.sStride ?? 0),
                 bExtra: sE * (moe.stacks?.gate.sStride ?? 0),
-                x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.exp + ki * inter)
+                x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.exp + ki * inter)
             try engine.encodeGemv(enc, uLin, rows: inter,
                 wExtra: wE * (moe.stacks?.up.wStride ?? 0), sExtra: sE * (moe.stacks?.up.sStride ?? 0),
                 bExtra: sE * (moe.stacks?.up.sStride ?? 0),
-                x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.exp + pend.picks.count * inter + ki * inter)
+                x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.exp + pend.picks.count * inter + ki * inter)
         }
-        try engine.encodeGemv(enc, moe.sharedGate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.sh)
-        try engine.encodeGemv(enc, moe.sharedUp, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.sh + shInter)
-        try engine.encodeGemv(enc, fl.sharedGateLin, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.shg)
+        try engine.encodeGemv(enc, moe.sharedGate, x: slot.scratch, xOff: slot.base + reg.xmoe,
+            y: slot.scratch, yOff: slot.base + reg.sh)
+        try engine.encodeGemv(enc, moe.sharedUp, x: slot.scratch, xOff: slot.base + reg.xmoe,
+            y: slot.scratch, yOff: slot.base + reg.sh + shInter)
+        try engine.encodeGemv(enc, fl.sharedGateLin, x: slot.scratch, xOff: slot.base + reg.xmoe,
+            y: slot.scratch, yOff: slot.base + reg.shg)
         barrier(enc)
         let K = pend.picks.count
         for ki in 0..<K {
-            try engine.encodeSiluMul(enc, buf: sBuf!, count: inter,
-                gOff: reg.exp + ki * inter, uOff: reg.exp + K * inter + ki * inter,
-                dstOff: reg.exp + 2 * K * inter + ki * inter)
+            try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
+                gOff: slot.base + reg.exp + ki * inter,
+                uOff: slot.base + reg.exp + K * inter + ki * inter,
+                dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
         }
-        try engine.encodeSiluMul(enc, buf: sBuf!, count: shInter,
-            gOff: reg.sh, uOff: reg.sh + shInter, dstOff: reg.sh + 2 * shInter)
+        try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
+            gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
+            dstOff: slot.base + reg.sh + 2 * shInter)
         barrier(enc)
         for (ki, pick) in pend.picks.enumerated() {
             let dLin: GPULinear
@@ -1313,29 +1399,39 @@ extension QwenMetalModel {
             try engine.encodeGemv(enc, dLin, rows: D,
                 wExtra: wE * (moe.stacks?.down.wStride ?? 0), sExtra: sE * (moe.stacks?.down.sStride ?? 0),
                 bExtra: sE * (moe.stacks?.down.sStride ?? 0),
-                x: sBuf!, xOff: reg.exp + 2 * K * inter + ki * inter,
-                y: sBuf!, yOff: reg.dexp + ki * D)
+                x: slot.scratch, xOff: slot.base + reg.exp + 2 * K * inter + ki * inter,
+                y: slot.scratch, yOff: slot.base + reg.dexp + ki * D)
         }
-        try engine.encodeGemv(enc, moe.sharedDown, x: sBuf!, xOff: reg.sh + 2 * shInter,
-            y: sBuf!, yOff: reg.sh + 3 * shInter)
+        try engine.encodeGemv(enc, moe.sharedDown, x: slot.scratch, xOff: slot.base + reg.sh + 2 * shInter,
+            y: slot.scratch, yOff: slot.base + reg.sh + 3 * shInter)
         barrier(enc)
 
-        enc.setComputePipelineState(try engine.pipeline("weighted_accum"))
-        var ap = SIMD8<UInt32>(UInt32(D), UInt32(K), UInt32(reg.dexp),
-                               UInt32(reg.sh + 3 * shInter), UInt32(reg.shg), 0, 0, 0)
-        enc.setBuffer(hBuf!, offset: 0, index: 0)
-        enc.setBuffer(sBuf!, offset: 0, index: 1)
-        setBytesParams(enc, &ap, index: 2)
-        pend.weights.withUnsafeBufferPointer {
-            enc.setBytes($0.baseAddress!, length: max(1, $0.count) * 4, index: 3)
-        }
-        dispatchN(enc, D)
+        try encWeightedAccum(enc, weights: pend.weights, count: pend.picks.count, slot: slot)
         barrier(enc)
     }
 
-    private func routerPicks() -> ([(Int, Float)], [Float]) {
+    /// h[slot] += sum(weights[k] * expertDown[k]) + sigmoid(sharedGate) * sharedDown.
+    private func encWeightedAccum(
+        _ enc: MTLComputeCommandEncoder, weights: [Float], count: Int, slot: TokenSlot
+    ) throws {
         let cfg = config
-        var router = readS(reg.rout, cfg.numExperts)
+        let D = cfg.hiddenSize, shInter = cfg.sharedExpertIntermediateSize
+        enc.setComputePipelineState(try engine.pipeline("weighted_accum"))
+        var ap = SIMD8<UInt32>(UInt32(D), UInt32(count), UInt32(slot.base + reg.dexp),
+                               UInt32(slot.base + reg.sh + 3 * shInter),
+                               UInt32(slot.base + reg.shg), 0, 0, 0)
+        enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
+        enc.setBuffer(slot.scratch, offset: 0, index: 1)
+        setBytesParams(enc, &ap, index: 2)
+        weights.withUnsafeBufferPointer {
+            enc.setBytes($0.baseAddress!, length: max(1, $0.count) * 4, index: 3)
+        }
+        dispatchN(enc, D)
+    }
+
+    private func routerPicks(slot: TokenSlot) -> ([(Int, Float)], [Float]) {
+        let cfg = config
+        var router = readSlot(slot, reg.rout, cfg.numExperts)
         QwenCPUModel.softmaxRow(&router, base: 0, count: cfg.numExperts)
         var picks: [(Int, Float)] = []
         for e in 0..<cfg.numExperts {
@@ -1350,6 +1446,62 @@ extension QwenMetalModel {
         for (_, p) in picks { sum += p }
         let weights = picks.map { cfg.normTopkProb ? $0.1 / sum : $0.1 }
         return (picks, weights)
+    }
+
+    /// Attention: input norm + q/k/v projections into the slot's regions.
+    private func encAttentionProjections(
+        _ enc: MTLComputeCommandEncoder, attn: AttnGPU, fl: FastLayer, slot: TokenSlot
+    ) throws {
+        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: slot)
+        barrier(enc)
+        try engine.encodeGemv(enc, attn.qProj, x: slot.scratch, xOff: slot.base + reg.x0,
+            y: slot.scratch, yOff: slot.base + reg.qout)
+        try engine.encodeGemv(enc, attn.kProj, x: slot.scratch, xOff: slot.base + reg.x0,
+            y: slot.scratch, yOff: slot.base + reg.knew)
+        try engine.encodeGemv(enc, attn.vProj, x: slot.scratch, xOff: slot.base + reg.x0,
+            y: slot.scratch, yOff: slot.base + reg.vnew)
+    }
+
+    /// Attention: output projection and residual add into the slot's hidden row.
+    private func encAttentionFinish(
+        _ enc: MTLComputeCommandEncoder, attn: AttnGPU, slot: TokenSlot
+    ) throws {
+        let D = config.hiddenSize
+        try engine.encodeGemv(enc, attn.oProj, x: slot.scratch, xOff: slot.base + reg.att,
+            y: slot.scratch, yOff: slot.base + reg.r)
+        barrier(enc)
+        var np = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
+        enc.setComputePipelineState(try engine.pipeline("add_inplace"))
+        enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
+        enc.setBuffer(slot.scratch, offset: 0, index: 1)
+        setBytesParams(enc, &np, index: 2)
+        dispatchN(enc, D)
+        barrier(enc)
+    }
+
+    /// Post-attention norm and router logits projection for one token.
+    private func encRouterProbe(
+        _ enc: MTLComputeCommandEncoder, moeGate: GPULinear, fl: FastLayer, slot: TokenSlot
+    ) throws {
+        try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe, slot: slot)
+        barrier(enc)
+        try engine.encodeGemv(enc, moeGate, x: slot.scratch, xOff: slot.base + reg.xmoe,
+            y: slot.scratch, yOff: slot.base + reg.rout)
+    }
+
+    /// Final norm + vocabulary projection for the slot's hidden row.
+    private func encFinalLMHead(_ enc: MTLComputeCommandEncoder, slot: TokenSlot) throws {
+        enc.setComputePipelineState(try engine.pipeline("norm_copy"))
+        var np = NormParams(rows: 1, dim: UInt32(config.hiddenSize), eps: Float(config.rmsNormEps),
+                            hasWeight: 1, scale: 1, off: UInt32(slot.base + reg.x0))
+        enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
+        enc.setBuffer(slot.scratch, offset: 0, index: 1)
+        enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
+        setBytesParams(enc, &np, index: 3)
+        dispatchRows(enc, rows: 1)
+        barrier(enc)
+        try engine.encodeGemv(enc, lmHead, x: slot.scratch, xOff: slot.base + reg.x0,
+            y: logitsBuf, yOff: 0)
     }
 
     func stepOneFast(
@@ -1367,6 +1519,7 @@ extension QwenMetalModel {
             hBuf!.contents().copyMemory(from: $0.baseAddress!, byteCount: D * 4)
         }
 
+        let slot = legacySlot
         var pending: PendingMoE? = nil
 
         for li in 0..<cfg.numHiddenLayers {
@@ -1376,55 +1529,50 @@ extension QwenMetalModel {
             if let delta = L.delta {
                 let (cb, enc) = beginStepCommandBuffer()
                 if let p = pending {
-                    try phase(.moe) { try encodePendingMoE(enc, p) }
+                    try phase(.moe) { try encodePendingMoE(enc, p, slot: slot) }
                     pending = nil
                 }
-                try encDeltaLayer(enc, delta: delta, fl: fl, moeGate: L.moe.gate)
+                try phase(.delta) {
+                    try encDeltaCore(enc, delta: delta, fl: fl, slot: slot)
+                }
+                try phase(.router) {
+                    try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: slot)
+                }
                 enc.endEncoding()
                 commitAndWait(cb)
             } else {
                 // Attention: projections, CPU core, then out-proj + router.
                 let (cb1, e1) = beginStepCommandBuffer()
                 if let p = pending {
-                    try phase(.moe) { try encodePendingMoE(e1, p) }
+                    try phase(.moe) { try encodePendingMoE(e1, p, slot: slot) }
                     pending = nil
                 }
                 let attn = L.attn!
                 try phase(.attention) {
-                    try encNormCopy(e1, w: fl.inputNorm, dstOff: reg.x0)
-                    barrier(e1)
-                    try engine.encodeGemv(e1, attn.qProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qout)
-                    try engine.encodeGemv(e1, attn.kProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.knew)
-                    try engine.encodeGemv(e1, attn.vProj, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.vnew)
+                    try encAttentionProjections(e1, attn: attn, fl: fl, slot: slot)
                 }
                 e1.endEncoding()
                 commitAndWait(cb1)
 
-                let attnOut = attnCoreCPU(layerIndex: li, state: state, attn: attn)
-                writeS(reg.att, attnOut)
+                let attnOut = attnCoreCPU(
+                    layerIndex: li, state: state, attn: attn,
+                    position: state.position, slot: slot
+                )
+                writeSlot(slot, reg.att, attnOut)
 
                 let (cb2, e2) = beginStepCommandBuffer()
                 try phase(.attention) {
-                    try engine.encodeGemv(e2, attn.oProj, x: sBuf!, xOff: reg.att, y: sBuf!, yOff: reg.r)
-                    barrier(e2)
-                    var np = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
-                    e2.setComputePipelineState(try engine.pipeline("add_inplace"))
-                    e2.setBuffer(hBuf!, offset: 0, index: 0)
-                    e2.setBuffer(sBuf!, offset: 0, index: 1)
-                    setBytesParams(e2, &np, index: 2)
-                    dispatchN(e2, D)
-                    barrier(e2)
+                    try encAttentionFinish(e2, attn: attn, slot: slot)
                 }
                 try phase(.router) {
-                    try encNormCopy(e2, w: fl.postNorm, dstOff: reg.xmoe)
-                    barrier(e2)
-                    try engine.encodeGemv(e2, L.moe.gate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
+                    try encRouterProbe(e2, moeGate: L.moe.gate, fl: fl, slot: slot)
                 }
                 e2.endEncoding()
                 commitAndWait(cb2)
             }
 
-            let (picks, weights) = routerPicks()
+            let (picks, weights) = routerPicks(slot: slot)
+            routedExpertObserver?(li, picks.map { $0.0 })
             var bufs: [MTLBuffer] = []
             if let cache = expertCache {
                 bufs = try cache.buffers(layer: li, experts: picks.map { $0.0 })
@@ -1435,18 +1583,10 @@ extension QwenMetalModel {
         // Always apply the last layer's experts. Only the final token in a
         // multi-token call also needs final norm + vocabulary projection.
         let (cb, enc) = beginStepCommandBuffer()
-        if let p = pending { try phase(.moe) { try encodePendingMoE(enc, p) } }
+        if let p = pending { try phase(.moe) { try encodePendingMoE(enc, p, slot: slot) } }
         if projectLogits {
             try phase(.lmHead) {
-                enc.setComputePipelineState(try engine.pipeline("norm_copy"))
-                var np = NormParams(rows: 1, dim: UInt32(D), eps: Float(cfg.rmsNormEps), hasWeight: 1, scale: 1, off: UInt32(reg.x0))
-                enc.setBuffer(hBuf!, offset: 0, index: 0)
-                enc.setBuffer(sBuf!, offset: 0, index: 1)
-                enc.setBuffer(finalNormBuf!, offset: 0, index: 2)
-                setBytesParams(enc, &np, index: 3)
-                dispatchRows(enc, rows: 1)
-                barrier(enc)
-                try engine.encodeGemv(enc, lmHead, x: sBuf!, xOff: reg.x0, y: logitsBuf, yOff: 0)
+                try encFinalLMHead(enc, slot: slot)
             }
             activeStepCounters?.logitProjections += 1
         }
@@ -1459,118 +1599,132 @@ extension QwenMetalModel {
             count: cfg.vocabSize))
     }
 
-    private func encDeltaLayer(_ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, moeGate: GPULinear) throws {
+    /// DeltaNet mixer for one token, entirely on GPU: projections, conv step,
+    /// gated recurrence, gated norm, output projection, residual add.
+    private func encDeltaCore(
+        _ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, slot: TokenSlot
+    ) throws {
         let cfg = config
         let D = cfg.hiddenSize
         let nk = cfg.linearNumKeyHeads, nv = cfg.linearNumValueHeads
         let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
         let keyDim = cfg.keyDim, convDim = cfg.convDim
 
-        try phase(.delta) {
-            try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0)
+        try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: slot)
+        barrier(enc)
+        switch config.deltaLayout {
+        case .split:
+            try engine.encodeGemv(enc, delta.qkv!, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + reg.qkv)
+            try engine.encodeGemv(enc, delta.zProj!, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + reg.z)
+            try engine.encodeGemv(enc, delta.bProj!, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + reg.b)
+            try engine.encodeGemv(enc, delta.aProj!, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + reg.a)
             barrier(enc)
-            switch config.deltaLayout {
-            case .split:
-                try engine.encodeGemv(enc, delta.qkv!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkv)
-                try engine.encodeGemv(enc, delta.zProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.z)
-                try engine.encodeGemv(enc, delta.bProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.b)
-                try engine.encodeGemv(enc, delta.aProj!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.a)
-                barrier(enc)
-            case .fusedInterleaved:
-                try engine.encodeGemv(enc, delta.qkvz!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.qkvzStage)
-                try engine.encodeGemv(enc, delta.ba!, x: sBuf!, xOff: reg.x0, y: sBuf!, yOff: reg.baStage)
-                barrier(enc)
-                enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
-                struct DeintParams {
-                    var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
-                    var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
-                    var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
-                }
-                var dip = DeintParams(
-                    nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
-                    keyDim: UInt32(keyDim), srcOff: UInt32(reg.qkvzStage), baOff: UInt32(reg.baStage),
-                    qkvOff: UInt32(reg.qkv), zOff: UInt32(reg.z), bOff: UInt32(reg.b), aOff: UInt32(reg.a)
-                )
-                enc.setBuffer(sBuf!, offset: 0, index: 0)
-                setBytesParams(enc, &dip, index: 1)
-                dispatchN(enc, nk)
-                barrier(enc)
+        case .fusedInterleaved:
+            try engine.encodeGemv(enc, delta.qkvz!, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + reg.qkvzStage)
+            try engine.encodeGemv(enc, delta.ba!, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + reg.baStage)
+            barrier(enc)
+            enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
+            struct DeintParams {
+                var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
+                var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
+                var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
             }
-
-            enc.setComputePipelineState(try engine.pipeline("conv_step"))
-            var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim), UInt32(reg.qkv), UInt32(reg.conv))
-            enc.setBuffer(sBuf!, offset: 0, index: 0)
-            enc.setBuffer(fl.hist!, offset: 0, index: 1)
-            enc.setBuffer(fl.convW!, offset: 0, index: 2)
-            setBytesParams(enc, &cp, index: 3)
-            dispatchN(enc, convDim)
-
-            enc.setComputePipelineState(try engine.pipeline("delta_pre"))
-            var dp = SIMD4<UInt32>(UInt32(nv), UInt32(reg.a), UInt32(reg.b), UInt32(reg.gb))
-            enc.setBuffer(sBuf!, offset: 0, index: 0)
-            enc.setBuffer(fl.aLog!, offset: 0, index: 1)
-            enc.setBuffer(fl.dtBias!, offset: 0, index: 2)
-            setBytesParams(enc, &dp, index: 3)
-            dispatchN(enc, nv)
-            barrier(enc)
-
-            let invScale = 1 / Float(dk).squareRoot()
-            try encRMSNorm(enc, off: reg.conv, rows: nk, dim: dk, w: nil, scale: invScale * invScale, eps: 1e-6)
-            try encRMSNorm(enc, off: reg.conv + keyDim, rows: nk, dim: dk, w: nil, scale: invScale, eps: 1e-6)
-            barrier(enc)
-
-            enc.setComputePipelineState(try engine.pipeline("gated_delta_step"))
-            var delp = MetalEngine.DeltaParams(T: 1, Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
-            enc.setBuffer(sBuf!, offset: reg.conv * 4, index: 0)                    // q
-            enc.setBuffer(sBuf!, offset: (reg.conv + keyDim) * 4, index: 1)         // k
-            enc.setBuffer(sBuf!, offset: (reg.conv + 2 * keyDim) * 4, index: 2)     // v
-            enc.setBuffer(sBuf!, offset: reg.gb * 4, index: 3)                      // g
-            enc.setBuffer(sBuf!, offset: (reg.gb + nv) * 4, index: 4)               // beta
-            enc.setBuffer(fl.state!, offset: 0, index: 5)
-            enc.setBuffer(sBuf!, offset: reg.dy * 4, index: 6)
-            enc.setBuffer(fl.state!, offset: 0, index: 7)
-            setBytesParams(enc, &delp, index: 8)
-            engine.dispatchThreads(
-                enc, threads: MTLSize(width: 32, height: dv, depth: nv),
-                threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
+            var dip = DeintParams(
+                nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
+                keyDim: UInt32(keyDim),
+                srcOff: UInt32(slot.base + reg.qkvzStage), baOff: UInt32(slot.base + reg.baStage),
+                qkvOff: UInt32(slot.base + reg.qkv), zOff: UInt32(slot.base + reg.z),
+                bOff: UInt32(slot.base + reg.b), aOff: UInt32(slot.base + reg.a)
             )
-            barrier(enc)
-
-            enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
-            struct GNP { var nv: UInt32; var dv: UInt32; var eps: Float; var yOff: UInt32; var zOff: UInt32; var outOff: UInt32 }
-            var gp = GNP(nv: UInt32(nv), dv: UInt32(dv), eps: Float(cfg.rmsNormEps),
-                         yOff: UInt32(reg.dy), zOff: UInt32(reg.z), outOff: UInt32(reg.dn))
-            enc.setBuffer(sBuf!, offset: 0, index: 0)
-            enc.setBuffer(fl.deltaNormW!, offset: 0, index: 1)
-            setBytesParams(enc, &gp, index: 2)
-            dispatchRows(enc, rows: nv)
-            barrier(enc)
-
-            try engine.encodeGemv(enc, delta.outProj, x: sBuf!, xOff: reg.dn, y: sBuf!, yOff: reg.r)
-            barrier(enc)
-            var ap = SIMD2<UInt32>(UInt32(D), UInt32(reg.r))
-            enc.setComputePipelineState(try engine.pipeline("add_inplace"))
-            enc.setBuffer(hBuf!, offset: 0, index: 0)
-            enc.setBuffer(sBuf!, offset: 0, index: 1)
-            setBytesParams(enc, &ap, index: 2)
-            dispatchN(enc, D)
+            enc.setBuffer(slot.scratch, offset: 0, index: 0)
+            setBytesParams(enc, &dip, index: 1)
+            dispatchN(enc, nk)
             barrier(enc)
         }
-        try phase(.router) {
-            try encNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe)
-            barrier(enc)
-            try engine.encodeGemv(enc, moeGate, x: sBuf!, xOff: reg.xmoe, y: sBuf!, yOff: reg.rout)
-        }
+
+        enc.setComputePipelineState(try engine.pipeline("conv_step"))
+        var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim),
+                               UInt32(slot.base + reg.qkv), UInt32(slot.base + reg.conv))
+        enc.setBuffer(slot.scratch, offset: 0, index: 0)
+        enc.setBuffer(fl.hist!, offset: 0, index: 1)
+        enc.setBuffer(fl.convW!, offset: 0, index: 2)
+        setBytesParams(enc, &cp, index: 3)
+        dispatchN(enc, convDim)
+
+        enc.setComputePipelineState(try engine.pipeline("delta_pre"))
+        var dp = SIMD4<UInt32>(UInt32(nv), UInt32(slot.base + reg.a),
+                               UInt32(slot.base + reg.b), UInt32(slot.base + reg.gb))
+        enc.setBuffer(slot.scratch, offset: 0, index: 0)
+        enc.setBuffer(fl.aLog!, offset: 0, index: 1)
+        enc.setBuffer(fl.dtBias!, offset: 0, index: 2)
+        setBytesParams(enc, &dp, index: 3)
+        dispatchN(enc, nv)
+        barrier(enc)
+
+        let invScale = 1 / Float(dk).squareRoot()
+        try encRMSNorm(enc, off: reg.conv, rows: nk, dim: dk, w: nil,
+                       scale: invScale * invScale, eps: 1e-6, slot: slot)
+        try encRMSNorm(enc, off: reg.conv + keyDim, rows: nk, dim: dk, w: nil,
+                       scale: invScale, eps: 1e-6, slot: slot)
+        barrier(enc)
+
+        enc.setComputePipelineState(try engine.pipeline("gated_delta_step"))
+        var delp = MetalEngine.DeltaParams(T: 1, Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
+        enc.setBuffer(slot.scratch, offset: (slot.base + reg.conv) * 4, index: 0)            // q
+        enc.setBuffer(slot.scratch, offset: (slot.base + reg.conv + keyDim) * 4, index: 1)   // k
+        enc.setBuffer(slot.scratch, offset: (slot.base + reg.conv + 2 * keyDim) * 4, index: 2) // v
+        enc.setBuffer(slot.scratch, offset: (slot.base + reg.gb) * 4, index: 3)              // g
+        enc.setBuffer(slot.scratch, offset: (slot.base + reg.gb + nv) * 4, index: 4)         // beta
+        enc.setBuffer(fl.state!, offset: 0, index: 5)
+        enc.setBuffer(slot.scratch, offset: (slot.base + reg.dy) * 4, index: 6)
+        enc.setBuffer(fl.state!, offset: 0, index: 7)
+        setBytesParams(enc, &delp, index: 8)
+        engine.dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: dv, depth: nv),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
+        )
+        barrier(enc)
+
+        enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
+        struct GNP { var nv: UInt32; var dv: UInt32; var eps: Float; var yOff: UInt32; var zOff: UInt32; var outOff: UInt32 }
+        var gp = GNP(nv: UInt32(nv), dv: UInt32(dv), eps: Float(cfg.rmsNormEps),
+                     yOff: UInt32(slot.base + reg.dy), zOff: UInt32(slot.base + reg.z),
+                     outOff: UInt32(slot.base + reg.dn))
+        enc.setBuffer(slot.scratch, offset: 0, index: 0)
+        enc.setBuffer(fl.deltaNormW!, offset: 0, index: 1)
+        setBytesParams(enc, &gp, index: 2)
+        dispatchRows(enc, rows: nv)
+        barrier(enc)
+
+        try engine.encodeGemv(enc, delta.outProj, x: slot.scratch, xOff: slot.base + reg.dn,
+            y: slot.scratch, yOff: slot.base + reg.r)
+        barrier(enc)
+        var ap = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
+        enc.setComputePipelineState(try engine.pipeline("add_inplace"))
+        enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
+        enc.setBuffer(slot.scratch, offset: 0, index: 1)
+        setBytesParams(enc, &ap, index: 2)
+        dispatchN(enc, D)
+        barrier(enc)
     }
 
-    private func attnCoreCPU(layerIndex: Int, state: QwenCPUModel.DecodeState, attn: AttnGPU) -> [Float] {
+    private func attnCoreCPU(
+        layerIndex: Int, state: QwenCPUModel.DecodeState, attn: AttnGPU,
+        position: Int, slot: TokenSlot
+    ) -> [Float] {
         let cfg = config
         let H = cfg.numAttentionHeads, KVH = cfg.numKeyValueHeads, hd = cfg.headDim
         let eps = Float(cfg.rmsNormEps)
-        let past = state.position
-        let qOut = readS(reg.qout, H * hd * 2)
-        var k = readS(reg.knew, KVH * hd)
-        let v = readS(reg.vnew, KVH * hd)
+        let past = position
+        let qOut = readSlot(slot, reg.qout, H * hd * 2)
+        var k = readSlot(slot, reg.knew, KVH * hd)
+        let v = readSlot(slot, reg.vnew, KVH * hd)
 
         var q = [Float](repeating: 0, count: H * hd)
         var gate = [Float](repeating: 0, count: H * hd)
@@ -1629,5 +1783,311 @@ extension QwenMetalModel {
                 x[base + half + j] = b * c + a * sn
             }
         }
+    }
+}
+
+// MARK: - S1b layer-major chunked prefill: inside a chunk, sweep each layer
+// across every token before moving on, so a layer's expert union is fetched
+// once per chunk and one 11-buffer sequence covers the whole chunk instead of
+// every token. Per-token math is encoded through the same slot helpers as the
+// decode path, so numerics match the token-major schedule exactly.
+extension QwenMetalModel {
+
+    /// One layer's deferred MoE for a whole chunk: per-token picks/weights in
+    /// the legacy order, plus the layer's ascending expert union with each
+    /// expert's resident buffer fetched exactly once (qpack mode; raw
+    /// checkpoints address stacked tensors by stride and keep this empty).
+    struct PendingChunkMoE {
+        var layer: Int
+        var union: [Int]
+        var buffers: [Int: MTLBuffer]
+        var perToken: [(picks: [(Int, Float)], weights: [Float])]
+    }
+
+    /// Grows the chunk scratch to hold `n` token slots. Returns false when
+    /// the device cannot allocate them (callers fall back to token-major).
+    private func ensurePrefillCapacity(_ n: Int) -> Bool {
+        if prefillSlotCapacity >= n, prefillScratchBuf != nil, prefillHiddenBuf != nil {
+            return true
+        }
+        let opts: MTLResourceOptions = [.storageModeShared, .hazardTrackingModeUntracked]
+        guard let scratch = engine.device.makeBuffer(length: n * reg.total * 4, options: opts),
+              let hidden = engine.device.makeBuffer(length: n * config.hiddenSize * 4, options: opts)
+        else { return false }
+        prefillScratchBuf = scratch
+        prefillHiddenBuf = hidden
+        prefillSlotCapacity = n
+        return true
+    }
+
+    private func prefillSlot(_ t: Int) -> TokenSlot {
+        TokenSlot(scratch: prefillScratchBuf!, base: t * reg.total,
+                  hidden: prefillHiddenBuf!, hiddenByteOffset: t * config.hiddenSize * 4)
+    }
+
+    /// Splits the prompt into chunks of at most `chunkCapacity` tokens and
+    /// prefills each chunk layer-major. Only the final chunk projects logits
+    /// (the S1a single-LM-head property).
+    func prefillLayerMajor(
+        _ tokens: [Int], state: QwenCPUModel.DecodeState, chunkCapacity: Int
+    ) throws -> [Float] {
+        var logits: [Float] = []
+        var start = 0
+        while start < tokens.count {
+            let end = min(start + chunkCapacity, tokens.count)
+            logits = try prefillChunkLayerMajor(
+                Array(tokens[start..<end]), state: state,
+                projectLogits: end == tokens.count
+            )
+            start = end
+        }
+        return logits
+    }
+
+    /// One chunk, layer-major. The buffer sequence per chunk is exactly the
+    /// legacy per-token shape (one buffer per DeltaNet layer, two per
+    /// attention layer, one tail), each buffer now carrying every chunk
+    /// token's work for that layer in per-token slots. Within a layer,
+    /// tokens are encoded in ascending order so the conv history, recurrence
+    /// state, and KV appends advance exactly as the token-major path does.
+    private func prefillChunkLayerMajor(
+        _ chunk: [Int], state: QwenCPUModel.DecodeState, projectLogits: Bool
+    ) throws -> [Float] {
+        let cfg = config
+        let D = cfg.hiddenSize
+        let S = chunk.count
+        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
+            boundStateID = ObjectIdentifier(state)
+            if state.position == 0 { resetGPUState() }
+        }
+        let basePosition = state.position
+
+        for (t, token) in chunk.enumerated() {
+            let h0 = try ckpt.moduleWeightSlice("model.embed_tokens", rowRange: token..<(token + 1))
+            h0.withUnsafeBufferPointer {
+                prefillHiddenBuf!.contents().advanced(by: t * D * 4)
+                    .copyMemory(from: $0.baseAddress!, byteCount: D * 4)
+            }
+        }
+
+        var pending: PendingChunkMoE?
+
+        for li in 0..<cfg.numHiddenLayers {
+            let L = layers[li]
+            let fl = fastLayers[li]
+
+            if let delta = L.delta {
+                let (cb, enc) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodeChunkMoE(enc, p) }
+                    pending = nil
+                }
+                try phase(.delta) {
+                    // Ascending token order: the conv history and recurrence
+                    // state are shared per layer, and the barriers inside
+                    // each token's sequence order token t+1 after token t.
+                    for t in 0..<S {
+                        try encDeltaCore(enc, delta: delta, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                try phase(.router) {
+                    for t in 0..<S {
+                        try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                enc.endEncoding()
+                commitAndWait(cb)
+            } else {
+                let attn = L.attn!
+                let (cb1, e1) = beginStepCommandBuffer()
+                if let p = pending {
+                    try phase(.moe) { try encodeChunkMoE(e1, p) }
+                    pending = nil
+                }
+                try phase(.attention) {
+                    for t in 0..<S {
+                        try encAttentionProjections(e1, attn: attn, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                e1.endEncoding()
+                commitAndWait(cb1)
+
+                // CPU attention core in ascending token order: token t
+                // attends to the chunk's earlier tokens through the KV rows
+                // they appended just before it.
+                for t in 0..<S {
+                    let slot = prefillSlot(t)
+                    let attnOut = attnCoreCPU(
+                        layerIndex: li, state: state, attn: attn,
+                        position: basePosition + t, slot: slot
+                    )
+                    writeSlot(slot, reg.att, attnOut)
+                }
+
+                let (cb2, e2) = beginStepCommandBuffer()
+                try phase(.attention) {
+                    for t in 0..<S {
+                        try encAttentionFinish(e2, attn: attn, slot: prefillSlot(t))
+                    }
+                }
+                try phase(.router) {
+                    for t in 0..<S {
+                        try encRouterProbe(e2, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
+                    }
+                }
+                e2.endEncoding()
+                commitAndWait(cb2)
+            }
+
+            // Routing on CPU for every chunk token, then one union fetch for
+            // the whole chunk: the schedule consumes exactly what the S1b-a
+            // plan predicts from these routes.
+            var perToken: [(picks: [(Int, Float)], weights: [Float])] = []
+            var unionSet = Set<Int>()
+            for t in 0..<S {
+                let (picks, weights) = routerPicks(slot: prefillSlot(t))
+                routedExpertObserver?(li, picks.map { $0.0 })
+                unionSet.formUnion(picks.map { $0.0 })
+                perToken.append((picks, weights))
+            }
+            let union = unionSet.sorted()
+            prefillExpertUnionObserver?(li, union)
+            var buffers: [Int: MTLBuffer] = [:]
+            if let cache = expertCache {
+                let bufs = try cache.buffers(layer: li, experts: union)
+                for (i, e) in union.enumerated() { buffers[e] = bufs[i] }
+            }
+            pending = PendingChunkMoE(
+                layer: li, union: union, buffers: buffers, perToken: perToken)
+        }
+
+        // Tail: flush the last layer's experts for the whole chunk; only the
+        // prompt's final token also needs final norm + vocabulary projection.
+        let (cb, enc) = beginStepCommandBuffer()
+        if let p = pending { try phase(.moe) { try encodeChunkMoE(enc, p) } }
+        if projectLogits {
+            try phase(.lmHead) {
+                try encFinalLMHead(enc, slot: prefillSlot(S - 1))
+            }
+            activeStepCounters?.logitProjections += 1
+        }
+        enc.endEncoding()
+        commitAndWait(cb)
+
+        state.position += S
+        activeStepCounters?.tokensProcessed += S
+
+        guard projectLogits else { return [] }
+        return Array(UnsafeBufferPointer(
+            start: logitsBuf.contents().bindMemory(to: Float.self, capacity: cfg.vocabSize),
+            count: cfg.vocabSize))
+    }
+
+    /// One layer's MoE for a whole chunk. Every expert in the union is
+    /// touched once per stage, encoding the GEMVs of all tokens routed to it
+    /// back-to-back; outputs land in disjoint per-token slots so a stage runs
+    /// fully in parallel, and each token's weighted accumulation uses the
+    /// legacy pick order, keeping numerics identical to the token-major path.
+    private func encodeChunkMoE(_ enc: MTLComputeCommandEncoder, _ pend: PendingChunkMoE) throws {
+        let cfg = config
+        let D = cfg.hiddenSize, inter = cfg.moeIntermediateSize
+        let shInter = cfg.sharedExpertIntermediateSize
+        let moe = layers[pend.layer].moe
+        let fl = fastLayers[pend.layer]
+        let projs = expertProjs
+
+        // expert -> [(token, pick index)] in ascending token order.
+        var assignments: [Int: [(t: Int, ki: Int)]] = [:]
+        for (t, entry) in pend.perToken.enumerated() {
+            for (ki, pick) in entry.picks.enumerated() {
+                assignments[pick.0, default: []].append((t, ki))
+            }
+        }
+
+        func linears(for expert: Int) -> (g: GPULinear, u: GPULinear, d: GPULinear, e: Int) {
+            if let projs, let buf = pend.buffers[expert] {
+                return (projs.gate.linear(on: buf), projs.up.linear(on: buf),
+                        projs.down.linear(on: buf), 0)
+            }
+            let st = moe.stacks!
+            return (st.gate.lin, st.up.lin, st.down.lin, expert)
+        }
+
+        // Stage 1: routed gate/up grouped by expert, plus each token's shared
+        // gate/up and shared-gate logit.
+        for expert in pend.union {
+            let lin = linears(for: expert)
+            for a in assignments[expert] ?? [] {
+                let slot = prefillSlot(a.t)
+                let K = pend.perToken[a.t].picks.count
+                try engine.encodeGemv(enc, lin.g, rows: inter,
+                    wExtra: lin.e * (moe.stacks?.gate.wStride ?? 0),
+                    sExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                    bExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                    x: slot.scratch, xOff: slot.base + reg.xmoe,
+                    y: slot.scratch, yOff: slot.base + reg.exp + a.ki * inter)
+                try engine.encodeGemv(enc, lin.u, rows: inter,
+                    wExtra: lin.e * (moe.stacks?.up.wStride ?? 0),
+                    sExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                    bExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                    x: slot.scratch, xOff: slot.base + reg.xmoe,
+                    y: slot.scratch, yOff: slot.base + reg.exp + K * inter + a.ki * inter)
+            }
+        }
+        for t in 0..<pend.perToken.count {
+            let slot = prefillSlot(t)
+            try engine.encodeGemv(enc, moe.sharedGate, x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.sh)
+            try engine.encodeGemv(enc, moe.sharedUp, x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.sh + shInter)
+            try engine.encodeGemv(enc, fl.sharedGateLin, x: slot.scratch, xOff: slot.base + reg.xmoe,
+                y: slot.scratch, yOff: slot.base + reg.shg)
+        }
+        barrier(enc)
+
+        // Stage 2: silu(gate) * up for every (token, pick) and shared chain.
+        for (t, entry) in pend.perToken.enumerated() {
+            let slot = prefillSlot(t)
+            let K = entry.picks.count
+            for ki in 0..<K {
+                try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
+                    gOff: slot.base + reg.exp + ki * inter,
+                    uOff: slot.base + reg.exp + K * inter + ki * inter,
+                    dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
+            }
+            try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
+                gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
+                dstOff: slot.base + reg.sh + 2 * shInter)
+        }
+        barrier(enc)
+
+        // Stage 3: down projections grouped by expert, plus shared down.
+        for expert in pend.union {
+            let lin = linears(for: expert)
+            for a in assignments[expert] ?? [] {
+                let slot = prefillSlot(a.t)
+                let K = pend.perToken[a.t].picks.count
+                try engine.encodeGemv(enc, lin.d, rows: D,
+                    wExtra: lin.e * (moe.stacks?.down.wStride ?? 0),
+                    sExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                    bExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                    x: slot.scratch, xOff: slot.base + reg.exp + 2 * K * inter + a.ki * inter,
+                    y: slot.scratch, yOff: slot.base + reg.dexp + a.ki * D)
+            }
+        }
+        for t in 0..<pend.perToken.count {
+            let slot = prefillSlot(t)
+            try engine.encodeGemv(enc, moe.sharedDown,
+                x: slot.scratch, xOff: slot.base + reg.sh + 2 * shInter,
+                y: slot.scratch, yOff: slot.base + reg.sh + 3 * shInter)
+        }
+        barrier(enc)
+
+        // Stage 4: weighted accumulation per token, legacy pick order.
+        for (t, entry) in pend.perToken.enumerated() {
+            try encWeightedAccum(enc, weights: entry.weights, count: entry.picks.count,
+                                 slot: prefillSlot(t))
+        }
+        barrier(enc)
     }
 }

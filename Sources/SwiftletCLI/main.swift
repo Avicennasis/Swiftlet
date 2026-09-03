@@ -197,6 +197,13 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         // bounded cache (--cache-gb) when the model is a .qpack container.
         let cacheGB = Double(flagValue(CommandLine.arguments, "--cache-gb") ?? "8") ?? 8
         let metal = try QwenMetalModel(modelDir: url, cacheBudgetGB: cacheGB)
+        // S1b prefill schedule knob: --prefill-chunk N sets the layer-major
+        // chunk size; 0 restores the legacy token-major schedule (A/B runs).
+        // Default (flag absent) is the model's layer-major default.
+        if let chunkFlag = flagValue(CommandLine.arguments, "--prefill-chunk"),
+           let chunk = Int(chunkFlag) {
+            metal.prefillMode = chunk <= 0 ? .tokenMajor : .layerMajor(chunkTokens: chunk)
+        }
         // S3b follow-up: what the device's counters can actually sample, and
         // whether the per-phase GPU split is measured or honestly absent.
         let split: String
@@ -435,7 +442,7 @@ default:
     print("  swiftlet info <model>            model budget summary (\(ArchConfig.known.keys.sorted().joined(separator: " | ")))")
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
     print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
-    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--lazy]")
+    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy]")
     print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
     print("")
     print("  --gpu       Metal runtime; on a .qpack container experts stream through a bounded cache")
