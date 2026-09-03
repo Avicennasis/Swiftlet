@@ -302,6 +302,160 @@ kernel void gemv_affine_fast8(
     if (lane == 0) y[p.yOff + row] = acc;
 }
 
+// ===== S2 full attention: q prep, KV append, gated causal GQA softmax. =====
+// Replaces the fast path's CPU attention core. RoPE trig uses precise::
+// variants so angles match the CPU's libm within float rounding.
+
+// Extract each head's query from the interleaved q|gate projection
+// (per head [q(hd) | gate(hd)] at srcOff), RMSNorm with wgt, apply partial
+// RoPE for one position, write flat rows at dstOff. One simdgroup per head;
+// the gate half stays untouched for attn_decode_gqa.
+struct AttnPrepParams {
+    uint heads;
+    uint headDim;
+    uint rot;       // rotary dims (<= headDim)
+    float eps;
+    float theta;
+    uint position;
+    uint srcOff;
+    uint dstOff;
+};
+
+inline void rope_row(device float *row, uint rot, uint position, float theta, uint lane) {
+    const uint half_ = rot / 2;
+    for (uint j = lane; j < half_; j += 32) {
+        float invFreq = metal::precise::pow(theta, -float(2 * j) / float(rot));
+        float angle = float(position) * invFreq;
+        float c = metal::precise::cos(angle);
+        float sn = metal::precise::sin(angle);
+        float a = row[j];
+        float b = row[half_ + j];
+        row[j] = a * c - b * sn;
+        row[half_ + j] = b * c + a * sn;
+    }
+}
+
+kernel void attn_q_prep(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],
+    constant AttnPrepParams &p [[buffer(2)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    device const float *src = data + p.srcOff + head * 2 * p.headDim;
+    device float *dst = data + p.dstOff + head * p.headDim;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += src[i] * src[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) dst[i] = src[i] * inv * wgt[i];
+    // RoPE pairs (j, j+rot/2) cross lanes; make the normed writes visible.
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(dst, p.rot, p.position, p.theta, lane);
+}
+
+// Append one position's K/V rows into the caches at row index `position`
+// (layout [position][kvHead][headDim], the CPU reference layout): K is
+// RMSNormed with wgt then roped, V copies verbatim. One simdgroup per kv head.
+struct AttnKVParams {
+    uint kvHeads;
+    uint headDim;
+    uint rot;
+    float eps;
+    float theta;
+    uint position;
+    uint kSrcOff;
+    uint vSrcOff;
+};
+
+kernel void attn_kv_append(
+    device float       *data   [[buffer(0)]],
+    device const float *wgt    [[buffer(1)]],
+    device float       *kCache [[buffer(2)]],
+    device float       *vCache [[buffer(3)]],
+    constant AttnKVParams &p   [[buffer(4)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.kvHeads) return;
+    device const float *kSrc = data + p.kSrcOff + head * p.headDim;
+    device const float *vSrc = data + p.vSrcOff + head * p.headDim;
+    const ulong row = (ulong(p.position) * p.kvHeads + head) * p.headDim;
+    device float *kDst = kCache + row;
+    device float *vDst = vCache + row;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += kSrc[i] * kSrc[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) {
+        kDst[i] = kSrc[i] * inv * wgt[i];
+        vDst[i] = vSrc[i];
+    }
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(kDst, p.rot, p.position, p.theta, lane);
+}
+
+// Gated causal GQA attention for one query token over cache rows [0, kvLen):
+// out = sigmoid(gate) * softmax(q K^T / sqrt(hd)) V, online softmax in f32.
+// One simdgroup per query head; per-lane accumulators cover headDim <= 256.
+struct AttnDecodeParams {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint kvLen;
+    uint qOff;      // prepped q rows (head * headDim)
+    uint qoutOff;   // raw interleaved projection; gate at head*2*hd + hd
+    uint outOff;    // gated context rows (head * headDim)
+};
+
+kernel void attn_decode_gqa(
+    device float       *data   [[buffer(0)]],
+    device const float *kCache [[buffer(1)]],
+    device const float *vCache [[buffer(2)]],
+    constant AttnDecodeParams &p [[buffer(3)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    const uint kvHead = head / (p.heads / p.kvHeads);
+    device const float *q = data + p.qOff + head * p.headDim;
+    const float scale = metal::rsqrt(float(p.headDim));
+    float m = -INFINITY;
+    float s = 0;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint sj = 0; sj < p.kvLen; ++sj) {
+        const ulong row = (ulong(sj) * p.kvHeads + kvHead) * p.headDim;
+        device const float *kr = kCache + row;
+        float dot = 0;
+        for (uint i = lane; i < p.headDim; i += 32) dot += q[i] * kr[i];
+        dot = simd_sum(dot) * scale;
+        const float mNew = metal::max(m, dot);
+        const float corr = metal::exp(m - mNew);   // first row: exp(-inf) = 0
+        const float w = metal::exp(dot - mNew);
+        s = s * corr + w;
+        device const float *vr = vCache + row;
+        uint cnt = 0;
+        for (uint i = lane; i < p.headDim; i += 32) {
+            acc[cnt] = acc[cnt] * corr + w * vr[i];
+            ++cnt;
+        }
+        m = mNew;
+    }
+    const float invS = 1.0f / s;
+    device const float *gate = data + p.qoutOff + head * 2 * p.headDim + p.headDim;
+    device float *out = data + p.outOff + head * p.headDim;
+    uint cnt = 0;
+    for (uint i = lane; i < p.headDim; i += 32) {
+        float gv = gate[i];
+        out[i] = acc[cnt] * invS * (1.0f / (1.0f + metal::exp(-gv)));
+        ++cnt;
+    }
+}
+
 // ===== Small glue kernels so a token needs few command buffers. =====
 
 // RMSNorm over `rows` rows of `dim`, in place at data[off...]. Optional

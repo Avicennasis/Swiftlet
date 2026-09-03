@@ -23,16 +23,23 @@ import Testing
         }
     }
 
-    static let commandBuffersPerToken = 11
+    /// S2: moving attention decode on-GPU merged each attention layer's two
+    /// command buffers (projections / CPU round trip / finish+router) into
+    /// one, so a token costs one buffer per layer plus the tail. Was 11 with
+    /// the CPU attention core (8 layers, 2 of them attention).
+    static let commandBuffersPerToken = 9
+    /// S2 dispatch deltas: +3 per attention layer per token (q prep, KV
+    /// append, causal attention). Was 212/214 (q4) and 218/220 (q35) when
+    /// the attention core ran on CPU.
     static let q4Baseline = FastPathBaseline(
-        commandBuffersPerToken: commandBuffersPerToken,
-        intermediateDispatches: 212,
-        finalDispatches: 214
-    )
-    static let q35Baseline = FastPathBaseline(
         commandBuffersPerToken: commandBuffersPerToken,
         intermediateDispatches: 218,
         finalDispatches: 220
+    )
+    static let q35Baseline = FastPathBaseline(
+        commandBuffersPerToken: commandBuffersPerToken,
+        intermediateDispatches: 224,
+        finalDispatches: 226
     )
 
     static let fixturesDir = URL(fileURLWithPath: #filePath)
@@ -152,9 +159,10 @@ import Testing
     }
 
     /// The label sequence the current fast-path schedule must produce: per
-    /// token, one buffer per DeltaNet layer, two per attention layer, and a
-    /// tail buffer that flushes the last layer's experts (adding the LM head
-    /// only on the final token). Labels are in canonical declaration order.
+    /// token, one buffer per layer (S2 merged the attention layers' former
+    /// two-buffer CPU round trip), and a tail buffer that flushes the last
+    /// layer's experts (adding the LM head only on the final token). Labels
+    /// are in canonical declaration order.
     static func expectedTimelinePhases(
         config: QwenConfig, tokens: Int
     ) -> [[QwenMetalModel.StepPhase]] {
@@ -165,8 +173,7 @@ import Testing
                 if config.isLinearLayer(layer) {
                     expected.append(flushesMoE ? [.delta, .moe, .router] : [.delta, .router])
                 } else {
-                    expected.append(flushesMoE ? [.attention, .moe] : [.attention])
-                    expected.append([.attention, .router])
+                    expected.append(flushesMoE ? [.attention, .moe, .router] : [.attention, .router])
                 }
             }
             expected.append(token == tokens - 1 ? [.moe, .lmHead] : [.moe])

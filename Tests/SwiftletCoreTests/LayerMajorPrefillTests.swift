@@ -15,10 +15,10 @@ import Testing
         .deletingLastPathComponent()
         .appendingPathComponent("fixtures")
 
-    /// Layer-major fast-path baseline: one legacy-token-shaped buffer
-    /// sequence per chunk (the S3a 11-buffer shape), per-token dispatch cost
-    /// unchanged from the old schedule, and the LM head only after the final
-    /// chunk. Exact assertions, S3a style.
+    /// Layer-major fast-path baseline: one decode-token-shaped buffer
+    /// sequence per chunk (the S2 9-buffer shape), per-token dispatch cost
+    /// identical to the decode schedule, and the LM head only after the
+    /// final chunk. Exact assertions, S3a style.
     struct LayerMajorBaseline {
         let commandBuffersPerChunk: Int
         let dispatchesPerToken: Int
@@ -37,14 +37,18 @@ import Testing
         }
     }
 
+    /// S2: the chunk keeps the decode shape — 9 buffers per chunk (was 11
+    /// around the CPU attention core) and +3 dispatches per attention layer
+    /// per token (q prep, KV append, causal attention), so 212 -> 218 (q4)
+    /// and 218 -> 224 (q35) dispatches per token.
     static let q4Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        dispatchesPerToken: 212,
+        dispatchesPerToken: 218,
         lmHeadDispatches: 2
     )
     static let q35Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        dispatchesPerToken: 218,
+        dispatchesPerToken: 224,
         lmHeadDispatches: 2
     )
 
