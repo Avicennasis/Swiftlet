@@ -60,6 +60,21 @@ public struct SafetensorsFile {
         data.subdata(in: (dataStart + t.byteRange.lowerBound)..<(dataStart + t.byteRange.upperBound))
     }
 
+    /// A sub-range of one tensor's stored bytes, viewed in place in the
+    /// mapped file -- no copy of the tensor. The data section can start at
+    /// any byte offset (headers are not padded), so callers must load
+    /// through `loadUnaligned` or memcpy, never `bindMemory`.
+    func withTensorBytes<T>(
+        _ t: TensorInfo, byteRange: Range<Int>, _ body: (UnsafeRawBufferPointer) throws -> T
+    ) rethrows -> T {
+        precondition(byteRange.lowerBound >= 0 && byteRange.upperBound <= t.byteRange.count,
+                     "tensor byte range out of bounds")
+        let lo = dataStart + t.byteRange.lowerBound + byteRange.lowerBound
+        return try data.withUnsafeBytes { raw in
+            try body(UnsafeRawBufferPointer(rebasing: raw[lo..<(lo + byteRange.count)]))
+        }
+    }
+
     /// Raw stored bytes of a tensor (no dtype conversion), with its info.
     public func raw(_ name: String) throws -> (info: TensorInfo, bytes: Data) {
         let t = try info(name)

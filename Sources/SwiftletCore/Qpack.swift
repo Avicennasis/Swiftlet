@@ -220,15 +220,56 @@ public final class QpackExpertReader {
     /// Single-pread fetch of one expert blob into a caller-provided buffer of
     /// at least `layout.expertStride` bytes.
     public func readExpert(layer: Int, expert: Int, into buffer: UnsafeMutableRawPointer) throws {
+        let fd = try descriptor(layer: layer)
+        try Self.readBlob(fd, layer: layer, expert: expert, stride: layout.expertStride, into: buffer)
+    }
+
+    /// Several expert blobs of one layer, each into its own buffer. Two or
+    /// more are read concurrently (one pread per thread; distinct offsets,
+    /// distinct destinations, one shared descriptor), which is what turns a
+    /// decode step's clustered cache misses from serial SSD latency into
+    /// queue depth. Any failure is rethrown after every read has stopped.
+    public func readExperts(
+        layer: Int, _ requests: [(expert: Int, into: UnsafeMutableRawPointer)]
+    ) throws {
+        guard !requests.isEmpty else { return }
+        let fd = try descriptor(layer: layer)
+        let stride = layout.expertStride
+        if requests.count == 1 {
+            try Self.readBlob(fd, layer: layer, expert: requests[0].expert, stride: stride,
+                           into: requests[0].into)
+            return
+        }
+        let lock = NSLock()
+        var failure: Swift.Error?
+        DispatchQueue.concurrentPerform(iterations: requests.count) { i in
+            do {
+                try Self.readBlob(fd, layer: layer, expert: requests[i].expert, stride: stride,
+                               into: requests[i].into)
+            } catch {
+                lock.lock()
+                if failure == nil { failure = error }
+                lock.unlock()
+            }
+        }
+        if let failure { throw failure }
+    }
+
+    private func descriptor(layer: Int) throws -> Int32 {
         if fds[layer] < 0 {
             let path = dir.appendingPathComponent(String(format: "layer_%02d.bin", layer)).path
             let fd = open(path, O_RDONLY)
             guard fd >= 0 else { throw Checkpoint.Error.missingTensor(path) }
             fds[layer] = fd
         }
-        let offset = off_t(expert * layout.expertStride)
-        let n = pread(fds[layer], buffer, layout.expertStride, offset)
-        guard n == layout.expertStride else {
+        return fds[layer]
+    }
+
+    private static func readBlob(
+        _ fd: Int32, layer: Int, expert: Int, stride: Int, into buffer: UnsafeMutableRawPointer
+    ) throws {
+        let n = pread(fd, buffer, stride, off_t(expert * stride))
+        guard n == stride else {
             throw Checkpoint.Error.badShape("short read: layer \(layer) expert \(expert)")
         }
     }
