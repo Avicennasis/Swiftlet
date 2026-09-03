@@ -1,11 +1,36 @@
 import Foundation
 import Metal
 
-/// Bounded expert-blob cache over a .qpack container: fixed slot pool of
-/// GPU-shared buffers, filled by single preads, LFU eviction with recency
-/// tie-break (TurboFieldfare's benchmarked policy). This replaces OS paging so
-/// the working set can never thrash the machine: memory use is exactly
-/// `slots * expertStride`, no more.
+/// Physical-allocation budget used by ``ExpertCache``. Metal may round a
+/// buffer's logical length up to a larger allocation, so the cache charges the
+/// resource's actual `allocatedSize` before retaining it.
+struct ExpertCacheBudget {
+    let limitBytes: Int
+    private(set) var allocatedBytes = 0
+
+    static func slotCapacity(
+        limitBytes: Int, stride: Int, totalSlots: Int, minimumSlots: Int = 16
+    ) -> Int? {
+        guard limitBytes >= 0, stride > 0, totalSlots > 0, minimumSlots >= 0 else {
+            return nil
+        }
+        let capacity = min(limitBytes / stride, totalSlots)
+        return capacity >= min(minimumSlots, totalSlots) ? capacity : nil
+    }
+
+    mutating func reserve(_ bytes: Int) -> Bool {
+        guard bytes > 0, allocatedBytes <= limitBytes,
+              bytes <= limitBytes - allocatedBytes else { return false }
+        allocatedBytes += bytes
+        return true
+    }
+}
+
+/// Bounded expert-blob cache over a .qpack container: a lazily allocated pool
+/// of GPU-shared buffers, filled by single preads, with LFU eviction and a
+/// recency tie-break (TurboFieldfare's benchmarked policy). Both logical slot
+/// capacity and Metal's physical allocation size are bounded by `budgetBytes`,
+/// so the working set can never thrash the machine.
 ///
 /// S3c: a batch resolves every hit and every victim first (the policy is
 /// sequential by definition -- each victim choice excludes the batch's
@@ -32,7 +57,8 @@ public final class ExpertCache {
     public private(set) var hits = 0
     public private(set) var misses = 0
 
-    private let maxSlots: Int
+    private var maxSlots: Int
+    private var physicalBudget: ExpertCacheBudget
 
     init(containerDir: URL, device: MTLDevice, budgetBytes: Int) throws {
         self.device = device
@@ -41,8 +67,23 @@ public final class ExpertCache {
         guard stride > 0, !reader.layout.sections.isEmpty else {
             throw Checkpoint.Error.badShape("corrupt container: empty expert layout (re-download the model)")
         }
-        let total = reader.layout.expertCount * reader.layout.layerCount
-        maxSlots = min(max(budgetBytes / stride, 16), total)
+        let (total, overflow) = reader.layout.expertCount.multipliedReportingOverflow(
+            by: reader.layout.layerCount
+        )
+        guard !overflow, total > 0 else {
+            throw Checkpoint.Error.badShape("corrupt container: invalid expert count")
+        }
+        guard let capacity = ExpertCacheBudget.slotCapacity(
+            limitBytes: budgetBytes, stride: stride, totalSlots: total
+        ) else {
+            let availableSlots = budgetBytes >= 0 ? budgetBytes / stride : 0
+            throw Checkpoint.Error.badShape(
+                "expert cache budget fits \(availableSlots) logical slots; "
+                    + "at least \(min(16, total)) required"
+            )
+        }
+        maxSlots = capacity
+        physicalBudget = ExpertCacheBudget(limitBytes: budgetBytes)
         // Slots allocate lazily on demand (memory grows with use, never past
         // the budget) — important on iOS where an up-front multi-GB allocation
         // invites jetsam before the model even runs.
@@ -50,6 +91,9 @@ public final class ExpertCache {
 
     public var slotCount: Int { maxSlots }
     public var allocatedSlots: Int { slots.count }
+    public var logicalBytes: Int { slots.count * stride }
+    public var allocatedBytes: Int { physicalBudget.allocatedBytes }
+    public var budgetBytes: Int { physicalBudget.limitBytes }
 
     private func key(_ layer: Int, _ expert: Int) -> Int64 {
         Int64(layer) << 32 | Int64(expert)
@@ -119,14 +163,32 @@ public final class ExpertCache {
     /// LFU victim with recency tie-break; grow-on-demand, then free slots,
     /// then eviction.
     private func slotForFill(excluding: Set<Int>) throws -> Int {
-        if slots.count < maxSlots,
-           let b = device.makeBuffer(length: stride, options: .storageModeShared) {
-            slots.append(b)
-            slotKey.append(-1)
-            slotFreq.append(0)
-            slotLastUse.append(0)
-            return slots.count - 1
+        if slots.count < maxSlots {
+            guard let b = device.makeBuffer(length: stride, options: .storageModeShared) else {
+                // Treat an allocator refusal as the discovered physical cap;
+                // repeated retries on every cache miss only make pressure worse.
+                maxSlots = slots.count
+                return try existingSlot(excluding: excluding)
+            }
+            // Never undercharge a resource even if a Metal implementation
+            // reports an unexpected value smaller than the requested length.
+            let charge = max(stride, b.allocatedSize)
+            if physicalBudget.reserve(charge) {
+                slots.append(b)
+                slotKey.append(-1)
+                slotFreq.append(0)
+                slotLastUse.append(0)
+                return slots.count - 1
+            }
+            // Resource rounding made the physical capacity smaller than the
+            // logical estimate. Remember the discovered cap so every miss
+            // does not allocate and immediately discard another buffer.
+            maxSlots = slots.count
         }
+        return try existingSlot(excluding: excluding)
+    }
+
+    private func existingSlot(excluding: Set<Int>) throws -> Int {
         if let free = slotKey.firstIndex(of: -1) { return free }
         var victim = -1
         var victimFreq = Int.max
@@ -140,7 +202,12 @@ public final class ExpertCache {
                 victim = s
             }
         }
-        guard victim >= 0 else { throw Checkpoint.Error.badShape("expert cache too small for batch") }
+        guard victim >= 0 else {
+            throw Checkpoint.Error.badShape(
+                "expert cache budget fits \(slots.count) physical slots; "
+                    + "batch requires at least \(excluding.count + 1)"
+            )
+        }
         return victim
     }
 }

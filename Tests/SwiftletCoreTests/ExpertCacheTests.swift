@@ -82,6 +82,15 @@ import Testing
         return out
     }
 
+    /// The cache now takes an explicit physical budget and refuses one too
+    /// small for min(16, total) slots. Size a budget that pins the pool to
+    /// exactly `slots` blobs (the repacker page-aligns the stride, so the
+    /// per-slot allocation equals the stride).
+    static func budget(slots: Int, container: URL) throws -> Int {
+        let reader = try QpackExpertReader(containerDir: container)
+        return slots * reader.layout.expertStride
+    }
+
     /// A seeded pseudo-random request stream (skewed toward a hot subset,
     /// batches of 1-6 distinct experts) over 16 slots of the 64-blob tiny
     /// container: every hit/miss count and every slot placement must match
@@ -90,8 +99,10 @@ import Testing
         let out = try Self.repackedTiny()
         defer { try? FileManager.default.removeItem(at: out) }
         let device = try #require(MTLCreateSystemDefaultDevice())
-        let cache = try ExpertCache(containerDir: out, device: device, budgetBytes: 0)
-        #expect(cache.slotCount == 16, "budget 0 must floor at 16 slots")
+        let cache = try ExpertCache(
+            containerDir: out, device: device,
+            budgetBytes: Self.budget(slots: 16, container: out))
+        #expect(cache.slotCount == 16, "a 16-slot budget must yield 16 slots")
         var reference = ReferencePolicy(maxSlots: cache.slotCount)
         let layers = cache.reader.layout.layerCount
         let expertsPerLayer = cache.reader.layout.expertCount
@@ -132,7 +143,9 @@ import Testing
         let out = try Self.repackedTiny()
         defer { try? FileManager.default.removeItem(at: out) }
         let device = try #require(MTLCreateSystemDefaultDevice())
-        let cache = try ExpertCache(containerDir: out, device: device, budgetBytes: 0)
+        let cache = try ExpertCache(
+            containerDir: out, device: device,
+            budgetBytes: Self.budget(slots: 16, container: out))
         let oracle = try QpackExpertReader(containerDir: out)
         let stride = cache.stride
         var scratch = [UInt8](repeating: 0, count: stride)
@@ -163,7 +176,9 @@ import Testing
         let out = try Self.repackedTiny()
         defer { try? FileManager.default.removeItem(at: out) }
         let device = try #require(MTLCreateSystemDefaultDevice())
-        let cache = try ExpertCache(containerDir: out, device: device, budgetBytes: 0)
+        let cache = try ExpertCache(
+            containerDir: out, device: device,
+            budgetBytes: Self.budget(slots: 16, container: out))
         // Truncate layer 2's file to two and a half blobs.
         let file = out.appendingPathComponent("packed_experts/layer_02.bin")
         let handle = try FileHandle(forWritingTo: file)
