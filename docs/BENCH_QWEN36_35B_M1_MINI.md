@@ -39,6 +39,12 @@ this box (medians of the three measured runs), TTFT by −5% / −13%, and no
 budget up to 6 GB swapped. The cost side and the mechanism are in "What this
 says for #18" below.
 
+**Follow-up (2026-09-02, `83ce946`):** the CPU gap this run named as the top
+lever was sub-attributed and cut — same box, same protocol, `--cache-gb 4`:
+decode 3.10–3.11 → 3.85–3.87 tok/s (short prompt, fast page-cache state)
+and 2.52 → 3.29 (503-token prompt), TTFT 70.6–72.2 → 58.0–60.9 s, greedy
+output still byte-identical to these logs. See "S3c follow-up" at the end.
+
 ## Environment
 
 - **Machine**: macmini2 — Mac mini (2020, `Macmini9,1`), Apple M1, 8 CPU cores
@@ -519,3 +525,192 @@ Numbers only, from the tables above:
    steady state". This is that trace: page cache 6–10 GiB against a
    16.9 GiB pool, 9–19 GiB of SSD reads per 503-token run at steady state,
    and a CPU gap of 148–253 ms per decode step that tracks the cache budget.
+
+## S3c follow-up: the CPU gap sub-attributed and cut (`4c6fd79` → `83ce946`)
+
+Run 2026-09-02 16:04 → 16:30 EDT on the same box, model, prompts, flags,
+sampler, and 1-warmup + 3-measured discipline as above (`--cache-gb 4`,
+64 new tokens, greedy, fresh process per run under `/usr/bin/time -l`,
+soft idle gate, pre/post `vm_stat`). Three builds, all from this branch,
+built before the first timed run:
+
+- **before** `4c6fd79`: the `1c158d8` stack above plus the S3c
+  instrumentation only (no cuts). Its decode rates reproduce the `5d8b2ab`
+  cells (short 2.90 / 3.10 / 3.11 vs 2.91 / 3.13 / 3.09; long 2.52 / 2.51 /
+  2.52 vs 2.52 / 2.54 / 2.47), so the instrumentation costs nothing visible.
+- **after** `83ce946`: before + the three cuts below.
+- **serial** (A/B arm, not committed): after with the concurrent preads
+  forced serial, to separate the fetch cut's two parts. Warmup + 2 measured.
+
+### What the gap contained (before, per decode step = 64-step totals ÷ 64)
+
+S3c (`StepMetrics.cpuGap`) times the CPU work the step performs between
+buffers with the same clock as encode and wait; the scopes are disjoint, so
+their sum is a lower bound on wall − wait − encode and the remainder is
+"other". The CLI's own argmax and detokenize are timed beside it because
+the bench's wall (1 / tok/s) contains them too.
+
+| Component (before, warm-1) | 16-tok prompt | 503-tok prompt |
+|---|---|---|
+| Step wall | 320.6 ms | 394.1 ms |
+| Blocking wait | 196.8 ms | 202.2 ms |
+| Encode (buffer creation → commit) | 7.6 ms | 6.7 ms |
+| **CPU gap (wall − wait − encode)** | **116.2 ms (36%)** | **185.2 ms (47%)** |
+| — expert-cache fetch | 89.3 ms (52 misses / step) | 160.2 ms (139 misses / step) |
+| — embedding row lookup | 21.1 ms | 18.4 ms |
+| — router readback + softmax + top-k | 0.7 ms | 0.6 ms |
+| — KV mirror append | 0.3 ms | 1.5 ms |
+| — command buffer + encoder creation | 1.3 ms | 1.3 ms |
+| — `commit()` | 1.1 ms | 1.0 ms |
+| — logits readback | 0.1 ms | 0.1 ms |
+| — other (unattributed) | 2.3 ms | 2.1 ms |
+| CLI argmax (outside the model) | 1.7 ms | 1.7 ms |
+| CLI detokenize + print | 0.6 ms | 0.4 ms |
+
+Two items were the gap: the fetch (77–87%, 1.2–1.7 ms per miss — one
+pread at a time against the SSD, plus a victim scan over two dictionaries
+for all 2427 slots on every miss) and the embedding lookup (10–18%), which
+turned out to copy the entire quantized `embed_tokens` tensor (254 MB +
+2 × 16 MB of scales/biases) through `Data.subdata` to extract one row, on
+every token — 5.0 s of the 503-token prefill as well. The three cuts:
+
+1. `ebf25f0` — safetensors sub-range reads in place (memcpy / unaligned
+   loads over the mapped file; the data section is not word-aligned).
+2. `0f39424` — the cache resolves a batch's hits and victims first, then
+   issues the misses as concurrent preads; the victim scan reads two flat
+   per-slot arrays. Same policy, decision for decision (tested against a
+   transcription of the old one over 400 evicting requests).
+3. `83ce946` — the KV mirror appends in place instead of copying the whole
+   history each step.
+
+Nothing about the schedule changed: 41 command buffers and 2082 dispatches
+per decode step, 656 / 148 809 per 503-token prefill, same as `5d8b2ab`.
+
+### A — 16-token prompt, `--cache-gb 4`, layer-major chunk 32
+
+| Build / run | TTFT | Decode tok/s | Decode wait / GPU (64 steps) | Gap (64 steps) | of which fetch / embedding / KV mirror | Hits / misses | SSD pageins | Peak footprint / RSS | user / sys | Real |
+|---|---|---|---|---|---|---|---|---|---|---|
+| before warm-0 (warmup) | 3.492 s | **2.91** | 13.870 / 9.953 s | 7.528 s | 5.878 / 1.301 / 0.020 s | 17152 / 5437 (76%) | 5.9 GiB | 5.47 / 6.81 GiB | 5.2 / 7.7 s | 27.34 s |
+| before warm-1 | 3.260 s | **3.10** | 12.597 / 9.746 s | 7.435 s | 5.716 / 1.351 / 0.021 s | 17152 / 5437 (76%) | 4.7 GiB | 5.47 / 6.82 GiB | 5.4 / 6.2 s | 25.29 s |
+| before warm-2 | 3.093 s | **2.90** | 14.060 / 9.917 s | 7.404 s | 5.778 / 1.286 / 0.020 s | 17152 / 5437 (76%) | 4.8 GiB | 5.47 / 6.41 GiB | 5.1 / 7.7 s | 27.50 s |
+| before warm-3 | 3.230 s | **3.11** | 12.508 / 9.697 s | 7.455 s | 5.750 / 1.340 / 0.022 s | 17152 / 5437 (76%) | 4.7 GiB | 5.47 / 6.82 GiB | 5.4 / 6.2 s | 25.19 s |
+| after warm-0 (warmup) | 2.388 s | **3.65** | 12.557 / 8.944 s | 4.191 s | 3.756 / 0.007 / 0.009 s | 17152 / 5437 (76%) | 6.2 GiB | 5.22 / 6.29 GiB | 3.2 / 8.3 s | 22.73 s |
+| after warm-1 | 2.160 s | **3.87** | 11.803 / 8.815 s | 3.968 s | 3.546 / 0.007 / 0.007 s | 17152 / 5437 (76%) | 3.6 GiB | 5.22 / 6.30 GiB | 3.1 / 8.0 s | 20.02 s |
+| after warm-2 | 2.084 s | **3.65** | 12.654 / 9.098 s | 4.129 s | 3.691 / 0.007 / 0.007 s | 17152 / 5437 (76%) | 3.6 GiB | 5.22 / 6.29 GiB | 3.2 / 9.2 s | 21.81 s |
+| after warm-3 | 2.194 s | **3.85** | 11.851 / 8.910 s | 4.021 s | 3.596 / 0.007 / 0.007 s | 17152 / 5437 (76%) | 3.5 GiB | 5.22 / 6.30 GiB | 3.2 / 8.1 s | 20.17 s |
+| serial warm-0 (warmup) | 3.162 s | **3.45** | 12.307 / 9.408 s | 5.507 s | 5.100 / 0.007 / 0.007 s | 17152 / 5437 (76%) | 5.6 GiB | 5.23 / 6.31 GiB | 3.0 / 6.9 s | 23.06 s |
+| serial warm-1 | 2.728 s | **3.28** | 13.197 / 9.336 s | 5.576 s | 5.153 / 0.006 / 0.008 s | 17152 / 5437 (76%) | 4.3 GiB | 5.23 / 6.30 GiB | 3.0 / 7.8 s | 24.40 s |
+| serial warm-2 | 2.888 s | **3.47** | 12.215 / 9.294 s | 5.506 s | 5.097 / 0.007 / 0.007 s | 17152 / 5437 (76%) | 4.2 GiB | 5.22 / 6.30 GiB | 3.0 / 6.9 s | 22.68 s |
+
+Major page faults (`/usr/bin/time -l`): before 63 / 42 034 / 36, after
+36 / 36 457 / 37, serial 36 006 / 36 — the same two page-cache states as the
+campaign above, so compare like with like: fast state 3.10–3.11 → 3.85–3.87
+(+24–25%), faulting state 2.90 → 3.65 (+26%). TTFT 3.09–3.26 → 2.08–2.19 s
+(−33%; the prefill's 16 embedding rows and 2109 misses).
+
+### C — 503-token prompt, `--cache-gb 4`, layer-major chunk 32
+
+| Build / run | TTFT | Prefill wait / GPU | Prefill gap (fetch / embedding) | Decode tok/s | Decode wait / GPU (64 steps) | Gap (64 steps) | of which fetch / embedding / KV mirror | Hits / misses | SSD pageins | Peak footprint / RSS | user / sys | Real |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| before warm-0 (warmup) | 72.132 s | 46.371 / 40.360 s | 25.550 s (20.314 / 4.952) | **2.50** | 13.623 / 10.348 s | 11.382 s | 9.840 / 1.140 / 0.092 s | 36452 / 27497 (57%) | 15.8 GiB | 5.59 / 6.45 GiB | 17.0 / 23.9 s | 99.88 s |
+| before warm-1 | 70.555 s | 45.632 / 40.332 s | 24.708 s (19.461 / 4.962) | **2.52** | 12.941 / 10.317 s | 11.852 s | 10.254 / 1.175 / 0.094 s | 36452 / 27497 (57%) | 14.6 GiB | 5.59 / 6.51 GiB | 17.3 / 22.1 s | 97.29 s |
+| before warm-2 | 72.198 s | 46.362 / 40.400 s | 25.626 s (20.391 / 4.950) | **2.51** | 13.585 / 10.283 s | 11.335 s | 9.802 / 1.135 / 0.089 s | 36452 / 27497 (57%) | 16.4 GiB | 5.59 / 6.35 GiB | 16.9 / 23.9 s | 99.80 s |
+| before warm-3 | 70.696 s | 45.609 / 40.356 s | 24.874 s (19.622 / 4.969) | **2.52** | 12.905 / 10.304 s | 11.884 s | 10.280 / 1.183 / 0.094 s | 36452 / 27497 (57%) | 14.6 GiB | 5.59 / 6.51 GiB | 17.3 / 22.3 s | 97.42 s |
+| after warm-0 (warmup) | 60.860 s | 49.171 / 40.260 s | 11.206 s (10.705 / 0.027) | **3.13** | 12.914 / 9.468 s | 6.680 s | 6.142 / 0.007 / 0.008 s | 36452 / 27497 (57%) | 11.5 GiB | 5.31 / 5.82 GiB | 8.6 / 41.1 s | 83.38 s |
+| after warm-1 | 58.109 s | 46.699 / 40.295 s | 10.861 s (10.339 / 0.029) | **3.29** | 12.077 / 9.499 s | 6.540 s | 6.034 / 0.008 / 0.008 s | 36452 / 27497 (57%) | 11.5 GiB | 5.32 / 6.31 GiB | 9.1 / 36.0 s | 78.94 s |
+| after warm-2 | 60.932 s | 49.157 / 40.303 s | 11.299 s (10.798 / 0.027) | **3.12** | 13.113 / 9.478 s | 6.602 s | 6.071 / 0.007 / 0.008 s | 36452 / 27497 (57%) | 12.7 GiB | 5.31 / 5.85 GiB | 8.6 / 40.5 s | 83.71 s |
+| after warm-3 | 58.025 s | 46.720 / 40.304 s | 10.774 s (10.251 / 0.034) | **3.29** | 12.057 / 9.472 s | 6.543 s | 6.026 / 0.009 / 0.009 s | 36452 / 27497 (57%) | 11.4 GiB | 5.32 / 6.30 GiB | 9.1 / 35.9 s | 78.83 s |
+| serial warm-0 (warmup) | 67.380 s | 46.822 / 40.324 s | 20.297 s (19.952 / 0.017) | **2.66** | 13.474 / 9.986 s | 9.928 s | 9.509 / 0.006 / 0.007 s | 36452 / 27497 (57%) | 15.9 GiB | 5.31 / 6.04 GiB | 6.7 / 28.6 s | 94.00 s |
+| serial warm-1 | 65.612 s | 44.762 / 40.252 s | 20.541 s (20.143 / 0.019) | **2.74** | 12.501 / 9.998 s | 10.144 s | 9.715 / 0.007 / 0.007 s | 36452 / 27497 (57%) | 14.3 GiB | 5.31 / 6.20 GiB | 7.2 / 26.2 s | 90.31 s |
+| serial warm-2 | 67.221 s | 46.698 / 40.292 s | 20.257 s (19.913 / 0.016) | **2.67** | 13.458 / 9.954 s | 9.885 s | 9.463 / 0.006 / 0.007 s | 36452 / 27497 (57%) | 15.9 GiB | 5.30 / 5.64 GiB | 6.6 / 28.5 s | 93.45 s |
+
+Major page faults: before 36 / 38 438 / 26, after 33 / 36 526 / 36, serial
+36 / 37 062. Like with like: fast state 2.52 → 3.29 (+31%), faulting state
+2.51 → 3.12 (+24%). TTFT 70.6–72.2 → 58.0–60.9 s (−16 to −18%).
+
+### Decode step after (per step, warm-1)
+
+| Component (after) | 16-tok prompt | 503-tok prompt |
+|---|---|---|
+| Step wall | 255.6 ms (was 320.6) | 301.4 ms (was 394.1) |
+| Blocking wait | 184.4 ms | 188.7 ms |
+| GPU (sum of buffer durations) | 137.7 ms (was 152.3) | 148.4 ms (was 161.2) |
+| Encode | 9.2 ms (was 7.6) | 10.5 ms (was 6.7) |
+| **CPU gap** | **62.0 ms (24%; was 116.2)** | **102.2 ms (34%; was 185.2)** |
+| — fetch | 55.4 ms (was 89.3) | 94.3 ms (was 160.2) |
+| — embedding | 0.1 ms (was 21.1) | 0.1 ms (was 18.4) |
+| — KV mirror | 0.1 ms (was 0.3) | 0.1 ms (was 1.5) |
+| — router / cb setup / commit / logits | 0.8 / 1.5 / 1.3 / 0.1 ms | 0.9 / 1.9 / 1.6 / 0.1 ms |
+| — other | 2.7 ms | 3.2 ms |
+
+Reading it:
+
+- **The fetch cut splits cleanly.** Serial arm vs before isolates the flat
+  victim scan (+ the embedding and KV cuts, which the serial arm also has):
+  fetch 5.72–5.78 → 5.10–5.15 s short (−11%, ~10 ms/step), 9.80–10.28 →
+  9.46–9.72 s long (−4%). Concurrent preads then take it to 3.55–3.69 s
+  (−30%) and 6.03–6.07 s (−37%). Per miss: 1.72 → 1.08 ms short, 1.15 →
+  0.68 ms long. In the prefill, where a layer's union has ~29 misses, the
+  concurrent fetch halves the fetch (19.5–20.4 → 10.3–10.8 s) and moves
+  its 31 GiB of nominal misses at ~3 GiB/s, which is this SSD — that arm is
+  now bandwidth-bound, not latency-bound.
+- **The embedding cut is total**: 1.29–1.35 s → 0.007 s per 64 steps,
+  4.95–4.97 s → 0.03 s per 503-token prefill. Peak footprint falls 0.25 GiB
+  (5.47 → 5.22, 5.59 → 5.32 GiB): the transient 254 MB copy is gone.
+- **Three things moved that the cuts do not directly touch, reported not
+  explained.** Decode GPU time (sum of buffer durations) fell 9.70–9.92 →
+  9.29–9.34 (serial arm) → 8.82–9.10 s (short) and 10.28–10.32 → 9.95–10.00
+  → 9.47–9.50 s (long) — the same 2624 buffers, same dispatches; the CPU no
+  longer streams 286 MB per token through unified memory next to the GPU,
+  and the concurrent build changes the read pattern again, which are the
+  obvious candidates, but the counters cannot confirm either. Encode rose 0.44–0.49 → 0.59–0.67 s (+2–4
+  ms/step) and "other" 0.13 → 0.17–0.21 s (+0.5–1 ms/step); both are small
+  against the gain and both appear with the concurrent-pread build only
+  (serial arm: encode 0.52–0.57 s). SSD pageins per run fell 4.7–4.8 →
+  3.5–3.6 GiB (short) and 14.6–16.4 → 11.4–12.7 GiB (long) on the
+  concurrent build while the serial arm stayed at before's level; user
+  CPU time fell (5.4 → 3.2 s, 17 → 9 s) and sys time rose (6.2 → 8.0 s,
+  22 → 36–40 s) as the preads moved to pool threads.
+- **What is left.** The gap is 24% / 34% of a step and 89–92% of it is the
+  fetch, now 0.7–1.1 ms per miss with 1.3 / 3.5 misses per layer — SSD
+  reads, serial across layers by the routing dependency. Everything else
+  in the gap is under 3 ms/step. The wait (184–189 ms/step, of which GPU
+  138–148 ms) is now the largest term; (wait − GPU) is still ~1 ms per
+  command buffer.
+
+### Cuts considered and not taken (numbers from the before split)
+
+- **GPU argmax (b)**: the CLI argmax is 1.7 ms/step (0.5% of a step) and
+  the logits readback 0.1 ms; a GPU reduction would save at most that
+  minus one dispatch, and would need first-max tie semantics pinned for
+  greedy parity. Not worth the surface change at this size.
+- **Fewer commit+wait points (d)**: creation + `commit()` are 2.4 ms/step
+  (0.75%); the per-layer round trip is forced by the CPU top-k → fetch
+  dependency, so cutting buffers means moving that dependency, not
+  merging waits. Rejected: the S3a/S3b baselines stay pinned unchanged.
+- **Skipping the KV mirror memcpy (c)**: the mirror is read by the
+  attention parity tests and by S6 state persistence, so it stays; the
+  in-place append removes the O(history) part and leaves 0.1 ms/step.
+- **Router readback batching (a, second form)**: 0.6–0.7 ms/step; nothing
+  to batch.
+- **Overlapping the fetch with GPU work (a, first form)**: not possible
+  as stated — layer L's routing needs layer L's attention output, and
+  every later GPU dispatch depends on layer L's experts. What remains
+  overlappable is the ~1 ms command-buffer submission latency against the
+  fetch tail (an `MTLSharedEvent` gate in front of each MoE), which would
+  be S4 proper; untested here.
+
+### Output parity
+
+Every measured run's stdout is byte-identical to the corresponding
+`5d8b2ab` bench log: md5 `6986955b…` for the 16-token prompt (all before
+/ after / serial runs, equal to `stack-A-c4-warm-*`) and `0a2e3e68…` for
+the 503-token prompt (equal to `stack-C32-c4-warm-*`). Cache hit/miss
+counts are identical run for run. Fixture-scale walls (tiny-model-q4, raw
+and repacked, 200 greedy tokens, 3 runs each) are within noise — 131–135
+→ 135–137 tok/s raw, 163–166 → 165–167 tok/s qpack — with identical
+output, as expected for a 128 × 64 embedding and 64 resident blobs.
+
+Raw logs: `~/build/cpugap-swiftlet/.bench/logs/` on macmini2
+(`{before,after,serial}-{A,C32}-c4-warm-N.{out,err,pre,post}`,
+`campaign-{before,after}.log`, `fixture-walls.log`).

@@ -29,7 +29,15 @@ struct ExpertCacheBudget {
 /// Bounded expert-blob cache over a .qpack container: a lazily allocated pool
 /// of GPU-shared buffers, filled by single preads, with LFU eviction and a
 /// recency tie-break (TurboFieldfare's benchmarked policy). Both logical slot
-/// capacity and Metal's physical allocation size are bounded by `budgetBytes`.
+/// capacity and Metal's physical allocation size are bounded by `budgetBytes`,
+/// so the working set can never thrash the machine.
+///
+/// S3c: a batch resolves every hit and every victim first (the policy is
+/// sequential by definition -- each victim choice excludes the batch's
+/// earlier members), then issues the batch's preads together. Victim
+/// selection scans two flat per-slot arrays instead of two dictionaries;
+/// the choice is identical (minimum (frequency, last use), lowest slot on
+/// ties), only cheaper.
 public final class ExpertCache {
     let reader: QpackExpertReader
     public let stride: Int
@@ -38,8 +46,12 @@ public final class ExpertCache {
     private var slots: [MTLBuffer] = []
     private var slotKey: [Int64] = []          // key occupying each slot, -1 free
     private var keyToSlot: [Int64: Int] = [:]
+    /// Access frequency per key, resident or not (LFU with history).
     private var freq: [Int64: Int] = [:]
-    private var lastUse: [Int: Int] = [:]      // slot -> tick
+    /// Per-slot mirror of `freq[slotKey[s]]` for resident keys, and the
+    /// tick of each slot's last use -- the two numbers the victim scan reads.
+    private var slotFreq: [Int] = []
+    private var slotLastUse: [Int] = []
     private var tick = 0
 
     public private(set) var hits = 0
@@ -87,21 +99,31 @@ public final class ExpertCache {
         Int64(layer) << 32 | Int64(expert)
     }
 
+    /// Test hook: the slot holding (layer, expert), or nil when not resident.
+    func residentSlot(layer: Int, expert: Int) -> Int? {
+        keyToSlot[key(layer, expert)]
+    }
+
     /// Buffers for a batch of experts in one layer. The whole batch is
     /// resident simultaneously (a member of the batch is never evicted to make
-    /// room for another member).
+    /// room for another member). Misses are read into their slots together
+    /// (concurrent preads when there is more than one); a failed read leaves
+    /// its slot free rather than claiming a key whose bytes never landed.
     func buffers(layer: Int, experts: [Int]) throws -> [MTLBuffer] {
         tick += 1
         var protectedSlots = Set<Int>()
         var result: [MTLBuffer] = []
         result.reserveCapacity(experts.count)
+        var fills: [(slot: Int, expert: Int)] = []
 
         for e in experts {
             let k = key(layer, e)
-            freq[k, default: 0] += 1
+            let f = freq[k, default: 0] + 1
+            freq[k] = f
             if let s = keyToSlot[k] {
                 hits += 1
-                lastUse[s] = tick
+                slotLastUse[s] = tick
+                slotFreq[s] = f
                 protectedSlots.insert(s)
                 result.append(slots[s])
                 continue
@@ -109,12 +131,31 @@ public final class ExpertCache {
             misses += 1
             let s = try slotForFill(excluding: protectedSlots)
             if slotKey[s] >= 0 { keyToSlot.removeValue(forKey: slotKey[s]) }
-            try reader.readExpert(layer: layer, expert: e, into: slots[s].contents())
             slotKey[s] = k
             keyToSlot[k] = s
-            lastUse[s] = tick
+            slotLastUse[s] = tick
+            slotFreq[s] = f
             protectedSlots.insert(s)
             result.append(slots[s])
+            fills.append((slot: s, expert: e))
+        }
+
+        if !fills.isEmpty {
+            do {
+                try reader.readExperts(
+                    layer: layer,
+                    fills.map { (expert: $0.expert, into: slots[$0.slot].contents()) })
+            } catch {
+                // Nothing in the batch is trustworthy after a short read:
+                // release every slot this batch filled so no key points at
+                // bytes that never arrived.
+                for fill in fills {
+                    keyToSlot.removeValue(forKey: slotKey[fill.slot])
+                    slotKey[fill.slot] = -1
+                    slotFreq[fill.slot] = 0
+                }
+                throw error
+            }
         }
         return result
     }
@@ -135,6 +176,8 @@ public final class ExpertCache {
             if physicalBudget.reserve(charge) {
                 slots.append(b)
                 slotKey.append(-1)
+                slotFreq.append(0)
+                slotLastUse.append(0)
                 return slots.count - 1
             }
             // Resource rounding made the physical capacity smaller than the
@@ -148,12 +191,14 @@ public final class ExpertCache {
     private func existingSlot(excluding: Set<Int>) throws -> Int {
         if let free = slotKey.firstIndex(of: -1) { return free }
         var victim = -1
-        var victimScore = (Int.max, Int.max)
+        var victimFreq = Int.max
+        var victimUse = Int.max
         for s in 0..<slots.count where !excluding.contains(s) {
-            let f = freq[slotKey[s]] ?? 0
-            let score = (f, lastUse[s] ?? 0)
-            if score < victimScore {
-                victimScore = score
+            let f = slotFreq[s]
+            let u = slotLastUse[s]
+            if f < victimFreq || (f == victimFreq && u < victimUse) {
+                victimFreq = f
+                victimUse = u
                 victim = s
             }
         }
