@@ -15,14 +15,38 @@ import Testing
         .deletingLastPathComponent()
         .appendingPathComponent("fixtures")
 
-    /// Layer-major fast-path baseline: one decode-token-shaped buffer
-    /// sequence per chunk (the S2 9-buffer shape), per-token dispatch cost
-    /// identical to the decode schedule, and the LM head only after the
-    /// final chunk. Exact assertions, S3a style.
+    /// Layer-major token-batched baseline: one decode-token-shaped buffer
+    /// sequence per chunk (the S2 9-buffer shape), with the dispatch cost
+    /// decomposed into per-chunk batched dispatches (each dense/shared/
+    /// router GEMV plus each batch twin or cross-token scan — norm copies,
+    /// deinterleave, silu, residual adds, weighted accumulation, attention
+    /// q prep / KV append / causal attend, conv scan, decay/beta prep, q/k
+    /// norms, gated scan, gated norm — encodes once per chunk regardless of
+    /// chunk size) and per-union-expert batched GEMVs (gate/up/down encode
+    /// once per (expert, projection) per chunk). No dispatch scales with
+    /// chunk size any more; the perTokenDispatches term is kept at zero as
+    /// the regression tripwire for that property. A single-token chunk
+    /// delegates every batch encode to the legacy per-token path and lands
+    /// exactly on the pre-batching decomposition. Exact assertions, S3a
+    /// style.
     struct LayerMajorBaseline {
         let commandBuffersPerChunk: Int
-        let dispatchesPerToken: Int
+        /// Dispatches that stay per token inside a multi-token chunk.
+        let perTokenDispatches: Int
+        /// Batched dispatches paid once per multi-token chunk.
+        let perChunkDispatches: Int
+        let perUnionExpertDispatches: Int
         let lmHeadDispatches: Int
+        /// The pre-batching decomposition (what a single-token chunk pays).
+        let legacyPerTokenDispatches: Int
+        let legacyPerChunkDispatches: Int
+        /// The flat per-token cost of the unbatched schedule; chunk=1 must
+        /// land exactly on it, larger chunks strictly below it.
+        let unbatchedDispatchesPerToken: Int
+
+        func chunkSizes(tokens: Int, chunkTokens: Int) -> [Int] {
+            stride(from: 0, to: tokens, by: chunkTokens).map { min(chunkTokens, tokens - $0) }
+        }
 
         func chunkCount(tokens: Int, chunkTokens: Int) -> Int {
             (tokens + chunkTokens - 1) / chunkTokens
@@ -32,24 +56,53 @@ import Testing
             commandBuffersPerChunk * chunkCount(tokens: tokens, chunkTokens: chunkTokens)
         }
 
-        func dispatches(tokens: Int) -> Int {
-            dispatchesPerToken * tokens + lmHeadDispatches
+        func dispatches(tokens: Int, chunkTokens: Int, unionSizes: [Int]) -> Int {
+            chunkSizes(tokens: tokens, chunkTokens: chunkTokens).reduce(lmHeadDispatches) {
+                $0 + ($1 == 1
+                    ? legacyPerTokenDispatches + legacyPerChunkDispatches
+                    : perTokenDispatches * $1 + perChunkDispatches)
+            } + perUnionExpertDispatches * unionSizes.reduce(0, +)
         }
     }
 
-    /// S2: the chunk keeps the decode shape — 9 buffers per chunk (was 11
-    /// around the CPU attention core) and +3 dispatches per attention layer
-    /// per token (q prep, KV append, causal attention), so 212 -> 218 (q4)
-    /// and 218 -> 224 (q35) dispatches per token.
+    /// Scanning the conv steps across the chunk erases the last per-token
+    /// dispatches from the layer-major decomposition.
+    /// Old (glue twins + chunked scan + batched attend + batched prep
+    /// chain): per token only the depthwise conv step advancing the layer's
+    /// shared history — q4/q35 6 = 6x1 — with per chunk q4 170 = 66 GEMVs
+    /// + 6x10 + 2x6 + 8x4 (q35: 176 = 78 + 6x9 + 2x6 + 8x4).
+    /// New: the conv history rides across the chunk inside one conv_scan
+    /// per delta layer (the kernel's step loop is the chained per-token
+    /// steps' arithmetic verbatim, so the chunk-size bitwise pins hold
+    /// unchanged) — per token 0; no dispatch scales with chunk size. Per
+    /// chunk the GEMVs plus every batched stage: q4 176 = 66 + 6x11 (conv
+    /// scan, input norm, deinterleave, decay/beta prep, q norm, k norm,
+    /// gather, T-step scan, gated norm, residual, post norm) + 2x6 (input
+    /// norm, q prep, KV append, attend, residual, post norm) + 8x4 (top-2
+    /// silus, shared silu, weighted accum); q35 182 = 78 + 6x10 (no
+    /// deinterleave) + 2x6 + 8x4.
+    /// Per union expert 3 (gate/up/down). A single-token chunk delegates to
+    /// the legacy path and lands exactly on the old pin: 104 + 66 + 3x16
+    /// = 218 and 98 + 78 + 3x16 = 224 (16 = 8 layers x top-2 picks).
     static let q4Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        dispatchesPerToken: 218,
-        lmHeadDispatches: 2
+        perTokenDispatches: 0,
+        perChunkDispatches: 176,
+        perUnionExpertDispatches: 3,
+        lmHeadDispatches: 2,
+        legacyPerTokenDispatches: 104,
+        legacyPerChunkDispatches: 66,
+        unbatchedDispatchesPerToken: 218
     )
     static let q35Baseline = LayerMajorBaseline(
         commandBuffersPerChunk: MetalModelTests.commandBuffersPerToken,
-        dispatchesPerToken: 224,
-        lmHeadDispatches: 2
+        perTokenDispatches: 0,
+        perChunkDispatches: 182,
+        perUnionExpertDispatches: 3,
+        lmHeadDispatches: 2,
+        legacyPerTokenDispatches: 98,
+        legacyPerChunkDispatches: 78,
+        unbatchedDispatchesPerToken: 224
     )
 
     static func argmax(_ v: [Float]) -> Int {
@@ -90,7 +143,10 @@ import Testing
         let layerMajorGPU = try QwenMetalModel(modelDir: dir)
         layerMajorGPU.prefillMode = .layerMajor(chunkTokens: chunkTokens)
         let layerMajorState = QwenCPUModel.DecodeState()
+        var unionSizes: [Int] = []
+        layerMajorGPU.prefillExpertUnionObserver = { unionSizes.append($1.count) }
         let layerMajorLogits = try layerMajorGPU.step(tokens, state: layerMajorState)
+        layerMajorGPU.prefillExpertUnionObserver = nil
         let metrics = layerMajorGPU.lastStepMetrics
 
         // Correctness bar: same logits, same greedy pick, same KV state.
@@ -108,14 +164,26 @@ import Testing
         #expect(metrics.avoidedLogitProjections == tokens.count - 1, "\(label): elision count")
         MetalModelTests.expectInstrumentation(metrics, tokens: tokens.count, label: label)
 
-        // S1b baselines, pinned exactly: buffers per chunk, dispatches per
-        // token, and the chunk-shaped phase timeline.
+        // S1b token-batched baselines, pinned exactly: buffers per chunk,
+        // the dispatch decomposition, and the chunk-shaped phase timeline.
         let chunks = baseline.chunkCount(tokens: tokens.count, chunkTokens: chunkTokens)
         #expect(metrics.commandBuffersCommitted
                 == baseline.commandBuffers(tokens: tokens.count, chunkTokens: chunkTokens),
                 "\(label): layer-major command-buffer baseline changed")
-        #expect(metrics.computeDispatchesEncoded == baseline.dispatches(tokens: tokens.count),
+        #expect(metrics.computeDispatchesEncoded == baseline.dispatches(
+                    tokens: tokens.count, chunkTokens: chunkTokens, unionSizes: unionSizes),
                 "\(label): layer-major dispatch baseline changed")
+        // The point of token batching: never above the unbatched schedule,
+        // strictly below it whenever a chunk holds more than one token.
+        let unbatched = baseline.unbatchedDispatchesPerToken * tokens.count
+            + baseline.lmHeadDispatches
+        if chunkTokens > 1 {
+            #expect(metrics.computeDispatchesEncoded < unbatched,
+                    "\(label): token batching did not reduce dispatches")
+        } else {
+            #expect(metrics.computeDispatchesEncoded == unbatched,
+                    "\(label): single-token chunks moved off the decode-shaped cost")
+        }
         MetalModelTests.expectPhaseTimeline(
             metrics,
             expectedPhases: MetalModelTests.expectedTimelinePhases(
@@ -161,6 +229,36 @@ import Testing
     @Test func singleTokenChunksDegenerateToTokenOrder() throws {
         try Self.compare("tiny-model-q4", chunkTokens: 1,
                          baseline: Self.q4Baseline, decodeBaseline: MetalModelTests.q4Baseline)
+    }
+
+    /// The split DeltaNet layout (q35) must batch across chunk boundaries
+    /// too: 4 in_proj dispatches per chunk instead of per token.
+    @Test func chunkedPrefillSpansThePromptOnQwen35() throws {
+        try Self.compare("tiny-model-q35", chunkTokens: 2,
+                         baseline: Self.q35Baseline, decodeBaseline: MetalModelTests.q35Baseline)
+    }
+
+    /// Token batching is pure reordering: chunk sizes 1, 2, and 5 must
+    /// produce bitwise-identical final logits, because each batched GEMV row
+    /// computes exactly the unbatched kernel's arithmetic and the recurrent
+    /// stages keep ascending token order.
+    @Test(arguments: ["tiny-model-q4", "tiny-model-q35"])
+    func chunkSizeIsBitwiseIrrelevant(modelName: String) throws {
+        let dir = Self.fixturesDir.appendingPathComponent(modelName)
+        let tokens = [1, 5, 9, 42, 7]
+        var reference: [Float] = []
+        for chunk in [1, 2, 5] {
+            let model = try QwenMetalModel(modelDir: dir)
+            model.prefillMode = .layerMajor(chunkTokens: chunk)
+            let state = QwenCPUModel.DecodeState()
+            let logits = try model.step(tokens, state: state)
+            if reference.isEmpty {
+                reference = logits
+            } else {
+                #expect(logits.map(\.bitPattern) == reference.map(\.bitPattern),
+                        "\(modelName): chunk=\(chunk) logits diverge bitwise from chunk=1")
+            }
+        }
     }
 
     // MARK: - Expert unions vs the S1b-a oracle
@@ -300,7 +398,8 @@ import Testing
                 == Self.q4Baseline.commandBuffers(tokens: tokens.count, chunkTokens: 32),
                 "qpack layer-major command-buffer baseline changed")
         #expect(layerMajorGPU.lastStepMetrics.computeDispatchesEncoded
-                == Self.q4Baseline.dispatches(tokens: tokens.count),
+                == Self.q4Baseline.dispatches(
+                    tokens: tokens.count, chunkTokens: 32, unionSizes: unionSizes),
                 "qpack layer-major dispatch baseline changed")
 
         #expect(unionSizes.count == layerMajorGPU.config.numHiddenLayers,

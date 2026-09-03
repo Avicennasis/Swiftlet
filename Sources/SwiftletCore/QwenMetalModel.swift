@@ -340,6 +340,7 @@ public final class QwenMetalModel {
     var prefillScratchBuf: MTLBuffer?
     var prefillHiddenBuf: MTLBuffer?
     var prefillSlotCapacity = 0
+    var prefillStage = PrefillStage()
 
     public init(modelDir: URL, cacheBudgetGB: Double = 8) throws {
         config = try QwenConfig(url: modelDir.appendingPathComponent("config.json"))
@@ -1479,16 +1480,10 @@ extension QwenMetalModel {
     private func encAttentionFinish(
         _ enc: MTLComputeCommandEncoder, attn: AttnGPU, slot: TokenSlot
     ) throws {
-        let D = config.hiddenSize
         try engine.encodeGemv(enc, attn.oProj, x: slot.scratch, xOff: slot.base + reg.att,
             y: slot.scratch, yOff: slot.base + reg.r)
         barrier(enc)
-        var np = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
-        enc.setComputePipelineState(try engine.pipeline("add_inplace"))
-        enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
-        enc.setBuffer(slot.scratch, offset: 0, index: 1)
-        setBytesParams(enc, &np, index: 2)
-        dispatchN(enc, D)
+        try encResidualAdd(enc, slot: slot)
         barrier(enc)
     }
 
@@ -1611,63 +1606,125 @@ extension QwenMetalModel {
     }
 
     /// DeltaNet mixer for one token, entirely on GPU: projections, conv step,
-    /// gated recurrence, gated norm, output projection, residual add.
+    /// gated recurrence, gated norm, output projection, residual add. Encoded
+    /// through the stage helpers below in exactly the legacy order; the
+    /// chunked prefill reuses the stages but batches the projection GEMVs
+    /// across tokens (S1b token batching).
     private func encDeltaCore(
         _ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, slot: TokenSlot
     ) throws {
-        let cfg = config
-        let D = cfg.hiddenSize
-        let nk = cfg.linearNumKeyHeads, nv = cfg.linearNumValueHeads
-        let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
-        let keyDim = cfg.keyDim, convDim = cfg.convDim
-
         try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: slot)
         barrier(enc)
-        switch config.deltaLayout {
-        case .split:
-            try engine.encodeGemv(enc, delta.qkv!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.qkv)
-            try engine.encodeGemv(enc, delta.zProj!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.z)
-            try engine.encodeGemv(enc, delta.bProj!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.b)
-            try engine.encodeGemv(enc, delta.aProj!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.a)
-            barrier(enc)
-        case .fusedInterleaved:
-            try engine.encodeGemv(enc, delta.qkvz!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.qkvzStage)
-            try engine.encodeGemv(enc, delta.ba!, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + reg.baStage)
-            barrier(enc)
-            enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
-            struct DeintParams {
-                var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
-                var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
-                var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
-            }
-            var dip = DeintParams(
-                nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
-                keyDim: UInt32(keyDim),
-                srcOff: UInt32(slot.base + reg.qkvzStage), baOff: UInt32(slot.base + reg.baStage),
-                qkvOff: UInt32(slot.base + reg.qkv), zOff: UInt32(slot.base + reg.z),
-                bOff: UInt32(slot.base + reg.b), aOff: UInt32(slot.base + reg.a)
-            )
-            enc.setBuffer(slot.scratch, offset: 0, index: 0)
-            setBytesParams(enc, &dip, index: 1)
-            dispatchN(enc, nk)
+        for proj in deltaInProjections(delta) {
+            try engine.encodeGemv(enc, proj.lin, x: slot.scratch, xOff: slot.base + reg.x0,
+                y: slot.scratch, yOff: slot.base + proj.dst)
+        }
+        barrier(enc)
+        if config.deltaLayout == .fusedInterleaved {
+            try encDeltaDeinterleave(enc, slot: slot)
             barrier(enc)
         }
+        try encDeltaRecurrence(enc, fl: fl, slot: slot)
+        try engine.encodeGemv(enc, delta.outProj, x: slot.scratch, xOff: slot.base + reg.dn,
+            y: slot.scratch, yOff: slot.base + reg.r)
+        barrier(enc)
+        try encResidualAdd(enc, slot: slot)
+        barrier(enc)
+    }
 
+    /// The DeltaNet input projections as (linear, destination region) pairs
+    /// in the layout's canonical encode order; the decode core and the
+    /// batched chunk pass dispatch exactly these.
+    private func deltaInProjections(_ delta: DeltaGPU) -> [(lin: GPULinear, dst: Int)] {
+        switch config.deltaLayout {
+        case .split:
+            return [(delta.qkv!, reg.qkv), (delta.zProj!, reg.z),
+                    (delta.bProj!, reg.b), (delta.aProj!, reg.a)]
+        case .fusedInterleaved:
+            return [(delta.qkvz!, reg.qkvzStage), (delta.ba!, reg.baStage)]
+        }
+    }
+
+    /// Splits the fused qkvz/ba staging rows into the flat qkv/z/b/a regions
+    /// (fusedInterleaved layout only).
+    private func encDeltaDeinterleave(_ enc: MTLComputeCommandEncoder, slot: TokenSlot) throws {
+        let cfg = config
+        let nk = cfg.linearNumKeyHeads, nv = cfg.linearNumValueHeads
+        let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
+        enc.setComputePipelineState(try engine.pipeline("deinterleave_qkvz"))
+        struct DeintParams {
+            var nk: UInt32; var dk: UInt32; var rep: UInt32; var dv: UInt32
+            var keyDim: UInt32; var srcOff: UInt32; var baOff: UInt32
+            var qkvOff: UInt32; var zOff: UInt32; var bOff: UInt32; var aOff: UInt32
+        }
+        var dip = DeintParams(
+            nk: UInt32(nk), dk: UInt32(dk), rep: UInt32(nv / nk), dv: UInt32(dv),
+            keyDim: UInt32(cfg.keyDim),
+            srcOff: UInt32(slot.base + reg.qkvzStage), baOff: UInt32(slot.base + reg.baStage),
+            qkvOff: UInt32(slot.base + reg.qkv), zOff: UInt32(slot.base + reg.z),
+            bOff: UInt32(slot.base + reg.b), aOff: UInt32(slot.base + reg.a)
+        )
+        enc.setBuffer(slot.scratch, offset: 0, index: 0)
+        setBytesParams(enc, &dip, index: 1)
+        dispatchN(enc, nk)
+    }
+
+    /// Conv step, decay/beta preparation, q/k norms, gated recurrence, and
+    /// the gated output norm for one token, ending on a barrier. Reads the
+    /// slot's projection regions and advances the layer's shared conv
+    /// history and recurrent state, so chunked callers must encode tokens in
+    /// ascending order (the decode core encodes exactly one). Assembled
+    /// from the stage helpers below; the chunked prefill batches decay/beta
+    /// prep, the q/k norms, and the gated norm through their stride twins
+    /// and runs each order-sensitive stage as one cross-token scan per
+    /// chunk (conv_scan, and the gated scan with T = chunk length; S1b
+    /// chunked recurrence).
+    private func encDeltaRecurrence(
+        _ enc: MTLComputeCommandEncoder, fl: FastLayer, slot: TokenSlot
+    ) throws {
+        let nv = config.linearNumValueHeads
+        let keyDim = config.keyDim
+        try encConvStep(enc, fl: fl, slot: slot)
+        try encDeltaPre(enc, fl: fl, slot: slot)
+        barrier(enc)
+        try encDeltaQKNorms(enc, slot: slot)
+        barrier(enc)
+        try encGatedDeltaScan(
+            enc, fl: fl, steps: 1, data: slot.scratch,
+            qOff: slot.base + reg.conv, kOff: slot.base + reg.conv + keyDim,
+            vOff: slot.base + reg.conv + 2 * keyDim,
+            gOff: slot.base + reg.gb, bOff: slot.base + reg.gb + nv,
+            yOff: slot.base + reg.dy)
+        barrier(enc)
+        try encGatedNormMul(
+            enc, fl: fl, data: slot.scratch,
+            yOff: slot.base + reg.dy, zOff: slot.base + reg.z,
+            outOff: slot.base + reg.dn)
+        barrier(enc)
+    }
+
+    /// Depthwise causal conv + silu on one token's qkv row, advancing the
+    /// layer's shared history (order-sensitive across tokens).
+    private func encConvStep(
+        _ enc: MTLComputeCommandEncoder, fl: FastLayer, slot: TokenSlot
+    ) throws {
+        let cfg = config
         enc.setComputePipelineState(try engine.pipeline("conv_step"))
-        var cp = SIMD4<UInt32>(UInt32(convDim), UInt32(cfg.linearConvKernelDim),
+        var cp = SIMD4<UInt32>(UInt32(cfg.convDim), UInt32(cfg.linearConvKernelDim),
                                UInt32(slot.base + reg.qkv), UInt32(slot.base + reg.conv))
         enc.setBuffer(slot.scratch, offset: 0, index: 0)
         enc.setBuffer(fl.hist!, offset: 0, index: 1)
         enc.setBuffer(fl.convW!, offset: 0, index: 2)
         setBytesParams(enc, &cp, index: 3)
-        dispatchN(enc, convDim)
+        dispatchN(enc, cfg.convDim)
+    }
 
+    /// g = exp(-exp(A_log) * softplus(a + dt_bias)) and beta = sigmoid(b)
+    /// into the slot's gb region.
+    private func encDeltaPre(
+        _ enc: MTLComputeCommandEncoder, fl: FastLayer, slot: TokenSlot
+    ) throws {
+        let nv = config.linearNumValueHeads
         enc.setComputePipelineState(try engine.pipeline("delta_pre"))
         var dp = SIMD4<UInt32>(UInt32(nv), UInt32(slot.base + reg.a),
                                UInt32(slot.base + reg.b), UInt32(slot.base + reg.gb))
@@ -1676,53 +1733,74 @@ extension QwenMetalModel {
         enc.setBuffer(fl.dtBias!, offset: 0, index: 2)
         setBytesParams(enc, &dp, index: 3)
         dispatchN(enc, nv)
-        barrier(enc)
+    }
 
+    /// Weightless q/k RMSNorms (scaled 1/dk and 1/sqrt(dk)) in place on the
+    /// slot's conv rows.
+    private func encDeltaQKNorms(_ enc: MTLComputeCommandEncoder, slot: TokenSlot) throws {
+        let cfg = config
+        let nk = cfg.linearNumKeyHeads, dk = cfg.linearKeyHeadDim
         let invScale = 1 / Float(dk).squareRoot()
         try encRMSNorm(enc, off: reg.conv, rows: nk, dim: dk, w: nil,
                        scale: invScale * invScale, eps: 1e-6, slot: slot)
-        try encRMSNorm(enc, off: reg.conv + keyDim, rows: nk, dim: dk, w: nil,
+        try encRMSNorm(enc, off: reg.conv + cfg.keyDim, rows: nk, dim: dk, w: nil,
                        scale: invScale, eps: 1e-6, slot: slot)
-        barrier(enc)
+    }
 
+    /// One gated_delta_step dispatch scanning `steps` timesteps from the
+    /// q/k/v/g/beta float offsets in `data` (contiguous [steps, row] blocks
+    /// when steps > 1), reading and writing the layer's recurrent state.
+    private func encGatedDeltaScan(
+        _ enc: MTLComputeCommandEncoder, fl: FastLayer, steps: Int, data: MTLBuffer,
+        qOff: Int, kOff: Int, vOff: Int, gOff: Int, bOff: Int, yOff: Int
+    ) throws {
+        let cfg = config
+        let nk = cfg.linearNumKeyHeads, nv = cfg.linearNumValueHeads
+        let dk = cfg.linearKeyHeadDim, dv = cfg.linearValueHeadDim
         enc.setComputePipelineState(try engine.pipeline("gated_delta_step"))
-        var delp = MetalEngine.DeltaParams(T: 1, Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
-        enc.setBuffer(slot.scratch, offset: (slot.base + reg.conv) * 4, index: 0)            // q
-        enc.setBuffer(slot.scratch, offset: (slot.base + reg.conv + keyDim) * 4, index: 1)   // k
-        enc.setBuffer(slot.scratch, offset: (slot.base + reg.conv + 2 * keyDim) * 4, index: 2) // v
-        enc.setBuffer(slot.scratch, offset: (slot.base + reg.gb) * 4, index: 3)              // g
-        enc.setBuffer(slot.scratch, offset: (slot.base + reg.gb + nv) * 4, index: 4)         // beta
+        var delp = MetalEngine.DeltaParams(
+            T: UInt32(steps), Hk: UInt32(nk), Hv: UInt32(nv), Dk: UInt32(dk), Dv: UInt32(dv))
+        enc.setBuffer(data, offset: qOff * 4, index: 0)
+        enc.setBuffer(data, offset: kOff * 4, index: 1)
+        enc.setBuffer(data, offset: vOff * 4, index: 2)
+        enc.setBuffer(data, offset: gOff * 4, index: 3)
+        enc.setBuffer(data, offset: bOff * 4, index: 4)
         enc.setBuffer(fl.state!, offset: 0, index: 5)
-        enc.setBuffer(slot.scratch, offset: (slot.base + reg.dy) * 4, index: 6)
+        enc.setBuffer(data, offset: yOff * 4, index: 6)
         enc.setBuffer(fl.state!, offset: 0, index: 7)
         setBytesParams(enc, &delp, index: 8)
         engine.dispatchThreads(
             enc, threads: MTLSize(width: 32, height: dv, depth: nv),
             threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1)
         )
-        barrier(enc)
+    }
 
+    /// Gated RMSNorm * silu(z) per v-head, y rows read at `yOff` in `data`.
+    private func encGatedNormMul(
+        _ enc: MTLComputeCommandEncoder, fl: FastLayer, data: MTLBuffer,
+        yOff: Int, zOff: Int, outOff: Int
+    ) throws {
+        let cfg = config
+        let nv = cfg.linearNumValueHeads, dv = cfg.linearValueHeadDim
         enc.setComputePipelineState(try engine.pipeline("gated_norm_mul"))
         struct GNP { var nv: UInt32; var dv: UInt32; var eps: Float; var yOff: UInt32; var zOff: UInt32; var outOff: UInt32 }
         var gp = GNP(nv: UInt32(nv), dv: UInt32(dv), eps: Float(cfg.rmsNormEps),
-                     yOff: UInt32(slot.base + reg.dy), zOff: UInt32(slot.base + reg.z),
-                     outOff: UInt32(slot.base + reg.dn))
-        enc.setBuffer(slot.scratch, offset: 0, index: 0)
+                     yOff: UInt32(yOff), zOff: UInt32(zOff), outOff: UInt32(outOff))
+        enc.setBuffer(data, offset: 0, index: 0)
         enc.setBuffer(fl.deltaNormW!, offset: 0, index: 1)
         setBytesParams(enc, &gp, index: 2)
         dispatchRows(enc, rows: nv)
-        barrier(enc)
+    }
 
-        try engine.encodeGemv(enc, delta.outProj, x: slot.scratch, xOff: slot.base + reg.dn,
-            y: slot.scratch, yOff: slot.base + reg.r)
-        barrier(enc)
-        var ap = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
+    /// h[slot] += the slot's reg.r row (a mixer's output-projection result).
+    private func encResidualAdd(_ enc: MTLComputeCommandEncoder, slot: TokenSlot) throws {
+        let D = config.hiddenSize
         enc.setComputePipelineState(try engine.pipeline("add_inplace"))
+        var p = SIMD2<UInt32>(UInt32(D), UInt32(slot.base + reg.r))
         enc.setBuffer(slot.hidden, offset: slot.hiddenByteOffset, index: 0)
         enc.setBuffer(slot.scratch, offset: 0, index: 1)
-        setBytesParams(enc, &ap, index: 2)
+        setBytesParams(enc, &p, index: 2)
         dispatchN(enc, D)
-        barrier(enc)
     }
 
     // MARK: - S2 GPU-resident KV cache
@@ -1840,9 +1918,18 @@ extension QwenMetalModel {
 // MARK: - S1b layer-major chunked prefill: inside a chunk, sweep each layer
 // across every token before moving on, so a layer's expert union is fetched
 // once per chunk and one decode-shaped buffer sequence covers the whole chunk
-// instead of every token. Per-token math is encoded through the same slot
-// helpers as the decode path, so numerics match the token-major schedule
-// exactly; S2 batches the attention core across the chunk's tokens on GPU.
+// instead of every token. Independent per-token work over shared weights
+// encodes as token-batched dispatches: projection GEMVs (one per projection
+// per chunk, one per (expert, projection) for routed experts) and the glue
+// kernels (norms, deinterleave, silu, residual adds, weighted accumulation,
+// attention q prep / KV append) via their batch twins. Every batched row is
+// the single-token kernel's arithmetic verbatim; the order-sensitive
+// recurrent stages keep ascending token order inside cross-token scans (the
+// conv history and the gated recurrence each advance in one T=chunk
+// in-dispatch scan), so numerics match the token-major schedule exactly. S2 batches the attention core across the
+// chunk's tokens on GPU, including the causal attend: its batch twin derives
+// each token's kvLen from the token grid, and every KV append lands behind a
+// barrier before any token attends.
 extension QwenMetalModel {
 
     /// One layer's deferred MoE for a whole chunk: per-token picks/weights in
@@ -1856,25 +1943,156 @@ extension QwenMetalModel {
         var perToken: [(picks: [(Int, Float)], weights: [Float])]
     }
 
-    /// Grows the chunk scratch to hold `n` token slots. Returns false when
-    /// the device cannot allocate them (callers fall back to token-major).
+    /// Where the chunked DeltaNet recurrence stages its contiguous
+    /// [chunk, row] blocks (float offsets inside prefillScratchBuf, after
+    /// every token slot stride): the normed q/k/v conv rows, g/beta, and
+    /// the y output — the exact layout gated_delta_step's T-step scan
+    /// expects.
+    struct PrefillStage {
+        var q = 0, k = 0, v = 0, g = 0, b = 0, y = 0
+    }
+
+    /// Grows the chunk scratch to hold `n` token slots plus the chunked
+    /// recurrence staging blocks. Returns false when the device cannot
+    /// allocate them (callers fall back to token-major).
     private func ensurePrefillCapacity(_ n: Int) -> Bool {
         if prefillSlotCapacity >= n, prefillScratchBuf != nil, prefillHiddenBuf != nil {
             return true
         }
         let opts: MTLResourceOptions = [.storageModeShared, .hazardTrackingModeUntracked]
-        guard let scratch = engine.device.makeBuffer(length: n * reg.total * 4, options: opts),
-              let hidden = engine.device.makeBuffer(length: n * config.hiddenSize * 4, options: opts)
+        let cfg = config
+        var stage = PrefillStage()
+        var floats = n * reg.total
+        func take(_ rowFloats: Int) -> Int {
+            let v = floats
+            floats += n * rowFloats
+            return v
+        }
+        stage.q = take(cfg.keyDim)
+        stage.k = take(cfg.keyDim)
+        stage.v = take(cfg.valueDim)
+        stage.g = take(cfg.linearNumValueHeads)
+        stage.b = take(cfg.linearNumValueHeads)
+        stage.y = take(cfg.valueDim)
+        guard let scratch = engine.device.makeBuffer(length: floats * 4, options: opts),
+              let hidden = engine.device.makeBuffer(length: n * cfg.hiddenSize * 4, options: opts)
         else { return false }
         prefillScratchBuf = scratch
         prefillHiddenBuf = hidden
         prefillSlotCapacity = n
+        prefillStage = stage
         return true
     }
 
     private func prefillSlot(_ t: Int) -> TokenSlot {
         TokenSlot(scratch: prefillScratchBuf!, base: t * reg.total,
                   hidden: prefillHiddenBuf!, hiddenByteOffset: t * config.hiddenSize * 4)
+    }
+
+    /// Offset table for one token-batched projection: chunk token t reads
+    /// `src` and writes `dst` inside its own slot stride.
+    private func chunkGemvSlots(_ n: Int, src: Int, dst: Int) -> [(xOff: Int, yOff: Int)] {
+        (0..<n).map { t in (xOff: t * reg.total + src, yOff: t * reg.total + dst) }
+    }
+
+    // MARK: Chunk-level batch twins for the per-token glue kernels. Every
+    // helper encodes one batched dispatch covering all chunk tokens, and a
+    // single-token chunk delegates to the legacy per-token encode so the
+    // degenerate chunk keeps the decode-shaped stream byte-identical.
+
+    /// Input/post norms for every chunk token as one norm_copy_batch.
+    private func encChunkNormCopy(
+        _ enc: MTLComputeCommandEncoder, w: MTLBuffer, dstOff: Int, tokens n: Int
+    ) throws {
+        if n == 1 {
+            try encNormCopy(enc, w: w, dstOff: dstOff, slot: prefillSlot(0))
+            return
+        }
+        try engine.encodeNormCopyBatch(
+            enc, h: prefillHiddenBuf!, hByteOffset: 0, hStride: config.hiddenSize,
+            dst: prefillScratchBuf!, weight: w,
+            dim: config.hiddenSize, eps: Float(config.rmsNormEps),
+            dstOff: dstOff, dstStride: reg.total, tokens: n)
+    }
+
+    /// Residual adds for every chunk token as one add_inplace_batch.
+    private func encChunkResidualAdd(_ enc: MTLComputeCommandEncoder, tokens n: Int) throws {
+        if n == 1 {
+            try encResidualAdd(enc, slot: prefillSlot(0))
+            return
+        }
+        try engine.encodeAddInplaceBatch(
+            enc, h: prefillHiddenBuf!, hStride: config.hiddenSize,
+            r: prefillScratchBuf!, rOff: reg.r, rStride: reg.total,
+            count: config.hiddenSize, tokens: n)
+    }
+
+    /// Fused qkvz/ba splits for every chunk token as one
+    /// deinterleave_qkvz_batch (fusedInterleaved layout only).
+    private func encChunkDeinterleave(_ enc: MTLComputeCommandEncoder, tokens n: Int) throws {
+        if n == 1 {
+            try encDeltaDeinterleave(enc, slot: prefillSlot(0))
+            return
+        }
+        let cfg = config
+        try engine.encodeDeinterleaveBatch(
+            enc, data: prefillScratchBuf!,
+            nk: cfg.linearNumKeyHeads, dk: cfg.linearKeyHeadDim,
+            rep: cfg.linearNumValueHeads / cfg.linearNumKeyHeads,
+            dv: cfg.linearValueHeadDim, keyDim: cfg.keyDim,
+            srcOff: reg.qkvzStage, baOff: reg.baStage,
+            qkvOff: reg.qkv, zOff: reg.z, bOff: reg.b, aOff: reg.a,
+            stride: reg.total, tokens: n)
+    }
+
+    /// Query prep and KV append for every chunk token: one batched dispatch
+    /// each. Token t preps at position basePosition + t and appends into its
+    /// own (disjoint) cache row, so batching cannot reorder any write.
+    private func encChunkAttentionPrep(
+        _ enc: MTLComputeCommandEncoder, layer li: Int, basePosition: Int, tokens n: Int
+    ) throws {
+        if n == 1 {
+            try encAttentionPrep(enc, layer: li, position: basePosition, slot: prefillSlot(0))
+            return
+        }
+        let cfg = config
+        let fl = fastLayers[li] // fresh copy: ensureKVCapacity may have swapped buffers
+        try engine.encodeAttnQPrepBatch(
+            enc, data: prefillScratchBuf!, weight: fl.qNormW!,
+            heads: cfg.numAttentionHeads, headDim: cfg.headDim,
+            rotaryDims: cfg.rotaryDims, eps: Float(cfg.rmsNormEps),
+            ropeTheta: Float(cfg.ropeTheta), basePosition: basePosition,
+            srcOff: reg.qout, dstOff: reg.qprep, slotStride: reg.total, tokens: n)
+        try engine.encodeAttnKVAppendBatch(
+            enc, data: prefillScratchBuf!, weight: fl.kNormW!,
+            kCache: fl.kCache!, vCache: fl.vCache!,
+            kvHeads: cfg.numKeyValueHeads, headDim: cfg.headDim,
+            rotaryDims: cfg.rotaryDims, eps: Float(cfg.rmsNormEps),
+            ropeTheta: Float(cfg.ropeTheta), basePosition: basePosition,
+            kSrcOff: reg.knew, vSrcOff: reg.vnew, slotStride: reg.total, tokens: n)
+    }
+
+    /// Causal attends for every chunk token as one attn_decode_gqa_batch:
+    /// token t attends over cache rows [0, basePosition + t + 1), a kvLen
+    /// the kernel derives from the token grid. Callers must barrier between
+    /// the chunk's KV appends and this encode — the youngest token reads
+    /// every appended row.
+    private func encChunkAttentionAttend(
+        _ enc: MTLComputeCommandEncoder, layer li: Int, basePosition: Int, tokens n: Int
+    ) throws {
+        if n == 1 {
+            try encAttentionAttend(
+                enc, layer: li, kvLen: basePosition + 1, slot: prefillSlot(0))
+            return
+        }
+        let cfg = config
+        let fl = fastLayers[li] // fresh copy: ensureKVCapacity may have swapped buffers
+        try engine.encodeAttnDecodeBatch(
+            enc, data: prefillScratchBuf!, kCache: fl.kCache!, vCache: fl.vCache!,
+            heads: cfg.numAttentionHeads, kvHeads: cfg.numKeyValueHeads,
+            headDim: cfg.headDim, basePosition: basePosition,
+            qOff: reg.qprep, qoutOff: reg.qout, outOff: reg.att,
+            slotStride: reg.total, tokens: n)
     }
 
     /// Splits the prompt into chunks of at most `chunkCapacity` tokens and
@@ -1935,17 +2153,10 @@ extension QwenMetalModel {
                     pending = nil
                 }
                 try phase(.delta) {
-                    // Ascending token order: the conv history and recurrence
-                    // state are shared per layer, and the barriers inside
-                    // each token's sequence order token t+1 after token t.
-                    for t in 0..<S {
-                        try encDeltaCore(enc, delta: delta, fl: fl, slot: prefillSlot(t))
-                    }
+                    try encChunkDelta(enc, delta: delta, fl: fl, tokens: S)
                 }
                 try phase(.router) {
-                    for t in 0..<S {
-                        try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
-                    }
+                    try encChunkRouterProbe(enc, moeGate: L.moe.gate, fl: fl, tokens: S)
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
@@ -1966,28 +2177,36 @@ extension QwenMetalModel {
                     pending = nil
                 }
                 try phase(.attention) {
-                    for t in 0..<S {
-                        try encAttentionProjections(enc, attn: attn, fl: fl, slot: prefillSlot(t))
+                    // One batched input norm over every slot, then q/k/v each
+                    // as one token-batched dispatch.
+                    try encChunkNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, tokens: S)
+                    barrier(enc)
+                    for proj in [(attn.qProj, reg.qout), (attn.kProj, reg.knew),
+                                 (attn.vProj, reg.vnew)] {
+                        try engine.encodeGemvBatch(
+                            enc, proj.0, x: prefillScratchBuf!, y: prefillScratchBuf!,
+                            slots: chunkGemvSlots(S, src: reg.x0, dst: proj.1))
                     }
                     barrier(enc)
-                    for t in 0..<S {
-                        try encAttentionPrep(
-                            enc, layer: li, position: basePosition + t, slot: prefillSlot(t))
-                    }
+                    try encChunkAttentionPrep(
+                        enc, layer: li, basePosition: basePosition, tokens: S)
                     barrier(enc)
-                    for t in 0..<S {
-                        try encAttentionAttend(
-                            enc, layer: li, kvLen: basePosition + t + 1, slot: prefillSlot(t))
-                    }
+                    // One batched causal attend: token t reads cache rows
+                    // [0, basePosition + t + 1), a kvLen the kernel derives
+                    // from the token grid; the barrier above guarantees
+                    // every row the youngest token can see has landed.
+                    try encChunkAttentionAttend(
+                        enc, layer: li, basePosition: basePosition, tokens: S)
                     barrier(enc)
-                    for t in 0..<S {
-                        try encAttentionFinish(enc, attn: attn, slot: prefillSlot(t))
-                    }
+                    try engine.encodeGemvBatch(
+                        enc, attn.oProj, x: prefillScratchBuf!, y: prefillScratchBuf!,
+                        slots: chunkGemvSlots(S, src: reg.att, dst: reg.r))
+                    barrier(enc)
+                    try encChunkResidualAdd(enc, tokens: S)
+                    barrier(enc)
                 }
                 try phase(.router) {
-                    for t in 0..<S {
-                        try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: prefillSlot(t))
-                    }
+                    try encChunkRouterProbe(enc, moeGate: L.moe.gate, fl: fl, tokens: S)
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
@@ -2038,15 +2257,132 @@ extension QwenMetalModel {
             count: cfg.vocabSize))
     }
 
-    /// One layer's MoE for a whole chunk. Every expert in the union is
-    /// touched once per stage, encoding the GEMVs of all tokens routed to it
-    /// back-to-back; outputs land in disjoint per-token slots so a stage runs
+    /// One DeltaNet layer over the whole chunk (S1b token batching): one
+    /// batched input norm, then one batched dispatch per in_proj tensor
+    /// covering all tokens, one batched deinterleave, then the chunked
+    /// recurrence (one cross-token conv scan, batched decay/beta prep and
+    /// q/k norms, one T=n gated scan, one batched gated norm), then one
+    /// batched output projection and one batched residual add. One token
+    /// degenerates to exactly the decode core's encode stream, keeping the
+    /// per-token scan alive as the chunked path's oracle.
+    private func encChunkDelta(
+        _ enc: MTLComputeCommandEncoder, delta: DeltaGPU, fl: FastLayer, tokens n: Int
+    ) throws {
+        try encChunkNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, tokens: n)
+        barrier(enc)
+        for proj in deltaInProjections(delta) {
+            try engine.encodeGemvBatch(
+                enc, proj.lin, x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: chunkGemvSlots(n, src: reg.x0, dst: proj.dst))
+        }
+        barrier(enc)
+        if config.deltaLayout == .fusedInterleaved {
+            try encChunkDeinterleave(enc, tokens: n)
+            barrier(enc)
+        }
+        if n == 1 {
+            try encDeltaRecurrence(enc, fl: fl, slot: prefillSlot(0))
+        } else {
+            try encChunkDeltaRecurrence(enc, fl: fl, tokens: n)
+        }
+        try engine.encodeGemvBatch(
+            enc, delta.outProj, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(n, src: reg.dn, dst: reg.r))
+        barrier(enc)
+        try encChunkResidualAdd(enc, tokens: n)
+        barrier(enc)
+    }
+
+    /// The chunk's recurrence stage as pure cross-token dispatches (S1b
+    /// chunked recurrence): one conv_scan advances the layer's shared conv
+    /// history through all n tokens in-dispatch — its step loop is the
+    /// chained per-token conv_steps' arithmetic verbatim, history carried
+    /// in registers instead of a barrier-fenced device round trip per
+    /// token; decay/beta prep and the weightless q/k norms are independent
+    /// per token and encode once per chunk through their stride twins; one
+    /// delta_gather packs the normed rows into the contiguous [T, row]
+    /// staging blocks, a single T=n gated_delta_step replaces the n
+    /// per-token scans, and one batched gated norm reads the scan's staged y
+    /// rows. Every batched row is the single-token kernel's arithmetic
+    /// verbatim and both scans' internal step loops perform the same
+    /// ascending-order arithmetic the per-token dispatches did — state
+    /// carried in f32 registers instead of a per-token f32 device round trip
+    /// — so every conv row, y row, and both final states are bitwise
+    /// identical. Nothing here dispatches per token any more. Ends on a
+    /// barrier like the decode core.
+    private func encChunkDeltaRecurrence(
+        _ enc: MTLComputeCommandEncoder, fl: FastLayer, tokens n: Int
+    ) throws {
+        let cfg = config
+        let valueDim = cfg.valueDim
+        try engine.encodeConvScan(
+            enc, data: prefillScratchBuf!, hist: fl.hist!, weight: fl.convW!,
+            convDim: cfg.convDim, K: cfg.linearConvKernelDim,
+            inOff: reg.qkv, outOff: reg.conv, slotStride: reg.total, tokens: n)
+        barrier(enc)   // the in-place q/k norms read the scan's conv rows
+        // Reads the slots' a/b projection rows (behind encChunkDelta's
+        // barrier) and writes gb, disjoint from the conv rows the norms
+        // touch in place — one barrier below covers both for the gather.
+        try engine.encodeDeltaPreBatch(
+            enc, data: prefillScratchBuf!, aLog: fl.aLog!, dtBias: fl.dtBias!,
+            nv: cfg.linearNumValueHeads, aOff: reg.a, bOff: reg.b, outOff: reg.gb,
+            slotStride: reg.total, tokens: n)
+        let nk = cfg.linearNumKeyHeads, dk = cfg.linearKeyHeadDim
+        let invScale = 1 / Float(dk).squareRoot()
+        try engine.encodeRMSNormRowsBatch(
+            enc, data: prefillScratchBuf!, weight: nil, off: reg.conv,
+            rows: nk, dim: dk, scale: invScale * invScale, eps: 1e-6,
+            slotStride: reg.total, tokens: n)
+        try engine.encodeRMSNormRowsBatch(
+            enc, data: prefillScratchBuf!, weight: nil, off: reg.conv + cfg.keyDim,
+            rows: nk, dim: dk, scale: invScale, eps: 1e-6,
+            slotStride: reg.total, tokens: n)
+        barrier(enc)
+        try engine.encodeDeltaGather(
+            enc, data: prefillScratchBuf!,
+            keyDim: config.keyDim, valueDim: valueDim, nv: config.linearNumValueHeads,
+            slotStride: reg.total, convOff: reg.conv, gbOff: reg.gb,
+            qOut: prefillStage.q, kOut: prefillStage.k, vOut: prefillStage.v,
+            gOut: prefillStage.g, bOut: prefillStage.b, tokens: n)
+        barrier(enc)
+        try encGatedDeltaScan(
+            enc, fl: fl, steps: n, data: prefillScratchBuf!,
+            qOff: prefillStage.q, kOff: prefillStage.k, vOff: prefillStage.v,
+            gOff: prefillStage.g, bOff: prefillStage.b, yOff: prefillStage.y)
+        barrier(enc)
+        try engine.encodeGatedNormMulBatch(
+            enc, data: prefillScratchBuf!, weight: fl.deltaNormW!,
+            nv: cfg.linearNumValueHeads, dv: cfg.linearValueHeadDim,
+            eps: Float(cfg.rmsNormEps),
+            yOff: prefillStage.y, yStride: valueDim,
+            zOff: reg.z, zStride: reg.total,
+            outOff: reg.dn, outStride: reg.total, tokens: n)
+        barrier(enc)
+    }
+
+    /// One batched post-attention norm over every chunk token, then the
+    /// router logits as one token-batched dispatch.
+    private func encChunkRouterProbe(
+        _ enc: MTLComputeCommandEncoder, moeGate: GPULinear, fl: FastLayer, tokens n: Int
+    ) throws {
+        try encChunkNormCopy(enc, w: fl.postNorm, dstOff: reg.xmoe, tokens: n)
+        barrier(enc)
+        try engine.encodeGemvBatch(
+            enc, moeGate, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(n, src: reg.xmoe, dst: reg.rout))
+    }
+
+    /// One layer's MoE for a whole chunk. Each routed projection encodes as
+    /// one token-batched dispatch per union expert covering every token
+    /// routed to it, and each shared projection as one dispatch covering the
+    /// whole chunk; outputs land in disjoint per-token slots so a stage runs
     /// fully in parallel, and each token's weighted accumulation uses the
     /// legacy pick order, keeping numerics identical to the token-major path.
     private func encodeChunkMoE(_ enc: MTLComputeCommandEncoder, _ pend: PendingChunkMoE) throws {
         let cfg = config
         let D = cfg.hiddenSize, inter = cfg.moeIntermediateSize
         let shInter = cfg.sharedExpertIntermediateSize
+        let topK = cfg.numExpertsPerTok
         let moe = layers[pend.layer].moe
         let fl = fastLayers[pend.layer]
         let projs = expertProjs
@@ -2068,80 +2404,111 @@ extension QwenMetalModel {
             return (st.gate.lin, st.up.lin, st.down.lin, expert)
         }
 
-        // Stage 1: routed gate/up grouped by expert, plus each token's shared
-        // gate/up and shared-gate logit.
+        // Stage 1: routed gate/up, one token-batched dispatch per (expert,
+        // projection); then the shared gate/up and shared-gate logit, each
+        // one dispatch covering every chunk token.
+        let S = pend.perToken.count
         for expert in pend.union {
             let lin = linears(for: expert)
-            for a in assignments[expert] ?? [] {
-                let slot = prefillSlot(a.t)
-                let K = pend.perToken[a.t].picks.count
-                try engine.encodeGemv(enc, lin.g, rows: inter,
-                    wExtra: lin.e * (moe.stacks?.gate.wStride ?? 0),
-                    sExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
-                    bExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
-                    x: slot.scratch, xOff: slot.base + reg.xmoe,
-                    y: slot.scratch, yOff: slot.base + reg.exp + a.ki * inter)
-                try engine.encodeGemv(enc, lin.u, rows: inter,
-                    wExtra: lin.e * (moe.stacks?.up.wStride ?? 0),
-                    sExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
-                    bExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
-                    x: slot.scratch, xOff: slot.base + reg.xmoe,
-                    y: slot.scratch, yOff: slot.base + reg.exp + K * inter + a.ki * inter)
-            }
+            let assigned = assignments[expert] ?? []
+            try engine.encodeGemvBatch(enc, lin.g, rows: inter,
+                wExtra: lin.e * (moe.stacks?.gate.wStride ?? 0),
+                sExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                bExtra: lin.e * (moe.stacks?.gate.sStride ?? 0),
+                x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: assigned.map { a in
+                    (xOff: a.t * reg.total + reg.xmoe,
+                     yOff: a.t * reg.total + reg.exp + a.ki * inter)
+                })
+            try engine.encodeGemvBatch(enc, lin.u, rows: inter,
+                wExtra: lin.e * (moe.stacks?.up.wStride ?? 0),
+                sExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                bExtra: lin.e * (moe.stacks?.up.sStride ?? 0),
+                x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: assigned.map { a in
+                    let K = pend.perToken[a.t].picks.count
+                    return (xOff: a.t * reg.total + reg.xmoe,
+                            yOff: a.t * reg.total + reg.exp + K * inter + a.ki * inter)
+                })
         }
-        for t in 0..<pend.perToken.count {
-            let slot = prefillSlot(t)
-            try engine.encodeGemv(enc, moe.sharedGate, x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.sh)
-            try engine.encodeGemv(enc, moe.sharedUp, x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.sh + shInter)
-            try engine.encodeGemv(enc, fl.sharedGateLin, x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.shg)
-        }
+        try engine.encodeGemvBatch(enc, moe.sharedGate, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.xmoe, dst: reg.sh))
+        try engine.encodeGemvBatch(enc, moe.sharedUp, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.xmoe, dst: reg.sh + shInter))
+        try engine.encodeGemvBatch(enc, fl.sharedGateLin, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.xmoe, dst: reg.shg))
         barrier(enc)
 
         // Stage 2: silu(gate) * up for every (token, pick) and shared chain.
-        for (t, entry) in pend.perToken.enumerated() {
-            let slot = prefillSlot(t)
-            let K = entry.picks.count
-            for ki in 0..<K {
-                try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
-                    gOff: slot.base + reg.exp + ki * inter,
-                    uOff: slot.base + reg.exp + K * inter + ki * inter,
-                    dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
+        // Pick slot ki's rows sit at the same offsets in every token slot, so
+        // each ki batches into one strided dispatch over the chunk (as does
+        // the shared chain); a single-token chunk or a rare non-uniform pick
+        // count keeps the legacy per-token loop.
+        let uniformK = pend.perToken.allSatisfy { $0.picks.count == topK }
+        if S > 1, uniformK {
+            for ki in 0..<topK {
+                try engine.encodeSiluMulBatch(enc, buf: prefillScratchBuf!, count: inter,
+                    gOff: reg.exp + ki * inter,
+                    uOff: reg.exp + topK * inter + ki * inter,
+                    dstOff: reg.exp + 2 * topK * inter + ki * inter,
+                    stride: reg.total, tokens: S)
             }
-            try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
-                gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
-                dstOff: slot.base + reg.sh + 2 * shInter)
+            try engine.encodeSiluMulBatch(enc, buf: prefillScratchBuf!, count: shInter,
+                gOff: reg.sh, uOff: reg.sh + shInter, dstOff: reg.sh + 2 * shInter,
+                stride: reg.total, tokens: S)
+        } else {
+            for (t, entry) in pend.perToken.enumerated() {
+                let slot = prefillSlot(t)
+                let K = entry.picks.count
+                for ki in 0..<K {
+                    try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
+                        gOff: slot.base + reg.exp + ki * inter,
+                        uOff: slot.base + reg.exp + K * inter + ki * inter,
+                        dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
+                }
+                try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
+                    gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
+                    dstOff: slot.base + reg.sh + 2 * shInter)
+            }
         }
         barrier(enc)
 
-        // Stage 3: down projections grouped by expert, plus shared down.
+        // Stage 3: down projections, one token-batched dispatch per union
+        // expert, plus the shared down covering every chunk token.
         for expert in pend.union {
             let lin = linears(for: expert)
-            for a in assignments[expert] ?? [] {
-                let slot = prefillSlot(a.t)
-                let K = pend.perToken[a.t].picks.count
-                try engine.encodeGemv(enc, lin.d, rows: D,
-                    wExtra: lin.e * (moe.stacks?.down.wStride ?? 0),
-                    sExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
-                    bExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
-                    x: slot.scratch, xOff: slot.base + reg.exp + 2 * K * inter + a.ki * inter,
-                    y: slot.scratch, yOff: slot.base + reg.dexp + a.ki * D)
-            }
+            try engine.encodeGemvBatch(enc, lin.d, rows: D,
+                wExtra: lin.e * (moe.stacks?.down.wStride ?? 0),
+                sExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                bExtra: lin.e * (moe.stacks?.down.sStride ?? 0),
+                x: prefillScratchBuf!, y: prefillScratchBuf!,
+                slots: (assignments[expert] ?? []).map { a in
+                    let K = pend.perToken[a.t].picks.count
+                    return (xOff: a.t * reg.total + reg.exp + 2 * K * inter + a.ki * inter,
+                            yOff: a.t * reg.total + reg.dexp + a.ki * D)
+                })
         }
-        for t in 0..<pend.perToken.count {
-            let slot = prefillSlot(t)
-            try engine.encodeGemv(enc, moe.sharedDown,
-                x: slot.scratch, xOff: slot.base + reg.sh + 2 * shInter,
-                y: slot.scratch, yOff: slot.base + reg.sh + 3 * shInter)
-        }
+        try engine.encodeGemvBatch(enc, moe.sharedDown, x: prefillScratchBuf!, y: prefillScratchBuf!,
+            slots: chunkGemvSlots(S, src: reg.sh + 2 * shInter, dst: reg.sh + 3 * shInter))
         barrier(enc)
 
-        // Stage 4: weighted accumulation per token, legacy pick order.
-        for (t, entry) in pend.perToken.enumerated() {
-            try encWeightedAccum(enc, weights: entry.weights, count: entry.picks.count,
-                                 slot: prefillSlot(t))
+        // Stage 4: weighted accumulation, one batched dispatch over the
+        // chunk with a token-major weights table. Each token's K-expert
+        // accumulation order stays inside the kernel, exactly the legacy
+        // per-token loop, so batching cannot reorder any float sum.
+        if S > 1, uniformK {
+            var weights: [Float] = []
+            weights.reserveCapacity(S * topK)
+            for entry in pend.perToken { weights.append(contentsOf: entry.weights) }
+            try engine.encodeWeightedAccumBatch(
+                enc, h: prefillHiddenBuf!, hStride: D, data: prefillScratchBuf!,
+                count: D, k: topK, dBase: reg.dexp, shOff: reg.sh + 3 * shInter,
+                gateOff: reg.shg, stride: reg.total, weights: weights, tokens: S)
+        } else {
+            for (t, entry) in pend.perToken.enumerated() {
+                try encWeightedAccum(enc, weights: entry.weights, count: entry.picks.count,
+                                     slot: prefillSlot(t))
+            }
         }
         barrier(enc)
     }

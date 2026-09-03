@@ -47,10 +47,9 @@ import Testing
     /// prepped q, the appended cache rows, and the gated context — to the CPU
     /// reference. `past` cache rows already hold earlier positions, so the
     /// softmax really spans history, not just the new token.
-    static func compare(_ geo: Geometry, seed: UInt64) throws {
+    static func compare(_ geo: Geometry, seed: UInt64, past: Int = 3) throws {
         let engine = try MetalEngine()
         let H = geo.H, KVH = geo.KVH, hd = geo.hd, rot = geo.rot
-        let past = 3
         let position = past
         let theta: Float = 10_000_000
         let eps: Float = 1e-6
@@ -178,5 +177,18 @@ import Testing
     /// deeper GQA group.
     @Test func attentionKernelsMatchCPUCoreWideHeads() throws {
         try Self.compare(Geometry(H: 8, KVH: 2, hd: 128, rot: 32), seed: 23)
+    }
+
+    /// A KV history long enough that every cooperating simdgroup in the
+    /// attend owns many cache rows, with a row count off every power-of-two
+    /// grid so the tail is uneven — the softmax must span all of it.
+    @Test func attentionKernelsMatchCPUCoreLongHistory() throws {
+        try Self.compare(Geometry(H: 4, KVH: 2, hd: 128, rot: 32), seed: 31, past: 133)
+    }
+
+    /// A head dim off the float4 grid (18 % 4 != 0) keeps the lane-strided
+    /// scalar reads honest for any vectorized-load fast path.
+    @Test func attentionKernelsMatchCPUCoreOddHeadDim() throws {
+        try Self.compare(Geometry(H: 4, KVH: 2, hd: 18, rot: 6), seed: 37, past: 9)
     }
 }
