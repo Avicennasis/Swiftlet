@@ -91,12 +91,21 @@ public final class SwiftletSession: @unchecked Sendable {
         renderMessages = { try tokenizer.applyChatTemplate(messages: $0) }
         generationCleanupHook = nil
         print("[SwiftletSession] tokenizer ok; building Metal model...")
-        if let gpu = try? QwenMetalModel(modelDir: modelDir, cacheBudgetGB: cacheBudgetGB) {
+        do {
+            let gpu = try QwenMetalModel(modelDir: modelDir, cacheBudgetGB: cacheBudgetGB)
             model = gpu
             usesGPU = true
             print("[SwiftletSession] Metal model ready")
-        } else {
-            print("[SwiftletSession] Metal init FAILED, falling back to CPU (heavy)")
+        } catch {
+            // A .qpack container streams its experts through the Metal cache
+            // and the CPU reader cannot serve it, so an impossible cache
+            // budget (or any other Metal failure) must surface here instead
+            // of producing a model that fails on its first step.
+            let isContainer = FileManager.default.fileExists(
+                atPath: modelDir.appendingPathComponent("packed_experts/layout.json").path
+            )
+            if isContainer { throw error }
+            print("[SwiftletSession] Metal init FAILED (\(error)), falling back to CPU (heavy)")
             let cpu = try QwenCPUModel(modelDir: modelDir)
             cpu.retainAllLayers = retainAllLayers
             model = cpu
