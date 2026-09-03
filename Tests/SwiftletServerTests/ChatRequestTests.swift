@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import SwiftletCore
 @testable import SwiftletServer
 
 @Suite struct ChatRequestTests {
@@ -53,6 +54,110 @@ import Testing
         #expect(r.messages.count == 1)
         #expect(r.max_tokens == nil)
         #expect(r.max_completion_tokens == 256)
+    }
+
+    @Test func stopAcceptsStringOrArray() throws {
+        let one = try decode(
+            #"{"messages":[{"role":"user","content":"hi"}],"stop":"END"}"#
+        )
+        #expect(one.stop?.values == ["END"])
+
+        let many = try decode(
+            #"{"messages":[{"role":"user","content":"hi"}],"stop":["END","USER:"]}"#
+        )
+        #expect(many.stop?.values == ["END", "USER:"])
+    }
+
+    @Test func nonStringStopThrows() {
+        #expect(throws: DecodingError.self) {
+            _ = try decode(
+                #"{"messages":[{"role":"user","content":"hi"}],"stop":42}"#
+            )
+        }
+    }
+
+    @Test func finishReasonMappingIsTruthful() {
+        #expect(openAIFinishReason(.stop) == "stop")
+        #expect(openAIFinishReason(.length) == "length")
+        #expect(openAIFinishReason(.cancelled) == nil)
+        #expect(openAIFinishReason(nil) == nil)
+    }
+
+    @Test func nonterminalStreamingPayloadCarriesNullFinishReason() throws {
+        let payload = completionPayload(
+            id: "chatcmpl-test", text: nil, delta: "piece", finish: nil,
+            model: "swiftlet-test"
+        )
+        let choices = try #require(payload["choices"] as? [[String: Any]])
+        let choice = try #require(choices.first)
+        #expect(choice["finish_reason"] is NSNull)
+
+        let encoded = try JSONSerialization.data(withJSONObject: payload)
+        let json = try #require(String(data: encoded, encoding: .utf8))
+        #expect(json.contains(#""finish_reason":null"#))
+    }
+
+    @Test func terminalStreamingPayloadCarriesConcreteFinishReason() throws {
+        let payload = completionPayload(
+            id: "chatcmpl-test", text: nil, delta: "", finish: "length"
+        )
+        let choices = try #require(payload["choices"] as? [[String: Any]])
+        let choice = try #require(choices.first)
+        #expect(choice["finish_reason"] as? String == "length")
+    }
+
+    @Test func connectionOwnerCancelsQueuedAndActiveWork() {
+        let owner = ConnectionGenerationOwner()
+        let first = GenerationCancellation()
+        let second = GenerationCancellation()
+        owner.register(id: "first", cancellation: first)
+        owner.register(id: "second", cancellation: second)
+
+        owner.cancelAll()
+
+        #expect(first.isCancelled)
+        #expect(second.isCancelled)
+    }
+
+    @Test func completedWorkIsNoLongerOwnedByConnection() {
+        let owner = ConnectionGenerationOwner()
+        let completed = GenerationCancellation()
+        owner.register(id: "done", cancellation: completed)
+        owner.finish(id: "done")
+
+        owner.cancelAll()
+
+        #expect(!completed.isCancelled)
+    }
+
+    @Test func disconnectCancellationIsScopedToItsConnection() {
+        let disconnectedOwner = ConnectionGenerationOwner()
+        let liveOwner = ConnectionGenerationOwner()
+        let disconnectedRequest = GenerationCancellation()
+        let liveRequest = GenerationCancellation()
+        disconnectedOwner.register(id: "queued", cancellation: disconnectedRequest)
+        liveOwner.register(id: "active", cancellation: liveRequest)
+
+        disconnectedOwner.cancelAll()
+
+        #expect(disconnectedRequest.isCancelled)
+        #expect(!liveRequest.isCancelled)
+    }
+
+    @Test func writeFailureCancelsOnlyItsOwnedRequest() {
+        let owner = ConnectionGenerationOwner()
+        let failedRequest = GenerationCancellation()
+        let neighboringRequest = GenerationCancellation()
+        owner.register(id: "failed", cancellation: failedRequest)
+        owner.register(id: "neighbor", cancellation: neighboringRequest)
+
+        #expect(owner.failWrite(id: "failed"))
+        #expect(failedRequest.isCancelled)
+        #expect(!neighboringRequest.isCancelled)
+        #expect(!owner.failWrite(id: "unknown"))
+
+        owner.cancelAll()
+        #expect(neighboringRequest.isCancelled)
     }
 
     @Test func malformedInputThrows() {

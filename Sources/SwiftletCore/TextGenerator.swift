@@ -5,6 +5,27 @@ public protocol InferenceModel: AnyObject {
     var config: QwenConfig { get }
     var modelDir: URL { get }
     func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float]
+    func step(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float]
+}
+
+public extension InferenceModel {
+    /// CPU/reference fallback: the batched step is atomic from the caller's
+    /// perspective, so cancellation is checked immediately before and after.
+    /// Metal supplies a finer-grained implementation between command buffers.
+    func step(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
+        try checkGenerationCancellation(shouldCancel)
+        let logits = try step(tokens, state: state)
+        try checkGenerationCancellation(shouldCancel)
+        return logits
+    }
 }
 
 extension QwenCPUModel: InferenceModel {
@@ -16,9 +37,22 @@ extension QwenMetalModel: InferenceModel {
 }
 
 /// Engine-agnostic greedy generation loop shared by the CLI and server.
-public final class TextGenerator {
+public final class TextGenerator: @unchecked Sendable {
+    public enum Error: Swift.Error, Equatable, Sendable {
+        /// `generate` was called again from a synchronous callback made by an
+        /// active generation on this same generator.
+        case reentrantGeneration
+    }
+
     public let model: any InferenceModel
     public let eosTokens: Set<Int>
+    /// Inference models own mutable decode/GPU scratch state. Keep every
+    /// public generation entry point single-flight even when callers create
+    /// several token streams from the same generator concurrently. A recursive
+    /// call can reacquire this lock only long enough to reject the call instead
+    /// of deadlocking inside a public token callback.
+    private let generationLock = NSRecursiveLock()
+    private var generationInProgress = false
 
     public init(model: any InferenceModel) {
         self.model = model
@@ -47,26 +81,48 @@ public final class TextGenerator {
     /// Token-id stream over `generate`, in the `AsyncStream` shape iOS chat
     /// UIs consume (Priv AI's engines all expose `-> AsyncStream`). Runs the
     /// blocking decode loop on a utility queue; cancelling the consuming task
-    /// stops generation at the next token.
+    /// stops prefill/decode at the next model-safe boundary.
     public func tokenStream(promptIds: [Int], maxNew: Int) -> AsyncThrowingStream<Int, Swift.Error> {
+        tokenStream(
+            promptIds: promptIds,
+            maxNew: maxNew,
+            cancellation: GenerationCancellation()
+        )
+    }
+
+    /// Token stream with an explicit cancellation owner for embedding clients
+    /// that need to cancel independently of the consuming Task.
+    public func tokenStream(
+        promptIds: [Int],
+        maxNew: Int,
+        cancellation: GenerationCancellation
+    ) -> AsyncThrowingStream<Int, Swift.Error> {
         AsyncThrowingStream { continuation in
             let work = DispatchWorkItem {
                 do {
-                    var cancelled = false
-                    try self.generate(promptIds: promptIds, maxNew: maxNew) { token in
+                    try self.generate(
+                        promptIds: promptIds,
+                        maxNew: maxNew,
+                        cancellation: cancellation
+                    ) { token in
                         if case .terminated = continuation.yield(token) {
-                            cancelled = true
+                            cancellation.cancel()
                             return false
                         }
                         return true
                     }
-                    _ = cancelled
+                    continuation.finish()
+                } catch GenerationInterruption.cancelled {
+                    // Task/owner cancellation is normal stream termination;
+                    // the local DecodeState dies with this work item.
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
-            continuation.onTermination = { _ in }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { cancellation.cancel() }
+            }
             DispatchQueue.global(qos: .userInitiated).async(execute: work)
         }
     }
@@ -76,22 +132,66 @@ public final class TextGenerator {
     /// consumed as a stop signal and not reported.
     @discardableResult
     public func generate(promptIds: [Int], maxNew: Int, onToken: (Int) -> Bool) throws -> Stats {
+        try generate(
+            promptIds: promptIds,
+            maxNew: maxNew,
+            cancellation: GenerationCancellation(),
+            onToken: onToken
+        )
+    }
+
+    /// Cancellable form of `generate`. Any cancellation error invalidates the
+    /// method-local DecodeState, which is discarded while unwinding. Concurrent
+    /// callers are serialized; a call made recursively from `onToken` throws
+    /// `Error.reentrantGeneration`.
+    @discardableResult
+    public func generate(
+        promptIds: [Int],
+        maxNew: Int,
+        cancellation: GenerationCancellation,
+        onToken: (Int) -> Bool
+    ) throws -> Stats {
+        generationLock.lock()
+        if generationInProgress {
+            generationLock.unlock()
+            throw Error.reentrantGeneration
+        }
+        generationInProgress = true
+        defer {
+            generationInProgress = false
+            generationLock.unlock()
+        }
+
+        // A stream can be cancelled while it waits behind another generation.
+        // Observe that before allocating or passing any DecodeState to the
+        // shared model.
+        try checkGenerationCancellation { cancellation.isCancelled }
+
         var stats = Stats()
         stats.promptTokens = promptIds.count
         let state = QwenCPUModel.DecodeState()
 
         let prefillStart = Date()
-        var logits = try model.step(promptIds, state: state)
+        var logits = try model.step(
+            promptIds,
+            state: state,
+            shouldCancel: { cancellation.isCancelled }
+        )
         stats.prefillSeconds = -prefillStart.timeIntervalSinceNow
 
         let decodeStart = Date()
-        for _ in 0..<maxNew {
+        for _ in 0..<max(0, maxNew) {
+            try checkGenerationCancellation { cancellation.isCancelled }
             var best = 0
             for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }
             if eosTokens.contains(best) { break }
             stats.generatedTokens += 1
             if !onToken(best) { break }
-            logits = try model.step([best], state: state)
+            logits = try model.step(
+                [best],
+                state: state,
+                shouldCancel: { cancellation.isCancelled }
+            )
         }
         stats.decodeSeconds = -decodeStart.timeIntervalSinceNow
         return stats

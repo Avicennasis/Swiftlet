@@ -891,6 +891,18 @@ public final class QwenMetalModel {
 
     /// Incremental step matching QwenCPUModel.step semantics.
     public func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
+        try step(tokens, state: state, shouldCancel: { false })
+    }
+
+    /// Cancellable Metal step. Checks happen only while no command buffer is
+    /// in flight; a cancelled partial token is abandoned with its DecodeState.
+    /// Cancellation exits by throwing, so StepMetrics is published through the
+    /// same `defer` as any other failure with `completedWithoutThrow == false`.
+    public func step(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
         let counters = StepCounters()
         if case .dispatchBoundaryCounters = phaseGpuSplitSupport {
             counters.phaseGpuSeconds = [:]
@@ -951,7 +963,8 @@ public final class QwenMetalModel {
         // S1b: multi-token prompt calls take the layer-major chunked schedule
         // when enabled and the fast path plus chunk scratch are available;
         // everything else keeps the token-major loop (single-token decode
-        // steps always do).
+        // steps always do). Cancellation is honoured between chunks and
+        // around each token step.
         var chunkCapacity = 0
         if tokens.count > 1, sBuf != nil, hBuf != nil,
            case .layerMajor(let chunkTokens) = prefillMode {
@@ -959,16 +972,22 @@ public final class QwenMetalModel {
             if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
         }
         if chunkCapacity > 0 {
-            logits = try prefillLayerMajor(tokens, state: state, chunkCapacity: chunkCapacity)
+            logits = try prefillLayerMajor(
+                tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
+            )
         } else {
             for (index, t) in tokens.enumerated() {
+                try checkGenerationCancellation(shouldCancel)
                 // S1a LM-head elision: a multi-token call consumes only the
                 // final position's logits, so intermediate vocabulary
                 // projections are unnecessary.
                 let projectLogits = index == tokens.count - 1
-                logits = try stepOne(t, state: state, projectLogits: projectLogits)
+                logits = try stepOne(
+                    t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+                )
                 state.position += 1
                 counters.tokensProcessed += 1
+                try checkGenerationCancellation(shouldCancel)
             }
         }
         counters.completedWithoutThrow = true
@@ -976,10 +995,15 @@ public final class QwenMetalModel {
     }
 
     private func stepOne(
-        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool
+        _ token: Int,
+        state: QwenCPUModel.DecodeState,
+        projectLogits: Bool,
+        shouldCancel: () -> Bool
     ) throws -> [Float] {
         if sBuf != nil {
-            return try stepOneFast(token, state: state, projectLogits: projectLogits)
+            return try stepOneFast(
+                token, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+            )
         }
         let cfg = config
         let D = cfg.hiddenSize
@@ -987,6 +1011,7 @@ public final class QwenMetalModel {
         precondition(h.count == D)
 
         for li in 0..<cfg.numHiddenLayers {
+            try checkGenerationCancellation(shouldCancel)
             let layer = layers[li]
             var x = h
             QwenCPUModel.rmsNorm(&x, rows: 1, dim: D, weight: layer.inputNorm, eps: Float(cfg.rmsNormEps))
@@ -1005,6 +1030,7 @@ public final class QwenMetalModel {
             for i in 0..<D { h[i] += m[i] }
         }
 
+        try checkGenerationCancellation(shouldCancel)
         guard projectLogits else { return [] }
         QwenCPUModel.rmsNorm(&h, rows: 1, dim: D, weight: finalNorm, eps: Float(cfg.rmsNormEps))
         loadX(h)
@@ -1594,7 +1620,10 @@ extension QwenMetalModel {
     }
 
     func stepOneFast(
-        _ token: Int, state: QwenCPUModel.DecodeState, projectLogits: Bool
+        _ token: Int,
+        state: QwenCPUModel.DecodeState,
+        projectLogits: Bool,
+        shouldCancel: () -> Bool = { false }
     ) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
@@ -1612,6 +1641,7 @@ extension QwenMetalModel {
         var pending: PendingMoE? = nil
 
         for li in 0..<cfg.numHiddenLayers {
+            try checkGenerationCancellation(shouldCancel)
             let L = layers[li]
             let fl = fastLayers[li]
 
@@ -1629,6 +1659,7 @@ extension QwenMetalModel {
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
+                try checkGenerationCancellation(shouldCancel)
             } else {
                 // S2: the whole attention layer in one command buffer — no
                 // CPU round trip. Projections, q prep + KV append into the
@@ -1658,12 +1689,14 @@ extension QwenMetalModel {
                 gapScope(\.gapKVMirrorSeconds) {
                     appendKVMirror(state, layer: li, position: state.position, count: 1)
                 }
+                try checkGenerationCancellation(shouldCancel)
             }
 
             let (picks, weights) = gapScope(\.gapRouterSeconds) { routerPicks(slot: slot) }
             routedExpertObserver?(li, picks.map { $0.0 })
             var bufs: [MTLBuffer] = []
             if let cache = expertCache {
+                try checkGenerationCancellation(shouldCancel)
                 bufs = try fetchExperts(cache, layer: li, experts: picks.map { $0.0 })
             }
             pending = PendingMoE(bufs: bufs, weights: weights, stacksLayer: li, picks: picks)
@@ -1671,6 +1704,7 @@ extension QwenMetalModel {
 
         // Always apply the last layer's experts. Only the final token in a
         // multi-token call also needs final norm + vocabulary projection.
+        try checkGenerationCancellation(shouldCancel)
         let (cb, enc) = beginStepCommandBuffer()
         if let p = pending { try phase(.moe) { try encodePendingMoE(enc, p, slot: slot) } }
         if projectLogits {
@@ -1681,6 +1715,7 @@ extension QwenMetalModel {
         }
         enc.endEncoding()
         commitAndWait(cb)
+        try checkGenerationCancellation(shouldCancel)
 
         guard projectLogits else { return [] }
         return readLogits()
@@ -2181,11 +2216,15 @@ extension QwenMetalModel {
     /// prefills each chunk layer-major. Only the final chunk projects logits
     /// (the S1a single-LM-head property).
     func prefillLayerMajor(
-        _ tokens: [Int], state: QwenCPUModel.DecodeState, chunkCapacity: Int
+        _ tokens: [Int], state: QwenCPUModel.DecodeState, chunkCapacity: Int,
+        shouldCancel: () -> Bool = { false }
     ) throws -> [Float] {
         var logits: [Float] = []
         var start = 0
         while start < tokens.count {
+            // Each chunk is its own group of command buffers; a cancelled
+            // prefill is abandoned here between chunks, before the next one.
+            try checkGenerationCancellation(shouldCancel)
             let end = min(start + chunkCapacity, tokens.count)
             logits = try prefillChunkLayerMajor(
                 Array(tokens[start..<end]), state: state,

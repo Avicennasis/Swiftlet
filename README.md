@@ -146,13 +146,16 @@ Swiftlet is a library first:
 
 1. **The Swift package.** Add SwiftletCore to any macOS or iOS app and use
    `SwiftletSession` for chat with streaming deltas, conversation caching,
-   sampling with repetition control, and memory-pressure handling built in.
+   sampling with repetition control, cooperative cancellation, and
+   memory-pressure handling built in.
 2. **The CLI.** `swiftlet chat` and `swiftlet generate` for local use and
    benchmarking, `swiftlet-repack` to build containers from MLX checkpoints
    (including streaming straight from Hugging Face with resume).
 3. **The server.** `swiftlet-server` speaks the OpenAI chat-completions API
    on loopback, so any chat UI that talks to OpenAI-compatible endpoints can
-   use a streamed local model.
+   use a streamed local model. It honors string/array `stop`, reports `stop`
+   versus `length`, and cancels queued or active generation when the client
+   disconnects.
 4. **An app.** [Priv AI](https://apps.apple.com/us/app/priv-ai/id6765706001)
    on iOS embeds SwiftletCore as its streamed-model engine. End users tap
    Download and chat. Nothing here is terminal-only. The app itself is open

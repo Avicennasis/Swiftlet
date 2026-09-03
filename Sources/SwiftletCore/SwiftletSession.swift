@@ -10,6 +10,7 @@ public final class SwiftletSession: @unchecked Sendable {
         public var generatedTokens = 0
         public var timeToFirstToken: TimeInterval = 0
         public var tokensPerSecond: Double = 0
+        public var finishReason: GenerationFinishReason?
     }
 
     /// Sampling settings. Defaults follow Qwen's recommendation for
@@ -37,6 +38,10 @@ public final class SwiftletSession: @unchecked Sendable {
         /// a "be concise" system prompt put real probability on stopping after
         /// 1-2 tokens ("I can" <eos>); a minimum length makes that impossible.
         public var minNew: Int = 8
+        /// Text sequences that end generation without being emitted. Potential
+        /// prefixes are held across token boundaries, so split stop strings do
+        /// not leak into a streamed response.
+        public var stopSequences: [String] = []
         public init() {}
         public static var greedy: GenerationOptions {
             var o = GenerationOptions()
@@ -59,7 +64,10 @@ public final class SwiftletSession: @unchecked Sendable {
     public let config: QwenConfig
     private let model: any InferenceModel
     private let generator: TextGenerator
-    private let tokenizer: Tokenizer
+    private let encodeText: (String) -> [Int]
+    private let decodeTokens: ([Int]) -> String
+    private let renderMessages: ([[String: String]]) throws -> [Int]
+    private let generationCleanupHook: (() -> Void)?
     private let metricsLock = NSLock()
     private var _lastMetrics = Metrics()
     /// True when running on the Metal engine (vs the CPU reference fallback).
@@ -77,7 +85,11 @@ public final class SwiftletSession: @unchecked Sendable {
     public init(modelDir: URL, retainAllLayers: Bool = false, cacheBudgetGB: Double = 2) async throws {
         self.modelDir = modelDir
         print("[SwiftletSession] loading tokenizer...")
-        tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+        let tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+        encodeText = { tokenizer.encode(text: $0) }
+        decodeTokens = { tokenizer.decode(tokens: $0) }
+        renderMessages = { try tokenizer.applyChatTemplate(messages: $0) }
+        generationCleanupHook = nil
         print("[SwiftletSession] tokenizer ok; building Metal model...")
         do {
             let gpu = try QwenMetalModel(modelDir: modelDir, cacheBudgetGB: cacheBudgetGB)
@@ -132,6 +144,31 @@ public final class SwiftletSession: @unchecked Sendable {
             && Array(probe.suffix(thinkOpen.count)) == thinkOpen
     }
 
+    /// Dependency-injected construction for deterministic session-boundary
+    /// tests. Production callers use the async model/tokenizer initializer.
+    init(
+        testingModel model: any InferenceModel,
+        modelDir: URL,
+        encodeText: @escaping (String) -> [Int],
+        decodeTokens: @escaping ([Int]) -> String,
+        renderMessages: @escaping ([[String: String]]) throws -> [Int],
+        suppressedIds: Set<Int> = [],
+        usesThinkPrompt: Bool = false,
+        generationCleanupHook: (() -> Void)? = nil
+    ) {
+        self.modelDir = modelDir
+        self.model = model
+        self.config = model.config
+        self.generator = TextGenerator(model: model)
+        self.usesGPU = model is QwenMetalModel
+        self.encodeText = encodeText
+        self.decodeTokens = decodeTokens
+        self.renderMessages = renderMessages
+        self.suppressedIds = suppressedIds
+        self.usesThinkPrompt = usesThinkPrompt
+        self.generationCleanupHook = generationCleanupHook
+    }
+
     private let suppressedIds: Set<Int>
     private let usesThinkPrompt: Bool
 
@@ -148,7 +185,23 @@ public final class SwiftletSession: @unchecked Sendable {
     private var statePrimed = false
 
     /// Drops the cached conversation (e.g. when the user starts a new chat).
+    /// A generation in flight is cancelled first, then the reset is ordered
+    /// behind it on the generation queue so it cannot replace DecodeState while
+    /// the model is using it. The caller therefore waits for at most one
+    /// model-safe boundary (a CPU step or Metal command buffer), not for the
+    /// remainder of the interrupted reply.
     public func resetConversation() {
+        genLock.lock()
+        let active = activeControl
+        genLock.unlock()
+        active?.cancel()
+        generationQueue.sync {
+            resetConversationState()
+        }
+    }
+
+    /// The queue-confined form used by streamChat itself.
+    private func resetConversationState() {
         convState = QwenCPUModel.DecodeState()
         lastMessages = []
         lastReplyText = ""
@@ -161,8 +214,24 @@ public final class SwiftletSession: @unchecked Sendable {
     // replies whenever a memory warning landed mid-generation). The warning
     // handler only sets a flag; the decode thread applies it between tokens.
     private let genLock = NSLock()
+
+    /// Cancellation owner of the request currently executing on
+    /// `generationQueue`, so `resetConversation()` can interrupt it instead of
+    /// waiting for it to run to completion. Guarded by `genLock`.
+    private var activeControl: GenerationCancellation?
+
+    private func setActiveControl(_ control: GenerationCancellation?) {
+        genLock.lock()
+        activeControl = control
+        genLock.unlock()
+    }
     private var generationActive = false
     private var pendingShrinkGB: Double?
+    /// Conversation state and the underlying model are both mutable. This is
+    /// the session's single-flight boundary for every public streamChat call.
+    private let generationQueue = DispatchQueue(
+        label: "swiftlet.session.generation", qos: .userInitiated
+    )
 
     /// Frees most of the expert cache in response to OS memory pressure; it
     /// refills lazily as generation continues. Safe to call from any thread.
@@ -192,6 +261,34 @@ public final class SwiftletSession: @unchecked Sendable {
         }
     }
 
+    private func beginGeneration() {
+        genLock.lock()
+        generationActive = true
+        genLock.unlock()
+    }
+
+    /// Completes all shared lifecycle cleanup before the stream continuation
+    /// is finished. Otherwise a waiting consumer can enqueue the next request
+    /// while the preceding request still advertises stale active/shrink state.
+    private func endGeneration() {
+        // Keep advertising an active generation until every deferred shrink
+        // has drained. A warning racing one shrink therefore queues another
+        // pass instead of invoking shrinkCache concurrently.
+        while true {
+            genLock.lock()
+            guard let gb = pendingShrinkGB else {
+                generationActive = false
+                genLock.unlock()
+                break
+            }
+            pendingShrinkGB = nil
+            genLock.unlock()
+            (model as? QwenMetalModel)?.shrinkCache(toGB: gb)
+            print("[SwiftletSession] deferred cache shrink applied")
+        }
+        generationCleanupHook?()
+    }
+
     /// Full prompt for a fresh conversation, with reasoning disabled: the
     /// Qwen3.6 template ends the generation prompt with "<think>\n", which
     /// makes the model reason in the open — and since the literal <think>
@@ -199,13 +296,13 @@ public final class SwiftletSession: @unchecked Sendable {
     /// Appending the rest of an empty think block reproduces the template's
     /// own enable_thinking=false rendering byte for byte.
     private func freshPromptIds(_ messages: [[String: String]]) throws -> [Int] {
-        var ids = try tokenizer.applyChatTemplate(messages: messages)
+        var ids = try renderMessages(messages)
         // Compare token ids, not decoded text — decode can normalize or skip
         // special tokens and silently defeat a string comparison.
         if usesThinkPrompt {
-            let thinkOpen = tokenizer.encode(text: "<think>\n")
+            let thinkOpen = encodeText("<think>\n")
             if ids.count >= thinkOpen.count, Array(ids.suffix(thinkOpen.count)) == thinkOpen {
-                ids += tokenizer.encode(text: "\n</think>\n\n")
+                ids += encodeText("\n</think>\n\n")
             }
         }
         return ids
@@ -233,7 +330,7 @@ public final class SwiftletSession: @unchecked Sendable {
         let turn = "<|im_end|>\n<|im_start|>user\n" + (newUser["content"] ?? "")
             + "<|im_end|>\n<|im_start|>assistant\n"
             + (usesThinkPrompt ? "<think>\n\n</think>\n\n" : "")
-        return tokenizer.encode(text: turn)
+        return encodeText(turn)
     }
 
     /// Drops the replacement characters an incomplete trailing multi-byte
@@ -330,29 +427,48 @@ public final class SwiftletSession: @unchecked Sendable {
     /// Applies the model's chat template to `messages` (role/content pairs,
     /// e.g. [["role": "user", "content": "hi"]]) and streams generated text
     /// deltas. Reasoning is disabled; the reply is the answer directly.
-    /// Cancelling the consuming task stops generation.
+    /// Cancelling the consuming task, or the optional cancellation owner,
+    /// stops generation at the next model-safe boundary.
     public func streamChat(
         messages: [[String: String]],
         maxNew: Int = 1024,
-        options: GenerationOptions = GenerationOptions()
+        options: GenerationOptions = GenerationOptions(),
+        cancellation: GenerationCancellation? = nil
     ) -> AsyncThrowingStream<String, Swift.Error> {
         AsyncThrowingStream { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.genLock.lock()
-                self.generationActive = true
-                self.genLock.unlock()
+            let control = cancellation ?? GenerationCancellation()
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { control.cancel() }
+            }
+            self.generationQueue.async {
+                self.beginGeneration()
+                self.setActiveControl(control)
+                var terminalError: Swift.Error?
                 defer {
-                    self.genLock.lock()
-                    self.generationActive = false
-                    self.genLock.unlock()
-                    self.applyPendingShrink()
+                    self.setActiveControl(nil)
+                    self.endGeneration()
+                    if let terminalError {
+                        continuation.finish(throwing: terminalError)
+                    } else {
+                        continuation.finish()
+                    }
                 }
                 do {
+                    // A server request can be cancelled while waiting behind
+                    // another request on the serial generation queue. Observe
+                    // that before consulting or mutating conversation state,
+                    // and report a fresh result instead of stale metrics from
+                    // the preceding request.
+                    if control.isCancelled {
+                        self.storeMetrics(Metrics(finishReason: .cancelled))
+                        return
+                    }
+
                     let suffix: [Int]
                     if let delta = self.continuationIds(messages) {
                         suffix = delta
                     } else {
-                        self.resetConversation()
+                        self.resetConversationState()
                         suffix = try self.freshPromptIds(messages)
                     }
 
@@ -360,100 +476,153 @@ public final class SwiftletSession: @unchecked Sendable {
                     var firstTokenAt: Date?
                     var generated: [Int] = []
                     var generatedCounts: [Int: Int] = [:]
-                    var printed = ""
-                    var cleanEnd = false
-
-                    var logits = try self.model.step(suffix, state: self.convState)
-                    let prefillDone = Date()
-
+                    var stopFilter = StopSequenceFilter(stopSequences: options.stopSequences)
+                    var matchedTextStop = false
+                    var prefillDone = start
                     var decodeSeconds = 0.0
-                    var stopReason = "maxNew"
-                    for _ in 0..<maxNew {
-                        self.applyPendingShrink()
-                        // EOS is legal when the reply reads finished (ends at
-                        // a sentence or line break; a stop after "are:"
-                        // mid-list is never valid) OR when EOS is the model's
-                        // top choice outright: a model that strongly wants to
-                        // stop knows the reply is done even after ")" or a
-                        // quote, and forcing it past its stop just makes it
-                        // emit junk. The 300-token escape keeps a
-                        // punctuation-averse reply from running to maxNew.
-                        let tail = printed.hasSuffix("\n") || {
-                            guard let last = printed.trimmingCharacters(in: .whitespacesAndNewlines).last
-                            else { return false }
-                            return ".!?。！？".contains(last)
-                        }()
-                        let eosIsTop = { () -> Bool in
-                            let vocab = min(self.config.vocabSize, logits.count)
-                            var best = 0
-                            for v in 1..<vocab where logits[v] > logits[best] { best = v }
-                            return self.generator.eosTokens.contains(best)
-                        }()
-                        let eosAllowed = generated.count >= options.minNew
-                            && (tail || eosIsTop || generated.count >= 300)
-                        let best = self.sample(logits, options: options, generated: generated,
-                                               seen: generatedCounts, banEOS: !eosAllowed)
-                        if self.generator.eosTokens.contains(best) {
-                            cleanEnd = true
-                            stopReason = "eos"
-                            break
+                    var finishReason = GenerationFinishReason.length
+
+                    do {
+                        var logits = try self.model.step(
+                            suffix, state: self.convState,
+                            shouldCancel: { control.isCancelled }
+                        )
+                        prefillDone = Date()
+
+                        for _ in 0..<max(0, maxNew) {
+                            try checkGenerationCancellation { control.isCancelled }
+                            self.applyPendingShrink()
+                            try checkGenerationCancellation { control.isCancelled }
+                            // EOS is legal when the reply reads finished (ends
+                            // at a sentence or line break) OR EOS is the model's
+                            // top choice outright. `stopFilter.output` is only
+                            // text already safe to expose; a possible stop
+                            // prefix must not influence this punctuation gate.
+                            let visible = stopFilter.output
+                            let tail = visible.hasSuffix("\n") || {
+                                guard let last = visible.trimmingCharacters(in: .whitespacesAndNewlines).last
+                                else { return false }
+                                return ".!?。！？".contains(last)
+                            }()
+                            let eosIsTop = { () -> Bool in
+                                let vocab = min(self.config.vocabSize, logits.count)
+                                var best = 0
+                                for v in 1..<vocab where logits[v] > logits[best] { best = v }
+                                return self.generator.eosTokens.contains(best)
+                            }()
+                            let eosAllowed = generated.count >= options.minNew
+                                && (tail || eosIsTop || generated.count >= 300)
+                            let best = self.sample(
+                                logits, options: options, generated: generated,
+                                seen: generatedCounts, banEOS: !eosAllowed
+                            )
+                            if self.generator.eosTokens.contains(best) {
+                                finishReason = .stop
+                                break
+                            }
+
+                            if firstTokenAt == nil { firstTokenAt = Date() }
+                            generated.append(best)
+                            generatedCounts[best, default: 0] += 1
+
+                            // Decode cumulatively so a stop can cross arbitrary
+                            // token boundaries. The filter also owns the UTF-8
+                            // and potential-stop-prefix hold-back.
+                            let update = stopFilter.consume(
+                                decoded: self.decodeTokens(generated)
+                            )
+                            guard update.isConsistent else {
+                                throw GenerationInterruption.invalidTextStream
+                            }
+                            try checkGenerationCancellation { control.isCancelled }
+                            if let delta = update.delta,
+                               case .terminated = continuation.yield(delta) {
+                                control.cancel()
+                            }
+                            if control.isCancelled {
+                                finishReason = .cancelled
+                                break
+                            }
+                            if update.didStop {
+                                matchedTextStop = true
+                                finishReason = .stop
+                                break
+                            }
+
+                            let t0 = Date()
+                            logits = try self.model.step(
+                                [best], state: self.convState,
+                                shouldCancel: { control.isCancelled }
+                            )
+                            decodeSeconds += -t0.timeIntervalSinceNow
                         }
-                        if firstTokenAt == nil { firstTokenAt = Date() }
-                        generated.append(best)
-                        generatedCounts[best, default: 0] += 1
-                        // StreamingText.delta owns the hold-back: a byte-split
-                        // multi-byte character decodes with a trailing U+FFFD,
-                        // and a later token can extend an already-decoded
-                        // character with a variation selector or ZWJ. Either
-                        // one desyncs a naive prefix check and silences the
-                        // rest of the turn (issues #9 and #15). Pass the raw
-                        // decode so the trim and the scalar-level prefix run
-                        // once, in one place, not stacked with a second trim.
-                        let text = self.tokenizer.decode(tokens: generated)
-                        var terminated = false
-                        if let (delta, newPrinted) = StreamingText.delta(printed: printed, decoded: text) {
-                            if case .terminated = continuation.yield(delta) { terminated = true }
-                            printed = newPrinted
-                        }
-                        let t0 = Date()
-                        logits = try self.model.step([best], state: self.convState)
-                        decodeSeconds += -t0.timeIntervalSinceNow
-                        if terminated { cleanEnd = true; stopReason = "consumer-cancelled"; break }
-                    }
-                    // Flush whatever the hold-back logic still owes (a
-                    // character completed by the last token, or a genuinely
-                    // unfinishable U+FFFD when EOS cut an emoji short).
-                    if let rest = StreamingText.finalDelta(
-                        printed: printed, decoded: self.tokenizer.decode(tokens: generated)
-                    ) {
-                        continuation.yield(rest)
-                    }
-                    print("[SwiftletSession] stop: \(stopReason) after \(generated.count) tokens")
-                    if !cleanEnd {
-                        // Hit maxNew: state still matches the generated text,
-                        // so the conversation remains continuable.
-                        cleanEnd = true
+                    } catch GenerationInterruption.cancelled {
+                        finishReason = .cancelled
                     }
 
-                    self.lastMessages = messages
-                    self.lastReplyText = Self.trimIncompleteUTF8(
-                        self.tokenizer.decode(tokens: generated))
-                    self.statePrimed = cleanEnd && !generated.isEmpty
+                    if control.isCancelled { finishReason = .cancelled }
+                    // On EOS/length, inspect the final raw scalar stream before
+                    // releasing held text. This both flushes a non-matching
+                    // prefix/U+FFFD and catches a stop that itself ends in the
+                    // now-terminal U+FFFD. Cancellation and prior matches do
+                    // not release anything further.
+                    if finishReason != .cancelled, !matchedTextStop {
+                        let finalUpdate = stopFilter.finishUpdate(
+                            decoded: self.decodeTokens(generated)
+                        )
+                        guard finalUpdate.isConsistent else {
+                            throw GenerationInterruption.invalidTextStream
+                        }
+                        if finalUpdate.didStop {
+                            matchedTextStop = true
+                            finishReason = .stop
+                        }
+                        if let rest = finalUpdate.delta,
+                           case .terminated = continuation.yield(rest) {
+                            finishReason = .cancelled
+                        }
+                    }
+                    // Cancellation can race the final EOS/length flush. Make
+                    // the reuse decision only after one last observation so a
+                    // turn cancelled during delivery cannot prime mismatched
+                    // conversation state. Cancellation after this check is
+                    // linearized as occurring after generation completed.
+                    if control.isCancelled { finishReason = .cancelled }
+                    print("[SwiftletSession] stop: \(finishReason.rawValue) after \(generated.count) tokens")
 
-                    self.metricsLock.lock()
-                    self._lastMetrics = Metrics(
+                    // EOS and length end with state exactly matching the text
+                    // exposed to the caller. An arbitrary text stop may span
+                    // already-fed token pieces, and cancellation can interrupt
+                    // a prompt/token partway through, so neither is reusable
+                    // without a real DecodeState snapshot/rollback facility.
+                    let reusable = finishReason != .cancelled
+                        && !matchedTextStop && !generated.isEmpty
+                    if reusable {
+                        self.lastMessages = messages
+                        self.lastReplyText = stopFilter.output
+                        self.statePrimed = true
+                    } else {
+                        self.resetConversationState()
+                    }
+
+                    self.storeMetrics(Metrics(
                         promptTokens: suffix.count,
                         generatedTokens: generated.count,
                         timeToFirstToken: (firstTokenAt ?? prefillDone).timeIntervalSince(start),
-                        tokensPerSecond: decodeSeconds > 0 ? Double(generated.count) / decodeSeconds : 0
-                    )
-                    self.metricsLock.unlock()
-                    continuation.finish()
+                        tokensPerSecond: decodeSeconds > 0 ? Double(generated.count) / decodeSeconds : 0,
+                        finishReason: finishReason
+                    ))
                 } catch {
-                    self.resetConversation()
-                    continuation.finish(throwing: error)
+                    self.resetConversationState()
+                    terminalError = error
                 }
             }
         }
+    }
+
+    private func storeMetrics(_ metrics: Metrics) {
+        metricsLock.lock()
+        _lastMetrics = metrics
+        metricsLock.unlock()
     }
 }
