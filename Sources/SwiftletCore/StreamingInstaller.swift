@@ -183,6 +183,13 @@ public final class StreamingInstaller {
 
         // 1. Small files.
         guard let configData = try source.smallFile("config.json") else { throw Error.missingFile("config.json") }
+        // Refuse a non-affine checkpoint (mxfp4/nvfp4/mxfp8) now, before the
+        // shard plan and the first weight byte: streaming it would fill a
+        // container the runtime cannot dequantize. Same decision as
+        // Checkpoint's, so the CLI reports the mode by name either way.
+        if let cfg = try JSONSerialization.jsonObject(with: configData) as? [String: Any] {
+            _ = try Checkpoint.quantization(fromConfig: cfg)
+        }
         try configData.write(to: outputDir.appendingPathComponent("config.json"))
         for aux in ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
                     "chat_template.jinja", "generation_config.json", "special_tokens_map.json", "added_tokens.json"] {

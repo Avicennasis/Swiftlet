@@ -5,15 +5,46 @@ import Foundation
 /// with transparent MLX affine dequantization (packed uint32 weight + scales +
 /// biases per group) for 2/4/8-bit tensors.
 public final class Checkpoint {
+    /// mlx-lm's default `quantization.mode`, and the only packed layout this
+    /// reader dequantizes: uint32 words + scales + biases per group. The other
+    /// modes (`mxfp4`, `nvfp4`, `mxfp8`) store e8m0/e4m3 scales and no biases.
+    public static let affineMode = "affine"
+
     public struct QuantSpec: Sendable {
         public let groupSize: Int
         public let bits: Int
+        /// `quantization.mode` as mlx-lm recorded it. Absent from the config
+        /// means `affine`: that is mlx-lm's default, and checkpoints converted
+        /// before the field existed omit it.
+        public let mode: String
+
+        public init(groupSize: Int, bits: Int, mode: String = Checkpoint.affineMode) {
+            self.groupSize = groupSize
+            self.bits = bits
+            self.mode = mode
+        }
     }
 
-    public enum Error: Swift.Error {
+    public enum Error: Swift.Error, CustomStringConvertible {
         case missingTensor(String)
         case unsupportedBits(Int)
         case badShape(String)
+        /// The checkpoint declares an MLX quantization mode other than `affine`
+        /// for `module` (`"quantization"` when it is the checkpoint default).
+        /// Its packed layout cannot be dequantized as affine, so the checkpoint
+        /// is refused before any tensor is read.
+        case unsupportedQuantMode(mode: String, module: String)
+
+        public var description: String {
+            switch self {
+            case .missingTensor(let name): return "missing tensor \(name)"
+            case .unsupportedBits(let bits): return "unsupported \(bits)-bit quantization (affine 4- and 8-bit only)"
+            case .badShape(let name): return "bad shape for tensor \(name)"
+            case .unsupportedQuantMode(let mode, let module):
+                return "unsupported MLX quantization mode \"\(mode)\" (\(module)); "
+                    + "only \"\(Checkpoint.affineMode)\" checkpoints (packed weight + scales + biases) can be read"
+            }
+        }
     }
 
     public let dir: URL
@@ -25,28 +56,53 @@ public final class Checkpoint {
     private var fileURLs: [URL] = []
     private var tensorToFile: [String: Int] = [:]
 
+    /// Parses mlx-lm's quantization block and refuses any mode this reader
+    /// cannot dequantize, so every entry point (checkpoint open, repack, the
+    /// streaming installer before its first weight byte) decides the same way.
+    ///
+    /// Config shape: {"quantization": {"group_size": 64, "bits": 4, "mode": "affine",
+    /// "model.layers.N.mlp.gate": {"group_size": 64, "bits": 8, "mode": "affine"}, ...}}.
+    /// A per-module override without `mode` is affine regardless of the
+    /// checkpoint default: MLX hands the override dict straight to
+    /// `to_quantized`, whose own default is affine, rather than inheriting
+    /// the top-level mode (mlx-community's mxfp4 Qwen3.6 builds keep their
+    /// routers affine exactly this way). The mode is refused before any
+    /// tensor is read: a non-affine checkpoint has no `.biases`, and reading
+    /// it as affine failed on a missing tensor that blamed the file.
+    public static func quantization(fromConfig cfg: [String: Any]) throws
+        -> (default: QuantSpec?, overrides: [String: QuantSpec]) {
+        guard let q = cfg["quantization"] as? [String: Any] else { return (nil, [:]) }
+        var defQuant: QuantSpec? = nil
+        var overrides: [String: QuantSpec] = [:]
+        if let g = q["group_size"] as? Int, let b = q["bits"] as? Int {
+            defQuant = QuantSpec(groupSize: g, bits: b,
+                                 mode: q["mode"] as? String ?? affineMode)
+        }
+        for (key, value) in q {
+            if let sub = value as? [String: Any],
+               let g = sub["group_size"] as? Int, let b = sub["bits"] as? Int {
+                overrides[key] = QuantSpec(groupSize: g, bits: b,
+                                           mode: sub["mode"] as? String ?? affineMode)
+            }
+        }
+        if let d = defQuant, d.mode != affineMode {
+            throw Error.unsupportedQuantMode(mode: d.mode, module: "quantization")
+        }
+        for (module, spec) in overrides.sorted(by: { $0.key < $1.key }) where spec.mode != affineMode {
+            throw Error.unsupportedQuantMode(mode: spec.mode, module: module)
+        }
+        return (defQuant, overrides)
+    }
+
     public init(dir: URL) throws {
         self.dir = dir
 
-        // Quantization config: {"quantization": {"group_size": 64, "bits": 4,
-        // "model.layers.N.mlp.gate": {"group_size": 64, "bits": 8}, ...}}
-        var defQuant: QuantSpec? = nil
-        var overrides: [String: QuantSpec] = [:]
         let configURL = dir.appendingPathComponent("config.json")
-        if let cfg = try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any],
-           let q = cfg["quantization"] as? [String: Any] {
-            if let g = q["group_size"] as? Int, let b = q["bits"] as? Int {
-                defQuant = QuantSpec(groupSize: g, bits: b)
-            }
-            for (key, value) in q {
-                if let sub = value as? [String: Any],
-                   let g = sub["group_size"] as? Int, let b = sub["bits"] as? Int {
-                    overrides[key] = QuantSpec(groupSize: g, bits: b)
-                }
-            }
-        }
-        defaultQuant = defQuant
-        quantOverrides = overrides
+        let cfg = (try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any]) ?? [:]
+        // Refuses a non-affine checkpoint here, before any shard is opened.
+        let quant = try Self.quantization(fromConfig: cfg)
+        defaultQuant = quant.default
+        quantOverrides = quant.overrides
 
         let indexURL = dir.appendingPathComponent("model.safetensors.index.json")
         if FileManager.default.fileExists(atPath: indexURL.path),
@@ -167,6 +223,11 @@ public final class Checkpoint {
     /// w[i] = scale[g] * q[i] + bias[g].
     private func dequantized(_ path: String, rowRange: Range<Int>?) throws -> [Float] {
         guard let spec = quantSpec(for: path) else { throw Error.missingTensor(path + ".scales") }
+        // `init` already refused non-affine configs; this keeps the affine
+        // arithmetic below from ever running on another layout.
+        guard spec.mode == Self.affineMode else {
+            throw Error.unsupportedQuantMode(mode: spec.mode, module: path)
+        }
         guard spec.bits == 4 || spec.bits == 8 else { throw Error.unsupportedBits(spec.bits) }
         let perWord = 32 / spec.bits
         let mask = UInt32((1 << spec.bits) - 1)
