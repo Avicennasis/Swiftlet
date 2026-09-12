@@ -106,16 +106,28 @@ public struct QpackRepacker {
     /// projections disagree with each other, since the manifest records one
     /// value for all of them (issue #30).
     static func expertQuant(_ ckpt: Checkpoint) throws -> Checkpoint.QuantSpec? {
+        try expertQuant(default: ckpt.defaultQuant,
+                        contains: { ckpt.contains($0) },
+                        spec: { ckpt.quantSpec(for: $0) })
+    }
+
+    /// The rule above over any source that can answer "is this tensor present"
+    /// and "what spec does this module resolve to": an opened checkpoint, or
+    /// the streaming installer's shard headers plus the config it fetched, so
+    /// both producers record the same expert quantization for the same source.
+    static func expertQuant(default defaultQuant: Checkpoint.QuantSpec?,
+                            contains: (String) -> Bool,
+                            spec: (String) -> Checkpoint.QuantSpec?) throws -> Checkpoint.QuantSpec? {
         var resolved: [(module: String, spec: Checkpoint.QuantSpec)] = []
         for proj in expertTensorSuffixes {
             // Layer 0 is representative: the section table is derived from it,
             // and mlx-lm quantizes a given module identically across layers.
             let module = "model.layers.0.mlp.switch_mlp." + proj
-            guard ckpt.contains(module + ".weight") else { continue }
-            guard let spec = ckpt.quantSpec(for: module) else { continue }
+            guard contains(module + ".weight") else { continue }
+            guard let spec = spec(module) else { continue }
             resolved.append((module, spec))
         }
-        guard let first = resolved.first else { return ckpt.defaultQuant }
+        guard let first = resolved.first else { return defaultQuant }
         for entry in resolved
         where entry.spec.bits != first.spec.bits || entry.spec.groupSize != first.spec.groupSize {
             throw Error.mixedExpertQuant(

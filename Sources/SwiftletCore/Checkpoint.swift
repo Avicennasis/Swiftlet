@@ -181,8 +181,17 @@ public final class Checkpoint {
 
     public func quantSpec(for path: String) -> QuantSpec? {
         guard isQuantized(path) else { return nil }
-        // Match the most specific override suffix (config keys omit shard prefixes).
-        for (key, spec) in quantOverrides where path.hasSuffix(key) || key.hasSuffix(path) {
+        return Self.quantSpec(for: path, default: defaultQuant, overrides: quantOverrides)
+    }
+
+    /// The spec a quantized module resolves to under a parsed quantization
+    /// block: the most specific override suffix (config keys omit shard
+    /// prefixes), else the default. `quantSpec(for:)` applies it to an opened
+    /// checkpoint; the streaming installer applies it to the config it has
+    /// fetched before any shard is read.
+    public static func quantSpec(for path: String, default defaultQuant: QuantSpec?,
+                                 overrides: [String: QuantSpec]) -> QuantSpec? {
+        for (key, spec) in overrides where path.hasSuffix(key) || key.hasSuffix(path) {
             return spec
         }
         return defaultQuant
