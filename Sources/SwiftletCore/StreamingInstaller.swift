@@ -186,10 +186,11 @@ public final class StreamingInstaller {
         // Refuse a non-affine checkpoint (mxfp4/nvfp4/mxfp8) now, before the
         // shard plan and the first weight byte: streaming it would fill a
         // container the runtime cannot dequantize. Same decision as
-        // Checkpoint's, so the CLI reports the mode by name either way.
-        if let cfg = try JSONSerialization.jsonObject(with: configData) as? [String: Any] {
-            _ = try Checkpoint.quantization(fromConfig: cfg)
-        }
+        // Checkpoint's, so the CLI reports the mode by name either way. The
+        // parsed block is kept: the manifest's expert quantization is resolved
+        // from it once the shard headers say which modules are quantized.
+        let configObject = (try JSONSerialization.jsonObject(with: configData) as? [String: Any]) ?? [:]
+        let quant = try Checkpoint.quantization(fromConfig: configObject)
         try configData.write(to: outputDir.appendingPathComponent("config.json"))
         for aux in ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
                     "chat_template.jinja", "generation_config.json", "special_tokens_map.json", "added_tokens.json"] {
@@ -264,6 +265,25 @@ public final class StreamingInstaller {
         // is not an mlx-lm runtime-format checkpoint. Fail here rather than writing
         // a container that cannot be loaded.
         guard !sections.isEmpty else { throw Error.notMLXCheckpoint }
+
+        // The expert quantization the manifest must record, resolved per module
+        // exactly as QpackRepacker resolves it (issue #30): a mixed-precision
+        // checkpoint (8-bit dense default, 4-bit `switch_mlp` experts, as the
+        // DWQ variants) carries the expert precision as per-module overrides,
+        // and recording the checkpoint default made the load-time cross-check
+        // refuse the container this installer had just streamed. Decided here,
+        // from the headers and the config, before any weight byte is
+        // downloaded, so disagreeing expert projections refuse without
+        // streaming anything.
+        let canonicalNames = Set(all.map { canonical($0.name) })
+        let expertQuant = try QpackRepacker.expertQuant(
+            default: quant.default,
+            contains: { canonicalNames.contains($0) },
+            spec: { module in
+                canonicalNames.contains(module + ".scales")
+                    ? Checkpoint.quantSpec(for: module, default: quant.default, overrides: quant.overrides)
+                    : nil
+            })
 
         let stride = Qpack.align(running, to: Qpack.pageAlignment)
         log("expert blob payload \(running) B, stride \(stride) B")
@@ -381,19 +401,13 @@ public final class StreamingInstaller {
                 if case .baseURL(let base) = source { return base }
                 return "local"
             }(),
-            quantBits: ckptQuantBits(configData: configData).bits,
-            quantGroupSize: ckptQuantBits(configData: configData).group,
+            quantBits: expertQuant?.bits,
+            quantGroupSize: expertQuant?.groupSize,
             files: files
         )
         try JSONEncoder.sorted.encode(manifest).write(to: outputDir.appendingPathComponent("manifest.json"))
         try? fm.removeItem(at: progressURL)
         log("container complete at \(outputDir.path)")
-    }
-
-    private func ckptQuantBits(configData: Data) -> (bits: Int?, group: Int?) {
-        guard let obj = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
-              let q = obj["quantization"] as? [String: Any] else { return (nil, nil) }
-        return (q["bits"] as? Int, q["group_size"] as? Int)
     }
 
     // MARK: Routing
