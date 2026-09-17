@@ -191,6 +191,9 @@ public final class StreamingInstaller {
         // from it once the shard headers say which modules are quantized.
         let configObject = (try JSONSerialization.jsonObject(with: configData) as? [String: Any]) ?? [:]
         let quant = try Checkpoint.quantization(fromConfig: configObject)
+        // Same for the family: a checkpoint of another model_type is refused
+        // here, by name, before anything is written into the output directory.
+        _ = try QwenConfig.modelType(fromConfig: configObject)
         try configData.write(to: outputDir.appendingPathComponent("config.json"))
         for aux in ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
                     "chat_template.jinja", "generation_config.json", "special_tokens_map.json", "added_tokens.json"] {
