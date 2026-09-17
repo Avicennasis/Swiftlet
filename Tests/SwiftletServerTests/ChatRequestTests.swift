@@ -32,11 +32,63 @@ import SwiftletCore
         #expect(r.messages[0].content.text == "ab")
     }
 
-    @Test func imageOnlyPartsDropped() throws {
+    private func expectRefused(type: String, _ json: String) {
+        do {
+            _ = try decode(json)
+            Issue.record("a \"\(type)\" content part was accepted")
+        } catch let part as ChatContent.UnsupportedContentPart {
+            #expect(part.type == type)
+            #expect(part.description.contains("\"\(type)\""), "the refusal must name the part type")
+        } catch {
+            Issue.record("refused with \(error), not by content part type")
+        }
+    }
+
+    /// A non-text part is refused by name, not dropped. Before this the part
+    /// vanished at decode and the model answered the empty text around it.
+    @Test func imagePartIsRefusedByName() {
+        expectRefused(type: "image_url",
+            #"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,xxx"}}]}]}"#)
+    }
+
+    /// Refusal is whole-request: the text beside the image would have been
+    /// answered as if the image had never been sent.
+    @Test func textBesideAnImagePartIsStillRefused() {
+        expectRefused(type: "image_url",
+            #"{"messages":[{"role":"user","content":[{"type":"text","text":"what is in this picture?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,xxx"}}]}]}"#)
+    }
+
+    /// Every foreign type is named as itself, so a client sees which one.
+    @Test func otherPartTypesAreRefusedByTheirOwnName() {
+        expectRefused(type: "input_audio",
+            #"{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"xx","format":"wav"}}]}]}"#)
+        expectRefused(type: "input_image",
+            #"{"messages":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,xxx"}]}]}"#)
+    }
+
+    /// Only the part type decides: a text part in a later message after an
+    /// image part in an earlier one is still refused, and a request with
+    /// text parts alone still decodes.
+    @Test func imagePartInAnEarlierMessageIsRefused() {
+        expectRefused(type: "image_url",
+            #"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,xxx"}}]},{"role":"assistant","content":"?"},{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#)
+    }
+
+    /// A part that names no type but carries text is text (unchanged
+    /// leniency); a `text` part with no text is a malformed body.
+    @Test func typelessTextPartIsText() throws {
         let r = try decode(
-            #"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,xxx"}}]}]}"#
+            #"{"messages":[{"role":"user","content":[{"text":"hi"}]}]}"#
         )
-        #expect(r.messages[0].content.text == "")
+        #expect(r.messages[0].content.text == "hi")
+    }
+
+    @Test func textPartWithoutTextIsMalformed() {
+        #expect(throws: DecodingError.self) {
+            _ = try decode(
+                #"{"messages":[{"role":"user","content":[{"type":"text"}]}]}"#
+            )
+        }
     }
 
     @Test func nullContentWithToolCalls() throws {
