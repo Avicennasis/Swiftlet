@@ -12,9 +12,25 @@ import SwiftletCore
 
 /// Message content per the OpenAI Chat Completions spec: a plain string, an
 /// array of parts ([{type:"text",text:"..."}]), or null on tool-call turns.
-/// Text parts are joined; non-text parts are dropped; null decodes as "".
+/// Text parts are joined; null decodes as "". A part of any other type
+/// (`image_url`, `input_audio`, ...) is refused by name rather than dropped:
+/// this server has no image or audio path, and answering the text left over
+/// after a silently dropped image is a reply to a question the client did
+/// not ask. The refusal is whole-request, so text beside an image does not
+/// rescue it.
 struct ChatContent: Decodable {
-    struct Part: Decodable { let text: String? }
+    struct Part: Decodable { let type: String?; let text: String? }
+
+    /// A content part this server cannot consume, carrying its `type` so the
+    /// 400 body can name it. Thrown from decoding; `handleChat` reports it as
+    /// a bad request with this description instead of "malformed request".
+    struct UnsupportedContentPart: Swift.Error, CustomStringConvertible {
+        let type: String
+        var description: String {
+            "unsupported content part type \"\(type)\": this server accepts text parts only"
+        }
+    }
+
     let text: String
     init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
@@ -23,7 +39,21 @@ struct ChatContent: Decodable {
         } else if let s = try? c.decode(String.self) {
             text = s
         } else {
-            text = try c.decode([Part].self).compactMap(\.text).joined()
+            var joined = ""
+            for part in try c.decode([Part].self) {
+                if let type = part.type, type != "text" {
+                    throw UnsupportedContentPart(type: type)
+                }
+                // A part that names no type is text when it carries text; a
+                // `text` part without `text` is a malformed body, not a
+                // foreign part type.
+                guard let text = part.text else {
+                    throw DecodingError.dataCorruptedError(
+                        in: c, debugDescription: "content part has no text")
+                }
+                joined += text
+            }
+            text = joined
         }
     }
 }
@@ -280,7 +310,15 @@ final class HTTPHandler: ChannelInboundHandler {
     private func handleChat(context: ChannelHandlerContext, body: ByteBuffer) {
         let bytes: [UInt8] = body.getBytes(at: 0, length: body.readableBytes) ?? []
         let data = Data(bytes)
-        guard let request = try? JSONDecoder().decode(ChatRequest.self, from: data) else {
+        let request: ChatRequest
+        do {
+            request = try JSONDecoder().decode(ChatRequest.self, from: data)
+        } catch let part as ChatContent.UnsupportedContentPart {
+            // Named refusal: the body was well formed, the part is one this
+            // server does not serve.
+            respondJSON(context, status: .badRequest, data: jsonData(["error": part.description]))
+            return
+        } catch {
             respondJSON(context, status: .badRequest, data: jsonData(["error": "malformed request"]))
             return
         }
