@@ -45,6 +45,87 @@ public enum Qpack {
         public let files: [String: Int]   // relative path -> byte size
     }
 
+    public enum Error: Swift.Error, CustomStringConvertible {
+        /// No `manifest.json`: not a qpack container. The installer writes the
+        /// manifest last, so this is also what an interrupted install looks like.
+        case notAContainer(String)
+        /// A file the manifest lists is absent.
+        case missingFile(String)
+        /// A file's size on disk disagrees with the manifest: a truncated or
+        /// oversized copy, an interrupted transfer, or a file from another
+        /// container.
+        case sizeMismatch(path: String, expected: Int, actual: Int)
+        /// `layout.json` promises `layerCount` blob files of
+        /// `expertStride × expertCount` bytes; one disagrees.
+        case layoutMismatch(String)
+
+        public var description: String {
+            switch self {
+            case .notAContainer(let dir):
+                return "\(dir) is not a qpack container (no manifest.json; an interrupted install looks the same way -- re-run it to resume)"
+            case .missingFile(let path):
+                return "qpack container is missing \(path), which its manifest lists"
+            case .sizeMismatch(let path, let expected, let actual):
+                return "qpack container file \(path) is \(actual) bytes; its manifest recorded \(expected) "
+                    + "(a truncated or foreign copy; re-download or re-repack the container)"
+            case .layoutMismatch(let why):
+                return "qpack container disagrees with its own packed_experts/layout.json: \(why)"
+            }
+        }
+    }
+
+    /// Verifies a container's structure from its own manifest and layout,
+    /// before any expert byte is read: every file the manifest lists exists at
+    /// the recorded size, and every `layer_NN.bin` is exactly
+    /// `expertStride × expertCount` bytes. No receipt (`hashes.json`) is
+    /// needed, so a container copied by hand is checked the same way as an
+    /// installed one. Before this a short layer file opened cleanly and
+    /// surfaced mid-generation as `short read: layer L expert E`, after the
+    /// model had reported itself ready. Returns the verified layout.
+    public static func verify(containerDir: URL) throws -> Layout {
+        let fm = FileManager.default
+        let manifestURL = containerDir.appendingPathComponent("manifest.json")
+        guard fm.fileExists(atPath: manifestURL.path) else {
+            throw Error.notAContainer(containerDir.path)
+        }
+        let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: manifestURL))
+        guard manifest.magic == "QPACK" else { throw Error.notAContainer(containerDir.path) }
+
+        func sizeOnDisk(_ relative: String) throws -> Int {
+            let path = containerDir.appendingPathComponent(relative).path
+            guard fm.fileExists(atPath: path),
+                  let size = try fm.attributesOfItem(atPath: path)[.size] as? Int else {
+                throw Error.missingFile(relative)
+            }
+            return size
+        }
+        for (relative, expected) in manifest.files.sorted(by: { $0.key < $1.key }) {
+            let actual = try sizeOnDisk(relative)
+            guard actual == expected else {
+                throw Error.sizeMismatch(path: relative, expected: expected, actual: actual)
+            }
+        }
+
+        let layoutRelative = "packed_experts/layout.json"
+        let layout = try JSONDecoder().decode(
+            Layout.self, from: Data(contentsOf: containerDir.appendingPathComponent(layoutRelative)))
+        let (perLayer, overflow) = layout.expertStride.multipliedReportingOverflow(by: layout.expertCount)
+        guard !overflow, perLayer > 0, layout.layerCount > 0 else {
+            throw Error.layoutMismatch(
+                "\(layout.expertCount) experts × \(layout.expertStride)-byte stride × \(layout.layerCount) layers is not a container")
+        }
+        for layer in 0..<layout.layerCount {
+            let relative = String(format: "packed_experts/layer_%02d.bin", layer)
+            let actual = try sizeOnDisk(relative)
+            guard actual == perLayer else {
+                throw Error.layoutMismatch(
+                    "\(relative) is \(actual) bytes; the layout promises \(layout.expertCount) experts × "
+                    + "\(layout.expertStride)-byte stride = \(perLayer)")
+            }
+        }
+        return layout
+    }
+
     static func align(_ n: Int, to a: Int) -> Int { (n + a - 1) / a * a }
 
     /// Logical inner dimension of a quantized expert projection, cross-checked
@@ -295,8 +376,17 @@ public final class QpackExpertReader {
 
     public init(containerDir: URL) throws {
         dir = containerDir.appendingPathComponent("packed_experts")
-        let layoutData = try Data(contentsOf: dir.appendingPathComponent("layout.json"))
-        layout = try JSONDecoder().decode(Qpack.Layout.self, from: layoutData)
+        if FileManager.default.fileExists(atPath: containerDir.appendingPathComponent("manifest.json").path) {
+            // A real container: check every listed file and every blob file
+            // against the sizes the container itself recorded, before the
+            // first pread. A directory carrying only packed_experts/ is a
+            // test scaffold, opened as before; the model opener requires the
+            // manifest regardless.
+            layout = try Qpack.verify(containerDir: containerDir)
+        } else {
+            let layoutData = try Data(contentsOf: dir.appendingPathComponent("layout.json"))
+            layout = try JSONDecoder().decode(Qpack.Layout.self, from: layoutData)
+        }
         fds = Array(repeating: -1, count: layout.layerCount)
     }
 

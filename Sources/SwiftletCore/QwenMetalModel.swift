@@ -389,8 +389,11 @@ public final class QwenMetalModel {
             )
             expertCache = cache
 
-            let manifestData = try Data(contentsOf: modelDir.appendingPathComponent("manifest.json"))
-            let manifest = try JSONDecoder().decode(Qpack.Manifest.self, from: manifestData)
+            let manifestURL = modelDir.appendingPathComponent("manifest.json")
+            guard FileManager.default.fileExists(atPath: manifestURL.path) else {
+                throw Qpack.Error.notAContainer(modelDir.path)
+            }
+            let manifest = try JSONDecoder().decode(Qpack.Manifest.self, from: Data(contentsOf: manifestURL))
             func proj(_ name: String, outDim: Int) throws -> ExpertProj {
                 guard let w = cache.reader.section(name + ".weight") else {
                     throw Checkpoint.Error.missingTensor("qpack section \(name)")
