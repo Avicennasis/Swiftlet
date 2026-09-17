@@ -34,10 +34,24 @@ public final class Checkpoint {
         /// Its packed layout cannot be dequantized as affine, so the checkpoint
         /// is refused before any tensor is read.
         case unsupportedQuantMode(mode: String, module: String)
+        /// `dir` has no `config.json`, so it is not a checkpoint directory (nor
+        /// a qpack container, which carries a copy). Refused at open: before
+        /// this the absent file read as an empty config, the directory opened
+        /// as an unquantized checkpoint, and the failure surfaced later as a
+        /// missing `.scales` tensor that blamed the file.
+        case missingConfig(String)
+        /// `config.json` exists but cannot be read as a JSON object.
+        case malformedConfig(path: String, reason: String)
 
         public var description: String {
             switch self {
             case .missingTensor(let name): return "missing tensor \(name)"
+            case .missingConfig(let dir):
+                return "no config.json in \(dir): not a checkpoint directory "
+                    + "(a checkpoint carries config.json, model.safetensors or its shards with "
+                    + "model.safetensors.index.json, and the tokenizer files; copy them from the source)"
+            case .malformedConfig(let path, let reason):
+                return "config.json at \(path) is not a JSON object (\(reason))"
             case .unsupportedBits(let bits): return "unsupported \(bits)-bit quantization (affine 4- and 8-bit only)"
             case .badShape(let name): return "bad shape for tensor \(name)"
             case .unsupportedQuantMode(let mode, let module):
@@ -94,11 +108,36 @@ public final class Checkpoint {
         return (defQuant, overrides)
     }
 
+    /// Reads a directory's `config.json` as a JSON object, refusing an absent
+    /// or unreadable one by name. `QwenConfig` opens through the same
+    /// function, so every opener says the same thing about the same
+    /// directory instead of one guessing an empty config and the other
+    /// reporting a Foundation file error.
+    public static func readConfig(inDirectory dir: URL) throws -> [String: Any] {
+        let url = dir.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw Error.missingConfig(dir.path)
+        }
+        let data: Data
+        do { data = try Data(contentsOf: url) } catch {
+            throw Error.malformedConfig(path: url.path, reason: "cannot read: \(error.localizedDescription)")
+        }
+        let object: Any
+        do { object = try JSONSerialization.jsonObject(with: data) } catch {
+            throw Error.malformedConfig(path: url.path, reason: "invalid JSON: \(error.localizedDescription)")
+        }
+        guard let cfg = object as? [String: Any] else {
+            throw Error.malformedConfig(path: url.path, reason: "the top level is not an object")
+        }
+        return cfg
+    }
+
     public init(dir: URL) throws {
         self.dir = dir
 
-        let configURL = dir.appendingPathComponent("config.json")
-        let cfg = (try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any]) ?? [:]
+        // Refuses a directory that is not a checkpoint here, by name, before
+        // any shard is looked for.
+        let cfg = try Self.readConfig(inDirectory: dir)
         // Refuses a non-affine checkpoint here, before any shard is opened.
         let quant = try Self.quantization(fromConfig: cfg)
         defaultQuant = quant.default

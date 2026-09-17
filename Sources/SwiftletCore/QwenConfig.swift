@@ -51,7 +51,10 @@ public struct QwenConfig: Sendable {
     }
 
     public init(url: URL) throws {
-        let top = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any] ?? [:]
+        // Absent or non-object config.json is refused by name (the same
+        // decision Checkpoint makes), not read as an empty config whose first
+        // missing field then gets the blame.
+        let top = try Checkpoint.readConfig(inDirectory: url.deletingLastPathComponent())
         // Multimodal checkpoints nest the text model under text_config.
         let text = (top["text_config"] as? [String: Any]) ?? top
         let isNested = top["text_config"] != nil
