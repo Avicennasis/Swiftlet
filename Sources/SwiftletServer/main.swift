@@ -253,9 +253,12 @@ struct RequestRefusal: Swift.Error, CustomStringConvertible, Equatable {
 
 /// Decided from the request head alone, before any body byte is read: a
 /// `Content-Length` over the limit is 413, one that is not a non-negative
-/// integer is 400 (NIO's parser normally refuses that framing itself; this
-/// keeps the rule in one place). No header means a chunked or empty body,
-/// which `bodyLimitRefusal` bounds as it arrives.
+/// integer is 400. (NIO's `HTTPServerProtocolErrorHandler`, installed by
+/// `configureHTTPServerPipeline()`, already answers an unparsable
+/// `Content-Length` with a bare 400 and closes before the head reaches this
+/// handler; the rule is kept here so the limit and its spellings live in one
+/// testable place.) No header means a chunked or empty body, which
+/// `bodyLimitRefusal` bounds as it arrives.
 @Sendable func requestBodyRefusal(contentLength: String?, limit: Int = RequestLimits.maxBodyBytes)
     -> RequestRefusal? {
     guard let contentLength else { return nil }
@@ -352,20 +355,6 @@ final class HTTPHandler: ChannelInboundHandler {
 
     func errorCaught(context: ChannelHandlerContext, error: Swift.Error) {
         generationOwner.cancelAll()
-        // A request NIO could not frame (a Content-Length that is not a
-        // number, a bad chunk size) is answered 400 before the close instead
-        // of the connection simply dropping. The pipeline handler delivers
-        // parser errors in order, after any response in progress has ended,
-        // so no head of ours is on the wire here unless we are already
-        // closing behind a refusal.
-        if error is HTTPParserError, !refused {
-            refused = true
-            requestHead = nil
-            body = ByteBuffer()
-            respondJSON(context, status: .badRequest,
-                        data: jsonData(["error": "malformed request: \(error)"]), closeAfterFlush: true)
-            return
-        }
         context.close(promise: nil)
     }
 
