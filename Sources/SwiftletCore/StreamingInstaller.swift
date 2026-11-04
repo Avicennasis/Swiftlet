@@ -609,7 +609,7 @@ public final class StreamingInstaller {
         }
     }
 
-    private func ranged(_ file: String, _ range: Range<Int>) throws -> Data? {
+    func ranged(_ file: String, _ range: Range<Int>) throws -> Data? {
         guard let base = source.httpBase else { return nil }
         let url = URL(string: "\(base)/\(file)")!
         var req = URLRequest(url: url)
